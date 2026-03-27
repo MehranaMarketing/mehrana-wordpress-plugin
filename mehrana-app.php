@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.4.5
+ * Version: 4.5.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '4.4.5';
+    private $version = '4.5.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -290,6 +290,45 @@ class Mehrana_App_Plugin
             'permission_callback' => [$this, 'check_permission'],
             'args' => [
                 'page_id' => [
+                    'required' => true,
+                    'validate_callback' => function ($param) {
+                        return is_numeric($param);
+                    }
+                ]
+            ]
+        ]);
+
+        // ========== TAXONOMY TERM ENDPOINTS (v4.5.0) ==========
+
+        // Get all taxonomy terms (product categories, tags, etc.) with SEO meta
+        register_rest_route($this->namespace, '/terms', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_terms'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Update SEO meta for a taxonomy term (Rank Math / Yoast)
+        register_rest_route($this->namespace, '/terms/(?P<id>\d+)/seo', [
+            'methods' => 'PUT',
+            'callback' => [$this, 'update_term_seo'],
+            'permission_callback' => [$this, 'check_permission'],
+            'args' => [
+                'id' => [
+                    'required' => true,
+                    'validate_callback' => function ($param) {
+                        return is_numeric($param);
+                    }
+                ]
+            ]
+        ]);
+
+        // Update term description content
+        register_rest_route($this->namespace, '/terms/(?P<id>\d+)/content', [
+            'methods' => 'POST',
+            'callback' => [$this, 'update_term_content'],
+            'permission_callback' => [$this, 'check_permission'],
+            'args' => [
+                'id' => [
                     'required' => true,
                     'validate_callback' => function ($param) {
                         return is_numeric($param);
@@ -4487,9 +4526,214 @@ class Mehrana_App_Plugin
         ]);
     }
 
+    // ========== TAXONOMY TERM HANDLERS (v4.5.0) ==========
+
+    /**
+     * Get all taxonomy terms with their URLs and SEO meta.
+     * Returns product categories, product tags, post categories, post tags.
+     */
+    public function get_terms($request)
+    {
+        $has_rank_math = defined('RANK_MATH_VERSION');
+        $has_yoast = defined('WPSEO_VERSION');
+
+        // All public taxonomies, excluding internal ones
+        $taxonomies = get_taxonomies(['public' => true], 'names');
+        $exclude = ['post_format', 'nav_menu', 'link_category', 'wp_theme', 'wp_template_part_area'];
+        $allowed = array_diff(array_values($taxonomies), $exclude);
+
+        $result = [];
+
+        foreach ($allowed as $taxonomy) {
+            $terms = get_terms([
+                'taxonomy' => $taxonomy,
+                'hide_empty' => false,
+            ]);
+
+            if (is_wp_error($terms)) continue;
+
+            foreach ($terms as $term) {
+                $term_url = get_term_link($term);
+                if (is_wp_error($term_url)) continue;
+
+                // Get SEO meta
+                $seo_title = '';
+                $seo_description = '';
+                $seo_canonical = '';
+
+                if ($has_rank_math) {
+                    $seo_title = get_term_meta($term->term_id, 'rank_math_title', true) ?: '';
+                    $seo_description = get_term_meta($term->term_id, 'rank_math_description', true) ?: '';
+                    $seo_canonical = get_term_meta($term->term_id, 'rank_math_canonical_url', true) ?: '';
+                } elseif ($has_yoast) {
+                    $seo_title = get_term_meta($term->term_id, '_yoast_wpseo_title', true) ?: '';
+                    $seo_description = get_term_meta($term->term_id, '_yoast_wpseo_metadesc', true) ?: '';
+                    $seo_canonical = get_term_meta($term->term_id, '_yoast_wpseo_canonical', true) ?: '';
+                }
+
+                $result[] = [
+                    'id' => $term->term_id,
+                    'name' => $term->name,
+                    'slug' => $term->slug,
+                    'taxonomy' => $taxonomy,
+                    'url' => $term_url,
+                    'description' => $term->description,
+                    'count' => $term->count,
+                    'parent' => $term->parent,
+                    'seo_title' => $seo_title,
+                    'seo_description' => $seo_description,
+                    'seo_canonical' => $seo_canonical,
+                ];
+            }
+        }
+
+        $this->log('[GET_TERMS] Fetched ' . count($result) . ' taxonomy terms');
+
+        return rest_ensure_response([
+            'terms' => $result,
+            'debug' => [
+                'total_found' => count($result),
+                'taxonomies' => $allowed,
+                'seo_plugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
+            ]
+        ]);
+    }
+
+    /**
+     * Update SEO meta for a taxonomy term (Rank Math / Yoast).
+     * Mirrors update_page_seo() but uses update_term_meta().
+     */
+    public function update_term_seo($request)
+    {
+        $term_id = intval($request['id']);
+        $body = $request->get_json_params();
+
+        // Validate term exists
+        $taxonomy = isset($body['taxonomy']) ? sanitize_text_field($body['taxonomy']) : '';
+        $term = get_term($term_id);
+
+        if (!$term || is_wp_error($term)) {
+            return new WP_Error('term_not_found', 'Term not found', ['status' => 404]);
+        }
+
+        // Use term's actual taxonomy if not provided
+        if (empty($taxonomy)) {
+            $taxonomy = $term->taxonomy;
+        }
+
+        $this->log("[UPDATE_TERM_SEO] Updating SEO for term ID: {$term_id}, taxonomy: {$taxonomy}");
+
+        $updated = [];
+        $has_rank_math = defined('RANK_MATH_VERSION');
+        $has_yoast = defined('WPSEO_VERSION');
+
+        // Title
+        if (isset($body['title'])) {
+            $title = sanitize_text_field($body['title']);
+            if ($has_rank_math) {
+                update_term_meta($term_id, 'rank_math_title', $title);
+            } elseif ($has_yoast) {
+                update_term_meta($term_id, '_yoast_wpseo_title', $title);
+            }
+            $updated['title'] = $title;
+        }
+
+        // Description
+        if (isset($body['description'])) {
+            $desc = sanitize_textarea_field($body['description']);
+            if ($has_rank_math) {
+                update_term_meta($term_id, 'rank_math_description', $desc);
+            } elseif ($has_yoast) {
+                update_term_meta($term_id, '_yoast_wpseo_metadesc', $desc);
+            }
+            $updated['description'] = $desc;
+        }
+
+        // Focus keyword
+        if (isset($body['focus_keyword'])) {
+            $kw = sanitize_text_field($body['focus_keyword']);
+            if ($has_rank_math) {
+                update_term_meta($term_id, 'rank_math_focus_keyword', $kw);
+            } elseif ($has_yoast) {
+                update_term_meta($term_id, '_yoast_wpseo_focuskw', $kw);
+            }
+            $updated['focus_keyword'] = $kw;
+        }
+
+        // Canonical URL
+        if (isset($body['canonical'])) {
+            $canonical = esc_url_raw($body['canonical']);
+            if ($has_rank_math) {
+                update_term_meta($term_id, 'rank_math_canonical_url', $canonical);
+            } elseif ($has_yoast) {
+                update_term_meta($term_id, '_yoast_wpseo_canonical', $canonical);
+            }
+            $updated['canonical'] = $canonical;
+        }
+
+        $this->log("[UPDATE_TERM_SEO] Updated fields: " . implode(', ', array_keys($updated)));
+
+        return rest_ensure_response([
+            'success' => true,
+            'term_id' => $term_id,
+            'taxonomy' => $taxonomy,
+            'seo_plugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
+            'updated' => $updated
+        ]);
+    }
+
+    /**
+     * Update a taxonomy term's description content.
+     * This is the only editable "body" content a term has.
+     */
+    public function update_term_content($request)
+    {
+        $term_id = intval($request['id']);
+        $body = $request->get_json_params();
+
+        $term = get_term($term_id);
+        if (!$term || is_wp_error($term)) {
+            return new WP_Error('term_not_found', 'Term not found', ['status' => 404]);
+        }
+
+        $this->log("[UPDATE_TERM_CONTENT] Updating content for term ID: {$term_id}");
+
+        $update_args = [];
+
+        if (isset($body['description'])) {
+            $update_args['description'] = $body['description']; // Allow HTML in term descriptions
+            $this->log("[UPDATE_TERM_CONTENT] Description length: " . strlen($body['description']));
+        }
+
+        if (isset($body['name'])) {
+            $update_args['name'] = sanitize_text_field($body['name']);
+        }
+
+        if (isset($body['slug'])) {
+            $update_args['slug'] = sanitize_title($body['slug']);
+        }
+
+        if (empty($update_args)) {
+            return new WP_Error('no_data', 'No fields to update', ['status' => 400]);
+        }
+
+        $result = wp_update_term($term_id, $term->taxonomy, $update_args);
+
+        if (is_wp_error($result)) {
+            return new WP_Error('update_failed', 'Failed to update term: ' . $result->get_error_message(), ['status' => 500]);
+        }
+
+        return rest_ensure_response([
+            'success' => true,
+            'term_id' => $term_id,
+            'taxonomy' => $term->taxonomy,
+            'updated' => array_keys($update_args),
+        ]);
+    }
+
     /**
      * Upload media to WordPress
-     * 
+     *
      * @param WP_REST_Request $request
      * @return WP_REST_Response|WP_Error
      */
