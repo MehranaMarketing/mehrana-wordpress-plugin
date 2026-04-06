@@ -2,11 +2,11 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.5.0
+ * Version: 4.6.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
- * GitHub Plugin URI: Mehrshadr/mehrana-wordpress-plugin
+ * GitHub Plugin URI: MehranaMarketing/mehrana-wordpress-plugin
  * GitHub Branch: main
  */
 
@@ -18,13 +18,13 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '4.5.0';
+    private $version = '4.6.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
 
     // GitHub Updater Config
-    private $github_username = 'Mehrshadr';
+    private $github_username = 'MehranaMarketing';
     private $github_repo = 'mehrana-wordpress-plugin';
     private $github_plugin_path = 'mehrana-app.php';
 
@@ -298,43 +298,92 @@ class Mehrana_App_Plugin
             ]
         ]);
 
-        // ========== TAXONOMY TERM ENDPOINTS (v4.5.0) ==========
+        // =============================================
+        // LinkLab Endpoints
+        // =============================================
 
-        // Get all taxonomy terms (product categories, tags, etc.) with SEO meta
-        register_rest_route($this->namespace, '/terms', [
+        // Get all navigation menus with full item trees
+        register_rest_route($this->namespace, '/menus', [
             'methods' => 'GET',
-            'callback' => [$this, 'get_terms'],
+            'callback' => [$this, 'linklab_get_menus'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
-        // Update SEO meta for a taxonomy term (Rank Math / Yoast)
-        register_rest_route($this->namespace, '/terms/(?P<id>\d+)/seo', [
+        // Update a menu item URL
+        register_rest_route($this->namespace, '/menus/items/(?P<id>\d+)', [
             'methods' => 'PUT',
-            'callback' => [$this, 'update_term_seo'],
+            'callback' => [$this, 'linklab_update_menu_item'],
             'permission_callback' => [$this, 'check_permission'],
-            'args' => [
-                'id' => [
-                    'required' => true,
-                    'validate_callback' => function ($param) {
-                        return is_numeric($param);
-                    }
-                ]
-            ]
         ]);
 
-        // Update term description content
-        register_rest_route($this->namespace, '/terms/(?P<id>\d+)/content', [
-            'methods' => 'POST',
-            'callback' => [$this, 'update_term_content'],
+        // List all redirects
+        register_rest_route($this->namespace, '/redirects', [
+            'methods' => 'GET',
+            'callback' => [$this, 'linklab_get_redirects'],
             'permission_callback' => [$this, 'check_permission'],
-            'args' => [
-                'id' => [
-                    'required' => true,
-                    'validate_callback' => function ($param) {
-                        return is_numeric($param);
-                    }
-                ]
-            ]
+        ]);
+
+        // Update a redirect
+        register_rest_route($this->namespace, '/redirects/(?P<id>\d+)', [
+            'methods' => 'PUT',
+            'callback' => [$this, 'linklab_update_redirect'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Delete a redirect
+        register_rest_route($this->namespace, '/redirects/(?P<id>\d+)', [
+            'methods' => 'DELETE',
+            'callback' => [$this, 'linklab_delete_redirect'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Get page robots directives
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/robots', [
+            'methods' => 'GET',
+            'callback' => [$this, 'linklab_get_page_robots'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Set page robots directives
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/robots', [
+            'methods' => 'POST',
+            'callback' => [$this, 'linklab_set_page_robots'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Search theme files for URLs
+        register_rest_route($this->namespace, '/theme/search', [
+            'methods' => 'POST',
+            'callback' => [$this, 'linklab_search_theme'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Add breadcrumb URL override
+        register_rest_route($this->namespace, '/breadcrumb/override', [
+            'methods' => 'POST',
+            'callback' => [$this, 'linklab_add_breadcrumb_override'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // List breadcrumb overrides
+        register_rest_route($this->namespace, '/breadcrumb/overrides', [
+            'methods' => 'GET',
+            'callback' => [$this, 'linklab_get_breadcrumb_overrides'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Delete breadcrumb override
+        register_rest_route($this->namespace, '/breadcrumb/override/(?P<id>\d+)', [
+            'methods' => 'DELETE',
+            'callback' => [$this, 'linklab_delete_breadcrumb_override'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Verify capabilities
+        register_rest_route($this->namespace, '/verify-capabilities', [
+            'methods' => 'GET',
+            'callback' => [$this, 'linklab_verify_capabilities'],
+            'permission_callback' => [$this, 'check_permission'],
         ]);
     }
 
@@ -2081,9 +2130,7 @@ class Mehrana_App_Plugin
                 'has_redirect' => $redirect_info['has_redirect'],
                 'redirect_url' => $redirect_info['redirect_url'],
                 'elementor_data' => $elementor_data,
-                'post_content' => $page->post_content,
-                'date' => $page->post_date,
-                'modified' => $page->post_modified
+                'post_content' => $page->post_content
             ];
         }
 
@@ -4516,6 +4563,48 @@ class Mehrana_App_Plugin
             $updated['canonical'] = $canonical;
         }
 
+        // OG Title
+        if (isset($body['og_title'])) {
+            $og_title = sanitize_text_field($body['og_title']);
+            if ($has_rank_math) {
+                update_post_meta($page_id, 'rank_math_facebook_title', $og_title);
+            } elseif ($has_yoast) {
+                update_post_meta($page_id, '_yoast_wpseo_opengraph-title', $og_title);
+            }
+            $updated['og_title'] = $og_title;
+        }
+
+        // OG Description
+        if (isset($body['og_description'])) {
+            $og_desc = sanitize_textarea_field($body['og_description']);
+            if ($has_rank_math) {
+                update_post_meta($page_id, 'rank_math_facebook_description', $og_desc);
+            } elseif ($has_yoast) {
+                update_post_meta($page_id, '_yoast_wpseo_opengraph-description', $og_desc);
+            }
+            $updated['og_description'] = $og_desc;
+        }
+
+        // OG Image
+        if (isset($body['og_image'])) {
+            $og_image = esc_url_raw($body['og_image']);
+            if ($has_rank_math) {
+                update_post_meta($page_id, 'rank_math_facebook_image', $og_image);
+            } elseif ($has_yoast) {
+                update_post_meta($page_id, '_yoast_wpseo_opengraph-image', $og_image);
+            }
+            $updated['og_image'] = $og_image;
+        }
+
+        // OG URL
+        if (isset($body['og_url'])) {
+            $og_url = esc_url_raw($body['og_url']);
+            if ($has_rank_math) {
+                update_post_meta($page_id, 'rank_math_facebook_url', $og_url);
+            }
+            $updated['og_url'] = $og_url;
+        }
+
         $this->log("[UPDATE_SEO] Updated fields: " . implode(', ', array_keys($updated)));
 
         return rest_ensure_response([
@@ -4526,214 +4615,9 @@ class Mehrana_App_Plugin
         ]);
     }
 
-    // ========== TAXONOMY TERM HANDLERS (v4.5.0) ==========
-
-    /**
-     * Get all taxonomy terms with their URLs and SEO meta.
-     * Returns product categories, product tags, post categories, post tags.
-     */
-    public function get_terms($request)
-    {
-        $has_rank_math = defined('RANK_MATH_VERSION');
-        $has_yoast = defined('WPSEO_VERSION');
-
-        // All public taxonomies, excluding internal ones
-        $taxonomies = get_taxonomies(['public' => true], 'names');
-        $exclude = ['post_format', 'nav_menu', 'link_category', 'wp_theme', 'wp_template_part_area'];
-        $allowed = array_diff(array_values($taxonomies), $exclude);
-
-        $result = [];
-
-        foreach ($allowed as $taxonomy) {
-            $terms = get_terms([
-                'taxonomy' => $taxonomy,
-                'hide_empty' => false,
-            ]);
-
-            if (is_wp_error($terms)) continue;
-
-            foreach ($terms as $term) {
-                $term_url = get_term_link($term);
-                if (is_wp_error($term_url)) continue;
-
-                // Get SEO meta
-                $seo_title = '';
-                $seo_description = '';
-                $seo_canonical = '';
-
-                if ($has_rank_math) {
-                    $seo_title = get_term_meta($term->term_id, 'rank_math_title', true) ?: '';
-                    $seo_description = get_term_meta($term->term_id, 'rank_math_description', true) ?: '';
-                    $seo_canonical = get_term_meta($term->term_id, 'rank_math_canonical_url', true) ?: '';
-                } elseif ($has_yoast) {
-                    $seo_title = get_term_meta($term->term_id, '_yoast_wpseo_title', true) ?: '';
-                    $seo_description = get_term_meta($term->term_id, '_yoast_wpseo_metadesc', true) ?: '';
-                    $seo_canonical = get_term_meta($term->term_id, '_yoast_wpseo_canonical', true) ?: '';
-                }
-
-                $result[] = [
-                    'id' => $term->term_id,
-                    'name' => $term->name,
-                    'slug' => $term->slug,
-                    'taxonomy' => $taxonomy,
-                    'url' => $term_url,
-                    'description' => $term->description,
-                    'count' => $term->count,
-                    'parent' => $term->parent,
-                    'seo_title' => $seo_title,
-                    'seo_description' => $seo_description,
-                    'seo_canonical' => $seo_canonical,
-                ];
-            }
-        }
-
-        $this->log('[GET_TERMS] Fetched ' . count($result) . ' taxonomy terms');
-
-        return rest_ensure_response([
-            'terms' => $result,
-            'debug' => [
-                'total_found' => count($result),
-                'taxonomies' => $allowed,
-                'seo_plugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
-            ]
-        ]);
-    }
-
-    /**
-     * Update SEO meta for a taxonomy term (Rank Math / Yoast).
-     * Mirrors update_page_seo() but uses update_term_meta().
-     */
-    public function update_term_seo($request)
-    {
-        $term_id = intval($request['id']);
-        $body = $request->get_json_params();
-
-        // Validate term exists
-        $taxonomy = isset($body['taxonomy']) ? sanitize_text_field($body['taxonomy']) : '';
-        $term = get_term($term_id);
-
-        if (!$term || is_wp_error($term)) {
-            return new WP_Error('term_not_found', 'Term not found', ['status' => 404]);
-        }
-
-        // Use term's actual taxonomy if not provided
-        if (empty($taxonomy)) {
-            $taxonomy = $term->taxonomy;
-        }
-
-        $this->log("[UPDATE_TERM_SEO] Updating SEO for term ID: {$term_id}, taxonomy: {$taxonomy}");
-
-        $updated = [];
-        $has_rank_math = defined('RANK_MATH_VERSION');
-        $has_yoast = defined('WPSEO_VERSION');
-
-        // Title
-        if (isset($body['title'])) {
-            $title = sanitize_text_field($body['title']);
-            if ($has_rank_math) {
-                update_term_meta($term_id, 'rank_math_title', $title);
-            } elseif ($has_yoast) {
-                update_term_meta($term_id, '_yoast_wpseo_title', $title);
-            }
-            $updated['title'] = $title;
-        }
-
-        // Description
-        if (isset($body['description'])) {
-            $desc = sanitize_textarea_field($body['description']);
-            if ($has_rank_math) {
-                update_term_meta($term_id, 'rank_math_description', $desc);
-            } elseif ($has_yoast) {
-                update_term_meta($term_id, '_yoast_wpseo_metadesc', $desc);
-            }
-            $updated['description'] = $desc;
-        }
-
-        // Focus keyword
-        if (isset($body['focus_keyword'])) {
-            $kw = sanitize_text_field($body['focus_keyword']);
-            if ($has_rank_math) {
-                update_term_meta($term_id, 'rank_math_focus_keyword', $kw);
-            } elseif ($has_yoast) {
-                update_term_meta($term_id, '_yoast_wpseo_focuskw', $kw);
-            }
-            $updated['focus_keyword'] = $kw;
-        }
-
-        // Canonical URL
-        if (isset($body['canonical'])) {
-            $canonical = esc_url_raw($body['canonical']);
-            if ($has_rank_math) {
-                update_term_meta($term_id, 'rank_math_canonical_url', $canonical);
-            } elseif ($has_yoast) {
-                update_term_meta($term_id, '_yoast_wpseo_canonical', $canonical);
-            }
-            $updated['canonical'] = $canonical;
-        }
-
-        $this->log("[UPDATE_TERM_SEO] Updated fields: " . implode(', ', array_keys($updated)));
-
-        return rest_ensure_response([
-            'success' => true,
-            'term_id' => $term_id,
-            'taxonomy' => $taxonomy,
-            'seo_plugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
-            'updated' => $updated
-        ]);
-    }
-
-    /**
-     * Update a taxonomy term's description content.
-     * This is the only editable "body" content a term has.
-     */
-    public function update_term_content($request)
-    {
-        $term_id = intval($request['id']);
-        $body = $request->get_json_params();
-
-        $term = get_term($term_id);
-        if (!$term || is_wp_error($term)) {
-            return new WP_Error('term_not_found', 'Term not found', ['status' => 404]);
-        }
-
-        $this->log("[UPDATE_TERM_CONTENT] Updating content for term ID: {$term_id}");
-
-        $update_args = [];
-
-        if (isset($body['description'])) {
-            $update_args['description'] = $body['description']; // Allow HTML in term descriptions
-            $this->log("[UPDATE_TERM_CONTENT] Description length: " . strlen($body['description']));
-        }
-
-        if (isset($body['name'])) {
-            $update_args['name'] = sanitize_text_field($body['name']);
-        }
-
-        if (isset($body['slug'])) {
-            $update_args['slug'] = sanitize_title($body['slug']);
-        }
-
-        if (empty($update_args)) {
-            return new WP_Error('no_data', 'No fields to update', ['status' => 400]);
-        }
-
-        $result = wp_update_term($term_id, $term->taxonomy, $update_args);
-
-        if (is_wp_error($result)) {
-            return new WP_Error('update_failed', 'Failed to update term: ' . $result->get_error_message(), ['status' => 500]);
-        }
-
-        return rest_ensure_response([
-            'success' => true,
-            'term_id' => $term_id,
-            'taxonomy' => $term->taxonomy,
-            'updated' => array_keys($update_args),
-        ]);
-    }
-
     /**
      * Upload media to WordPress
-     *
+     * 
      * @param WP_REST_Request $request
      * @return WP_REST_Response|WP_Error
      */
@@ -4816,7 +4700,437 @@ class Mehrana_App_Plugin
             esc_attr($atts['scrolling'])
         );
     }
+
+    // =============================================
+    // LinkLab Handler Functions
+    // =============================================
+
+    /**
+     * GET /menus — Return all navigation menus with full item trees
+     */
+    public function linklab_get_menus($request) {
+        $menus = wp_get_nav_menus();
+        $result = [];
+        $locations = get_nav_menu_locations();
+        $location_map = array_flip($locations);
+
+        foreach ($menus as $menu) {
+            $items = wp_get_nav_menu_items($menu->term_id);
+            $location = isset($location_map[$menu->term_id]) ? $location_map[$menu->term_id] : null;
+
+            $tree = $this->linklab_build_menu_tree($items ?: []);
+
+            $result[] = [
+                'id' => (string) $menu->term_id,
+                'name' => $menu->name,
+                'location' => $location,
+                'items' => $tree,
+            ];
+        }
+
+        return rest_ensure_response($result);
+    }
+
+    private function linklab_build_menu_tree($items, $parent_id = 0) {
+        $tree = [];
+        foreach ($items as $item) {
+            if ((int) $item->menu_item_parent === $parent_id) {
+                $children = $this->linklab_build_menu_tree($items, $item->ID);
+                $tree[] = [
+                    'id' => (string) $item->ID,
+                    'title' => $item->title,
+                    'url' => $item->url,
+                    'children' => $children,
+                ];
+            }
+        }
+        return $tree;
+    }
+
+    /**
+     * PUT /menus/items/{id} — Update a menu item's URL
+     */
+    public function linklab_update_menu_item($request) {
+        $item_id = intval($request['id']);
+        $body = $request->get_json_params();
+        $new_url = isset($body['url']) ? esc_url_raw($body['url']) : null;
+
+        if (!$new_url) {
+            return new \WP_Error('missing_url', 'URL is required', ['status' => 400]);
+        }
+
+        $menu_item = wp_setup_nav_menu_item(get_post($item_id));
+        if (!$menu_item || $menu_item->post_type !== 'nav_menu_item') {
+            return new \WP_Error('not_found', 'Menu item not found', ['status' => 404]);
+        }
+
+        $old_url = $menu_item->url;
+
+        // Update the menu item URL
+        update_post_meta($item_id, '_menu_item_url', $new_url);
+
+        return rest_ensure_response([
+            'success' => true,
+            'item_id' => $item_id,
+            'old_url' => $old_url,
+            'new_url' => $new_url,
+        ]);
+    }
+
+    /**
+     * GET /redirects — List all redirects from Rank Math + Redirection plugin + custom
+     */
+    public function linklab_get_redirects($request) {
+        global $wpdb;
+        $redirects = [];
+
+        // 1. Rank Math redirections
+        $table = $wpdb->prefix . 'rank_math_redirections';
+        if ($wpdb->get_var("SHOW TABLES LIKE '$table'") === $table) {
+            $rows = $wpdb->get_results("SELECT id, sources, url_to, header_code, status FROM $table ORDER BY id DESC LIMIT 500");
+            foreach ($rows as $row) {
+                $sources = maybe_unserialize($row->sources);
+                $from_url = is_array($sources) && isset($sources[0]['pattern']) ? $sources[0]['pattern'] : '';
+                $redirects[] = [
+                    'id' => 'rm_' . $row->id,
+                    'fromUrl' => $from_url,
+                    'toUrl' => $row->url_to,
+                    'type' => (int) $row->header_code,
+                    'isActive' => $row->status === 'active',
+                    'source' => 'rank_math',
+                ];
+            }
+        }
+
+        // 2. Redirection plugin
+        if (class_exists('Red_Item')) {
+            $items = \Red_Item::get_all();
+            if (is_array($items)) {
+                foreach ($items as $item) {
+                    $redirects[] = [
+                        'id' => 'rp_' . $item->get_id(),
+                        'fromUrl' => $item->get_url(),
+                        'toUrl' => $item->get_action_data(),
+                        'type' => (int) $item->get_action_code(),
+                        'isActive' => $item->is_enabled(),
+                        'source' => 'redirection_plugin',
+                    ];
+                }
+            }
+        }
+
+        // 3. Custom Mehrana redirects
+        $custom = get_option('mehrana_redirects', []);
+        foreach ($custom as $idx => $r) {
+            $redirects[] = [
+                'id' => 'custom_' . $idx,
+                'fromUrl' => $r['from_url'],
+                'toUrl' => $r['to_url'],
+                'type' => (int) ($r['type'] ?? 301),
+                'isActive' => true,
+                'source' => 'mehrana',
+            ];
+        }
+
+        return rest_ensure_response($redirects);
+    }
+
+    /**
+     * PUT /redirects/{id} — Update a redirect rule
+     */
+    public function linklab_update_redirect($request) {
+        global $wpdb;
+        $id = $request['id'];
+        $body = $request->get_json_params();
+
+        if (strpos($id, 'rm_') === 0) {
+            $rm_id = intval(str_replace('rm_', '', $id));
+            $table = $wpdb->prefix . 'rank_math_redirections';
+            $update = [];
+            if (isset($body['toUrl'])) $update['url_to'] = esc_url_raw($body['toUrl']);
+            if (isset($body['type'])) $update['header_code'] = intval($body['type']);
+            if (isset($body['isActive'])) $update['status'] = $body['isActive'] ? 'active' : 'inactive';
+            if (!empty($update)) {
+                $wpdb->update($table, $update, ['id' => $rm_id]);
+            }
+            return rest_ensure_response(['success' => true]);
+        }
+
+        return new \WP_Error('not_supported', 'Only Rank Math redirects can be updated', ['status' => 400]);
+    }
+
+    /**
+     * DELETE /redirects/{id} — Delete a redirect rule
+     */
+    public function linklab_delete_redirect($request) {
+        global $wpdb;
+        $id = $request['id'];
+
+        if (strpos($id, 'rm_') === 0) {
+            $rm_id = intval(str_replace('rm_', '', $id));
+            $table = $wpdb->prefix . 'rank_math_redirections';
+            $wpdb->delete($table, ['id' => $rm_id]);
+            return rest_ensure_response(['success' => true]);
+        }
+
+        if (strpos($id, 'custom_') === 0) {
+            $idx = intval(str_replace('custom_', '', $id));
+            $custom = get_option('mehrana_redirects', []);
+            if (isset($custom[$idx])) {
+                array_splice($custom, $idx, 1);
+                update_option('mehrana_redirects', $custom);
+            }
+            return rest_ensure_response(['success' => true]);
+        }
+
+        return new \WP_Error('not_supported', 'Cannot delete this redirect type', ['status' => 400]);
+    }
+
+    /**
+     * GET /pages/{id}/robots — Read current robots directives
+     */
+    public function linklab_get_page_robots($request) {
+        $page_id = intval($request['id']);
+        $noindex = false;
+        $nofollow = false;
+        $raw = '';
+
+        // Rank Math
+        $rm_robots = get_post_meta($page_id, 'rank_math_robots', true);
+        if (is_array($rm_robots)) {
+            $noindex = in_array('noindex', $rm_robots);
+            $nofollow = in_array('nofollow', $rm_robots);
+            $raw = implode(', ', $rm_robots);
+        }
+
+        // Yoast fallback
+        if (!$rm_robots) {
+            $yoast_noindex = get_post_meta($page_id, '_yoast_wpseo_meta-robots-noindex', true);
+            $yoast_nofollow = get_post_meta($page_id, '_yoast_wpseo_meta-robots-nofollow', true);
+            $noindex = $yoast_noindex === '1';
+            $nofollow = $yoast_nofollow === '1';
+            $parts = [];
+            if ($noindex) $parts[] = 'noindex';
+            if ($nofollow) $parts[] = 'nofollow';
+            $raw = implode(', ', $parts);
+        }
+
+        return rest_ensure_response([
+            'noindex' => $noindex,
+            'nofollow' => $nofollow,
+            'raw' => $raw,
+        ]);
+    }
+
+    /**
+     * POST /pages/{id}/robots — Set noindex/nofollow
+     */
+    public function linklab_set_page_robots($request) {
+        $page_id = intval($request['id']);
+        $body = $request->get_json_params();
+        $noindex = isset($body['noindex']) ? (bool) $body['noindex'] : null;
+        $nofollow = isset($body['nofollow']) ? (bool) $body['nofollow'] : null;
+
+        // Get current state for undo
+        $old = $this->linklab_get_page_robots($request)->get_data();
+
+        // Rank Math
+        if (class_exists('RankMath')) {
+            $robots = get_post_meta($page_id, 'rank_math_robots', true);
+            if (!is_array($robots)) $robots = ['index'];
+
+            if ($noindex !== null) {
+                $robots = array_filter($robots, fn($v) => $v !== 'index' && $v !== 'noindex');
+                $robots[] = $noindex ? 'noindex' : 'index';
+            }
+            if ($nofollow !== null) {
+                $robots = array_filter($robots, fn($v) => $v !== 'follow' && $v !== 'nofollow');
+                $robots[] = $nofollow ? 'nofollow' : 'follow';
+            }
+
+            update_post_meta($page_id, 'rank_math_robots', array_values($robots));
+        }
+        // Yoast fallback
+        elseif (defined('WPSEO_VERSION')) {
+            if ($noindex !== null) {
+                update_post_meta($page_id, '_yoast_wpseo_meta-robots-noindex', $noindex ? '1' : '0');
+            }
+            if ($nofollow !== null) {
+                update_post_meta($page_id, '_yoast_wpseo_meta-robots-nofollow', $nofollow ? '1' : '0');
+            }
+        }
+
+        return rest_ensure_response([
+            'success' => true,
+            'previous' => $old,
+        ]);
+    }
+
+    /**
+     * POST /theme/search — Search theme files for URL patterns
+     */
+    public function linklab_search_theme($request) {
+        $body = $request->get_json_params();
+        $urls = isset($body['urls']) ? (array) $body['urls'] : [];
+
+        if (empty($urls)) {
+            return new \WP_Error('missing_urls', 'URLs array is required', ['status' => 400]);
+        }
+
+        $theme_dir = get_stylesheet_directory();
+        $results = [];
+
+        $files = $this->linklab_scan_directory($theme_dir, ['php', 'js', 'css', 'html']);
+
+        foreach ($files as $file) {
+            $content = file_get_contents($file);
+            if ($content === false) continue;
+
+            $lines = explode("\n", $content);
+            $rel_path = str_replace($theme_dir . '/', '', $file);
+
+            foreach ($urls as $url) {
+                foreach ($lines as $line_num => $line) {
+                    if (stripos($line, $url) !== false) {
+                        $results[] = [
+                            'url' => $url,
+                            'file' => $rel_path,
+                            'line' => $line_num + 1,
+                            'context' => trim($line),
+                            'canAutoFix' => true,
+                        ];
+                    }
+                }
+            }
+        }
+
+        return rest_ensure_response($results);
+    }
+
+    private function linklab_scan_directory($dir, $extensions) {
+        $files = [];
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS)
+        );
+        foreach ($iterator as $file) {
+            $ext = strtolower($file->getExtension());
+            if (in_array($ext, $extensions)) {
+                $files[] = $file->getPathname();
+            }
+        }
+        return $files;
+    }
+
+    /**
+     * POST /breadcrumb/override — Add persistent breadcrumb URL override
+     */
+    public function linklab_add_breadcrumb_override($request) {
+        $body = $request->get_json_params();
+        $from_url = isset($body['from_url']) ? $body['from_url'] : null;
+        $to_url = isset($body['to_url']) ? $body['to_url'] : null;
+        $to_text = isset($body['to_text']) ? $body['to_text'] : null;
+
+        if (!$from_url || !$to_url) {
+            return new \WP_Error('missing_params', 'from_url and to_url are required', ['status' => 400]);
+        }
+
+        $overrides = get_option('mehrana_breadcrumb_overrides', []);
+        $overrides[] = [
+            'from_url' => $from_url,
+            'to_url' => $to_url,
+            'to_text' => $to_text,
+        ];
+        update_option('mehrana_breadcrumb_overrides', $overrides);
+
+        return rest_ensure_response(['success' => true, 'id' => count($overrides) - 1]);
+    }
+
+    /**
+     * GET /breadcrumb/overrides — List all active breadcrumb overrides
+     */
+    public function linklab_get_breadcrumb_overrides($request) {
+        $overrides = get_option('mehrana_breadcrumb_overrides', []);
+        $result = [];
+        foreach ($overrides as $idx => $o) {
+            $result[] = [
+                'id' => (string) $idx,
+                'fromUrl' => $o['from_url'],
+                'toUrl' => $o['to_url'],
+                'toText' => isset($o['to_text']) ? $o['to_text'] : null,
+            ];
+        }
+        return rest_ensure_response($result);
+    }
+
+    /**
+     * DELETE /breadcrumb/override/{id} — Remove a breadcrumb override
+     */
+    public function linklab_delete_breadcrumb_override($request) {
+        $idx = intval($request['id']);
+        $overrides = get_option('mehrana_breadcrumb_overrides', []);
+        if (isset($overrides[$idx])) {
+            array_splice($overrides, $idx, 1);
+            update_option('mehrana_breadcrumb_overrides', $overrides);
+        }
+        return rest_ensure_response(['success' => true]);
+    }
+
+    /**
+     * GET /verify-capabilities — Health check for all LinkLab features
+     */
+    public function linklab_verify_capabilities($request) {
+        $has_rank_math = class_exists('RankMath');
+        $has_yoast = defined('WPSEO_VERSION');
+        $has_redirection = class_exists('Red_Item');
+
+        global $wpdb;
+        $rm_table = $wpdb->prefix . 'rank_math_redirections';
+        $has_rm_redirects = $wpdb->get_var("SHOW TABLES LIKE '$rm_table'") === $rm_table;
+
+        return rest_ensure_response([
+            'menus' => true,
+            'redirects' => true,
+            'noindex' => $has_rank_math || $has_yoast,
+            'breadcrumbs' => $has_rank_math || $has_yoast,
+            'themeEdit' => true,
+            'sitemapExclude' => $has_rank_math,
+            'seoPlugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
+            'redirectPlugin' => $has_rm_redirects ? 'rank_math' : ($has_redirection ? 'redirection' : 'custom'),
+            'pluginVersion' => '4.5.0',
+        ]);
+    }
 }
+
+// Apply breadcrumb overrides at render time
+add_filter('rank_math/frontend/breadcrumb/items', function($items) {
+    $overrides = get_option('mehrana_breadcrumb_overrides', []);
+    if (empty($overrides)) return $items;
+    foreach ($items as &$item) {
+        if (!isset($item[1])) continue;
+        foreach ($overrides as $o) {
+            if (rtrim($item[1], '/') === rtrim($o['from_url'], '/')) {
+                $item[1] = $o['to_url'];
+                if (!empty($o['to_text'])) $item[0] = $o['to_text'];
+            }
+        }
+    }
+    return $items;
+});
+
+add_filter('wpseo_breadcrumb_links', function($links) {
+    $overrides = get_option('mehrana_breadcrumb_overrides', []);
+    if (empty($overrides)) return $links;
+    foreach ($links as &$link) {
+        if (!isset($link['url'])) continue;
+        foreach ($overrides as $o) {
+            if (rtrim($link['url'], '/') === rtrim($o['from_url'], '/')) {
+                $link['url'] = $o['to_url'];
+                if (!empty($o['to_text'])) $link['text'] = $o['to_text'];
+            }
+        }
+    }
+    return $links;
+});
 
 // Initialize plugin
 new Mehrana_App_Plugin();
