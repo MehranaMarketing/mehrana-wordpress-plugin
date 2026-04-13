@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.7.0
+ * Version: 4.8.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '4.7.0';
+    private $version = '4.8.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -323,15 +323,15 @@ class Mehrana_App_Plugin
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
-        // Update a redirect
-        register_rest_route($this->namespace, '/redirects/(?P<id>\d+)', [
+        // Update a redirect (id can be rm_123, rp_456, custom_789)
+        register_rest_route($this->namespace, '/redirects/(?P<id>[a-zA-Z0-9_]+)', [
             'methods' => 'PUT',
             'callback' => [$this, 'linklab_update_redirect'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
-        // Delete a redirect
-        register_rest_route($this->namespace, '/redirects/(?P<id>\d+)', [
+        // Delete a redirect (id can be rm_123, rp_456, custom_789)
+        register_rest_route($this->namespace, '/redirects/(?P<id>[a-zA-Z0-9_]+)', [
             'methods' => 'DELETE',
             'callback' => [$this, 'linklab_delete_redirect'],
             'permission_callback' => [$this, 'check_permission'],
@@ -4899,6 +4899,7 @@ class Mehrana_App_Plugin
         $id = $request['id'];
         $body = $request->get_json_params();
 
+        // Rank Math
         if (strpos($id, 'rm_') === 0) {
             $rm_id = intval(str_replace('rm_', '', $id));
             $table = $wpdb->prefix . 'rank_math_redirections';
@@ -4912,7 +4913,38 @@ class Mehrana_App_Plugin
             return rest_ensure_response(['success' => true]);
         }
 
-        return new \WP_Error('not_supported', 'Only Rank Math redirects can be updated', ['status' => 400]);
+        // Redirection plugin
+        if (strpos($id, 'rp_') === 0) {
+            $rp_id = intval(str_replace('rp_', '', $id));
+            if (class_exists('Red_Item')) {
+                $item = \Red_Item::get_by_id($rp_id);
+                if ($item) {
+                    $update_data = [];
+                    if (isset($body['toUrl'])) $update_data['action_data'] = ['url' => esc_url_raw($body['toUrl'])];
+                    if (isset($body['type'])) $update_data['action_code'] = intval($body['type']);
+                    if (!empty($update_data)) {
+                        $item->update($update_data);
+                    }
+                    return rest_ensure_response(['success' => true]);
+                }
+            }
+            return new \WP_Error('not_found', 'Redirection plugin redirect not found', ['status' => 404]);
+        }
+
+        // Custom Mehrana redirects
+        if (strpos($id, 'custom_') === 0) {
+            $idx = intval(str_replace('custom_', '', $id));
+            $custom = get_option('mehrana_redirects', []);
+            if (isset($custom[$idx])) {
+                if (isset($body['toUrl'])) $custom[$idx]['to'] = esc_url_raw($body['toUrl']);
+                if (isset($body['type'])) $custom[$idx]['type'] = intval($body['type']);
+                update_option('mehrana_redirects', $custom);
+                return rest_ensure_response(['success' => true]);
+            }
+            return new \WP_Error('not_found', 'Custom redirect not found', ['status' => 404]);
+        }
+
+        return new \WP_Error('not_supported', 'Unknown redirect type: ' . $id, ['status' => 400]);
     }
 
     /**
@@ -4922,24 +4954,43 @@ class Mehrana_App_Plugin
         global $wpdb;
         $id = $request['id'];
 
+        // Rank Math
         if (strpos($id, 'rm_') === 0) {
             $rm_id = intval(str_replace('rm_', '', $id));
             $table = $wpdb->prefix . 'rank_math_redirections';
             $wpdb->delete($table, ['id' => $rm_id]);
+            $this->log("Deleted Rank Math redirect #{$rm_id}");
             return rest_ensure_response(['success' => true]);
         }
 
+        // Redirection plugin
+        if (strpos($id, 'rp_') === 0) {
+            $rp_id = intval(str_replace('rp_', '', $id));
+            if (class_exists('Red_Item')) {
+                $item = \Red_Item::get_by_id($rp_id);
+                if ($item) {
+                    $item->delete();
+                    $this->log("Deleted Redirection plugin redirect #{$rp_id}");
+                    return rest_ensure_response(['success' => true]);
+                }
+            }
+            return new \WP_Error('not_found', 'Redirection plugin redirect not found', ['status' => 404]);
+        }
+
+        // Custom Mehrana redirects
         if (strpos($id, 'custom_') === 0) {
             $idx = intval(str_replace('custom_', '', $id));
             $custom = get_option('mehrana_redirects', []);
             if (isset($custom[$idx])) {
                 array_splice($custom, $idx, 1);
                 update_option('mehrana_redirects', $custom);
+                $this->log("Deleted custom redirect #{$idx}");
+                return rest_ensure_response(['success' => true]);
             }
             return rest_ensure_response(['success' => true]);
         }
 
-        return new \WP_Error('not_supported', 'Cannot delete this redirect type', ['status' => 400]);
+        return new \WP_Error('not_supported', 'Unknown redirect type: ' . $id, ['status' => 400]);
     }
 
     /**
