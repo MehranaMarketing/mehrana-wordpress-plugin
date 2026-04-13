@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.8.0
+ * Version: 4.8.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '4.8.0';
+    private $version = '4.8.1';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -4179,12 +4179,15 @@ class Mehrana_App_Plugin
         // Method 3: Custom option-based redirect (fallback)
         if (!$method_used) {
             $redirects = get_option('mehrana_redirects', []);
-            $redirects[$from_path] = [
-                'to' => $to_url,
+            // Migrate old format (path-keyed) to new format (numeric-keyed with from_url)
+            $redirects = $this->normalize_custom_redirects($redirects);
+            $redirects[] = [
+                'from_url' => $from_path,
+                'to_url' => sanitize_text_field($to_url),
                 'type' => $type,
                 'created' => current_time('mysql')
             ];
-            update_option('mehrana_redirects', $redirects);
+            update_option('mehrana_redirects', array_values($redirects));
             $method_used = 'mehrana_custom';
             $this->log("[CREATE_REDIRECT] Created via Mehrana custom option");
 
@@ -4202,6 +4205,30 @@ class Mehrana_App_Plugin
             'method' => $method_used,
             'message' => "Redirect created via {$method_used}"
         ]);
+    }
+
+    /**
+     * Normalize custom redirects from old format (path-keyed assoc array)
+     * to new format (numeric-indexed with from_url field).
+     */
+    private function normalize_custom_redirects($custom) {
+        if (empty($custom)) return [];
+        $normalized = [];
+        foreach ($custom as $key => $val) {
+            if (is_string($key) && !is_numeric($key)) {
+                // Old format: path is the key, value has 'to'
+                $normalized[] = [
+                    'from_url' => $key,
+                    'to_url' => is_array($val) ? ($val['to'] ?? ($val['to_url'] ?? '')) : $val,
+                    'type' => is_array($val) ? (int)($val['type'] ?? 301) : 301,
+                    'created' => is_array($val) ? ($val['created'] ?? '') : '',
+                ];
+            } else {
+                // New format: numeric key, from_url in value
+                $normalized[] = $val;
+            }
+        }
+        return array_values($normalized);
     }
 
     /**
@@ -4877,11 +4904,13 @@ class Mehrana_App_Plugin
 
         // 3. Custom Mehrana redirects
         $custom = get_option('mehrana_redirects', []);
+        $custom = $this->normalize_custom_redirects($custom);
         foreach ($custom as $idx => $r) {
+            if (empty($r['from_url'])) continue;
             $redirects[] = [
                 'id' => 'custom_' . $idx,
                 'fromUrl' => $r['from_url'],
-                'toUrl' => $r['to_url'],
+                'toUrl' => $r['to_url'] ?? ($r['to'] ?? ''),
                 'type' => (int) ($r['type'] ?? 301),
                 'isActive' => true,
                 'source' => 'mehrana',
@@ -4935,8 +4964,9 @@ class Mehrana_App_Plugin
         if (strpos($id, 'custom_') === 0) {
             $idx = intval(str_replace('custom_', '', $id));
             $custom = get_option('mehrana_redirects', []);
+            $custom = $this->normalize_custom_redirects($custom);
             if (isset($custom[$idx])) {
-                if (isset($body['toUrl'])) $custom[$idx]['to'] = esc_url_raw($body['toUrl']);
+                if (isset($body['toUrl'])) $custom[$idx]['to_url'] = sanitize_text_field($body['toUrl']);
                 if (isset($body['type'])) $custom[$idx]['type'] = intval($body['type']);
                 update_option('mehrana_redirects', $custom);
                 return rest_ensure_response(['success' => true]);
@@ -4981,11 +5011,11 @@ class Mehrana_App_Plugin
         if (strpos($id, 'custom_') === 0) {
             $idx = intval(str_replace('custom_', '', $id));
             $custom = get_option('mehrana_redirects', []);
+            $custom = $this->normalize_custom_redirects($custom);
             if (isset($custom[$idx])) {
-                array_splice($custom, $idx, 1);
-                update_option('mehrana_redirects', $custom);
+                unset($custom[$idx]);
+                update_option('mehrana_redirects', array_values($custom));
                 $this->log("Deleted custom redirect #{$idx}");
-                return rest_ensure_response(['success' => true]);
             }
             return rest_ensure_response(['success' => true]);
         }
