@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.6.0
+ * Version: 4.7.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -376,6 +376,20 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/breadcrumb/override/(?P<id>\d+)', [
             'methods' => 'DELETE',
             'callback' => [$this, 'linklab_delete_breadcrumb_override'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Exclude URL from sitemap
+        register_rest_route($this->namespace, '/sitemap/exclude', [
+            'methods' => 'POST',
+            'callback' => [$this, 'linklab_sitemap_exclude'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Include URL in sitemap (undo exclude)
+        register_rest_route($this->namespace, '/sitemap/include', [
+            'methods' => 'POST',
+            'callback' => [$this, 'linklab_sitemap_include'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -5073,6 +5087,114 @@ class Mehrana_App_Plugin
             update_option('mehrana_breadcrumb_overrides', $overrides);
         }
         return rest_ensure_response(['success' => true]);
+    }
+
+    /**
+     * POST /sitemap/exclude — Remove a URL from the XML sitemap
+     * Works with Rank Math and Yoast. For pages: sets noindex. For redirect URLs: adds to exclusion list.
+     */
+    public function linklab_sitemap_exclude($request) {
+        $body = $request->get_json_params();
+        $url = isset($body['url']) ? esc_url_raw($body['url']) : '';
+        if (!$url) {
+            return new \WP_Error('missing_url', 'URL is required', ['status' => 400]);
+        }
+
+        $this->log("[SITEMAP_EXCLUDE] Excluding: {$url}");
+
+        // Try to find the post by URL
+        $post_id = url_to_postid($url);
+
+        // If no direct match, try searching by slug
+        if (!$post_id) {
+            $path = wp_parse_url($url, PHP_URL_PATH);
+            $slug = trim($path, '/');
+            $slug_parts = explode('/', $slug);
+            $final_slug = end($slug_parts);
+
+            if ($final_slug) {
+                global $wpdb;
+                $post_id = $wpdb->get_var($wpdb->prepare(
+                    "SELECT ID FROM $wpdb->posts WHERE post_name = %s AND post_status = 'publish' LIMIT 1",
+                    $final_slug
+                ));
+            }
+        }
+
+        $method_used = null;
+
+        if ($post_id) {
+            // Found the actual page — set noindex via SEO plugin (auto-excludes from sitemap)
+            if (class_exists('RankMath')) {
+                $robots = get_post_meta($post_id, 'rank_math_robots', true);
+                if (!is_array($robots)) $robots = ['index'];
+                $robots = array_filter($robots, fn($v) => $v !== 'index' && $v !== 'noindex');
+                $robots[] = 'noindex';
+                update_post_meta($post_id, 'rank_math_robots', array_values($robots));
+                $method_used = 'rank_math_noindex';
+                $this->log("[SITEMAP_EXCLUDE] Set noindex via Rank Math for post {$post_id}");
+            } elseif (defined('WPSEO_VERSION')) {
+                update_post_meta($post_id, '_yoast_wpseo_meta-robots-noindex', '1');
+                $method_used = 'yoast_noindex';
+                $this->log("[SITEMAP_EXCLUDE] Set noindex via Yoast for post {$post_id}");
+            }
+        }
+
+        // Also add to custom exclusion list (works even for URLs without a page, e.g. redirect rules)
+        if (!$method_used) {
+            $exclusions = get_option('mehrana_sitemap_exclusions', []);
+            if (!in_array($url, $exclusions)) {
+                $exclusions[] = $url;
+                update_option('mehrana_sitemap_exclusions', $exclusions);
+                $method_used = 'custom_exclusion';
+                $this->log("[SITEMAP_EXCLUDE] Added to custom exclusion list");
+            }
+        }
+
+        return rest_ensure_response([
+            'success' => true,
+            'url' => $url,
+            'postId' => $post_id ?: null,
+            'method' => $method_used,
+        ]);
+    }
+
+    /**
+     * POST /sitemap/include — Re-include a URL in the XML sitemap (undo exclude)
+     */
+    public function linklab_sitemap_include($request) {
+        $body = $request->get_json_params();
+        $url = isset($body['url']) ? esc_url_raw($body['url']) : '';
+        if (!$url) {
+            return new \WP_Error('missing_url', 'URL is required', ['status' => 400]);
+        }
+
+        $this->log("[SITEMAP_INCLUDE] Re-including: {$url}");
+
+        $post_id = url_to_postid($url);
+
+        if ($post_id) {
+            if (class_exists('RankMath')) {
+                $robots = get_post_meta($post_id, 'rank_math_robots', true);
+                if (is_array($robots)) {
+                    $robots = array_filter($robots, fn($v) => $v !== 'noindex');
+                    $robots[] = 'index';
+                    update_post_meta($post_id, 'rank_math_robots', array_values($robots));
+                }
+            } elseif (defined('WPSEO_VERSION')) {
+                update_post_meta($post_id, '_yoast_wpseo_meta-robots-noindex', '0');
+            }
+        }
+
+        // Remove from custom exclusion list
+        $exclusions = get_option('mehrana_sitemap_exclusions', []);
+        $exclusions = array_values(array_filter($exclusions, fn($u) => $u !== $url));
+        update_option('mehrana_sitemap_exclusions', $exclusions);
+
+        return rest_ensure_response([
+            'success' => true,
+            'url' => $url,
+        ]);
     }
 
     /**
