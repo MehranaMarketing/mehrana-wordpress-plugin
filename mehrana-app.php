@@ -4779,9 +4779,51 @@ class Mehrana_App_Plugin
         }
 
         $old_url = $menu_item->url;
+        $item_type = get_post_meta($item_id, '_menu_item_type', true);
 
-        // Update the menu item URL
+        // Page/post/taxonomy menu items derive their URL from the linked object — can't safely change via API
+        if ($item_type !== 'custom') {
+            return new \WP_Error('not_custom_link',
+                "This menu item is a {$item_type} link (URL comes from the linked {$item_type}). Change it in WordPress → Appearance → Menus.",
+                ['status' => 400]
+            );
+        }
+
+        // Custom link — update the URL directly
         update_post_meta($item_id, '_menu_item_url', $new_url);
+
+        // Clear caches so the menu change is visible immediately
+        // WordPress nav menu cache
+        wp_cache_delete('last_changed', 'nav_menus');
+        wp_cache_flush();
+
+        // LiteSpeed Cache
+        if (class_exists('LiteSpeed\Purge') || function_exists('litespeed_purge_all')) {
+            if (function_exists('litespeed_purge_all')) {
+                litespeed_purge_all();
+            } elseif (method_exists('LiteSpeed\Purge', 'purge_all')) {
+                \LiteSpeed\Purge::purge_all();
+            }
+            $this->log("[MENU_UPDATE] LiteSpeed cache purged");
+        }
+
+        // WP Rocket
+        if (function_exists('rocket_clean_domain')) {
+            rocket_clean_domain();
+            $this->log("[MENU_UPDATE] WP Rocket cache purged");
+        }
+
+        // WP Super Cache
+        if (function_exists('wp_cache_clear_cache')) {
+            wp_cache_clear_cache();
+        }
+
+        // W3 Total Cache
+        if (function_exists('w3tc_flush_all')) {
+            w3tc_flush_all();
+        }
+
+        $this->log("[MENU_UPDATE] Updated menu item {$item_id}: {$old_url} → {$new_url}");
 
         return rest_ensure_response([
             'success' => true,
