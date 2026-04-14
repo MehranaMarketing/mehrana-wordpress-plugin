@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.8.1
+ * Version: 4.8.2
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '4.8.1';
+    private $version = '4.8.2';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -4148,6 +4148,7 @@ class Mehrana_App_Plugin
                             'updated' => current_time('mysql')
                         ]);
                         $method_used = 'rank_math';
+                        $this->flush_rank_math_redirect_cache();
                         $this->log("[CREATE_REDIRECT] Created via Rank Math");
                     } else {
                         return new WP_Error('redirect_exists', 'Redirect already exists', ['status' => 409]);
@@ -4205,6 +4206,24 @@ class Mehrana_App_Plugin
             'method' => $method_used,
             'message' => "Redirect created via {$method_used}"
         ]);
+    }
+
+    /**
+     * Flush Rank Math redirect cache after direct DB changes.
+     * Without this, Rank Math serves stale cached redirects.
+     */
+    private function flush_rank_math_redirect_cache() {
+        global $wpdb;
+        // Clear Rank Math's internal redirect cache (transients + options)
+        $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '%rank_math%redirection%cache%'");
+        $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient%rank_math%redirect%'");
+        // Clear object cache
+        wp_cache_delete('redirections', 'rank_math');
+        // Trigger Rank Math's own cache clear if available
+        if (class_exists('RankMath\\Redirections\\Cache')) {
+            try { \RankMath\Redirections\Cache::clear(); } catch (\Exception $e) {}
+        }
+        $this->log("[RANK_MATH] Flushed redirect cache");
     }
 
     /**
@@ -4938,6 +4957,7 @@ class Mehrana_App_Plugin
             if (isset($body['isActive'])) $update['status'] = $body['isActive'] ? 'active' : 'inactive';
             if (!empty($update)) {
                 $wpdb->update($table, $update, ['id' => $rm_id]);
+                $this->flush_rank_math_redirect_cache();
             }
             return rest_ensure_response(['success' => true]);
         }
@@ -4989,6 +5009,7 @@ class Mehrana_App_Plugin
             $rm_id = intval(str_replace('rm_', '', $id));
             $table = $wpdb->prefix . 'rank_math_redirections';
             $wpdb->delete($table, ['id' => $rm_id]);
+            $this->flush_rank_math_redirect_cache();
             $this->log("Deleted Rank Math redirect #{$rm_id}");
             return rest_ensure_response(['success' => true]);
         }
