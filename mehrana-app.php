@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.8.2
+ * Version: 4.8.4
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '4.8.2';
+    private $version = '4.8.4';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -48,12 +48,64 @@ class Mehrana_App_Plugin
 
         // Register hooks that need 'init'
         add_action('init', [$this, 'init_actions']);
+
+        // Daily cron that prunes image backups older than 24h
+        add_action('mehrana_prune_image_backups', [$this, 'prune_image_backups']);
+        register_activation_hook(__FILE__, [__CLASS__, 'schedule_prune_cron']);
+        register_deactivation_hook(__FILE__, [__CLASS__, 'unschedule_prune_cron']);
     }
 
     public function init_actions()
     {
         // Register [iframe] shortcode for Google Maps
         add_shortcode('iframe', [$this, 'render_iframe_shortcode']);
+
+        // Ensure cron is scheduled (self-heal in case activation hook didn't fire,
+        // e.g. plugin updated via git pull rather than reinstall).
+        if (!wp_next_scheduled('mehrana_prune_image_backups')) {
+            wp_schedule_event(time() + 300, 'hourly', 'mehrana_prune_image_backups');
+        }
+    }
+
+    public static function schedule_prune_cron()
+    {
+        if (!wp_next_scheduled('mehrana_prune_image_backups')) {
+            wp_schedule_event(time() + 300, 'hourly', 'mehrana_prune_image_backups');
+        }
+    }
+
+    public static function unschedule_prune_cron()
+    {
+        $ts = wp_next_scheduled('mehrana_prune_image_backups');
+        if ($ts) {
+            wp_unschedule_event($ts, 'mehrana_prune_image_backups');
+        }
+    }
+
+    /**
+     * Delete backup files in mehrana-backups older than 24 hours.
+     * Runs hourly; each backup gets a 24h grace window for undo.
+     */
+    public function prune_image_backups()
+    {
+        $upload_dir = wp_upload_dir();
+        $backup_dir = $upload_dir['basedir'] . '/mehrana-backups';
+        if (!is_dir($backup_dir)) return;
+
+        $cutoff = time() - 86400; // 24 hours
+        $deleted = 0;
+        foreach (glob($backup_dir . '/*') as $path) {
+            if (!is_file($path)) continue;
+            $base = basename($path);
+            // Skip .htaccess / index.php protections
+            if ($base === '.htaccess' || $base === 'index.php') continue;
+            if (filemtime($path) < $cutoff) {
+                if (@unlink($path)) $deleted++;
+            }
+        }
+        if ($deleted > 0) {
+            $this->log("[PRUNE_BACKUPS] Deleted $deleted backup file(s) older than 24h");
+        }
     }
 
     /**
@@ -148,6 +200,14 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/media/(?P<id>\d+)/replace', [
             'methods' => 'POST',
             'callback' => [$this, 'replace_media'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Stream raw attachment bytes from disk — bypasses Cloudflare Polish
+        // so repeat compress cycles start from the real origin file.
+        register_rest_route($this->namespace, '/media/(?P<id>\d+)/raw', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_raw_media'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -1033,6 +1093,54 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * Stream raw attachment bytes from local disk.
+     * Used by the CRM compressor to avoid Cloudflare Polish / CDN transformations
+     * re-encoding the source image on each compress cycle.
+     */
+    public function get_raw_media($request)
+    {
+        $id = intval($request['id']);
+        $attachment = get_post($id);
+        if (!$attachment || $attachment->post_type !== 'attachment') {
+            return new WP_Error('invalid_id', 'Invalid attachment ID', ['status' => 404]);
+        }
+
+        $file = get_attached_file($id);
+
+        // If get_attached_file returned a URL (S3 offload), resolve to local path.
+        if ($file && (strpos($file, 'http://') === 0 || strpos($file, 'https://') === 0)) {
+            $upload_dir = wp_upload_dir();
+            $metadata = wp_get_attachment_metadata($id);
+            if (!empty($metadata['file'])) {
+                $file = $upload_dir['basedir'] . '/' . $metadata['file'];
+            } else {
+                $parsed = parse_url($file);
+                if (!empty($parsed['path']) && preg_match('/\/wp-content\/uploads\/(.+)$/', $parsed['path'], $m)) {
+                    $file = $upload_dir['basedir'] . '/' . $m[1];
+                }
+            }
+        }
+
+        if (!$file || !file_exists($file)) {
+            return new WP_Error('not_found', 'Local file missing for attachment ' . $id, ['status' => 404]);
+        }
+
+        $mime = $attachment->post_mime_type ?: 'application/octet-stream';
+        $size = filesize($file);
+
+        // Stream raw bytes with cache-bust headers.
+        if (!headers_sent()) {
+            header('Content-Type: ' . $mime);
+            header('Content-Length: ' . $size);
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+            header('Pragma: no-cache');
+            header('X-Mehrana-Raw: 1');
+        }
+        readfile($file);
+        exit;
+    }
+
+    /**
      * Replace media with optimized version (creates backup first)
      * Expects: base64 encoded image data
      * Supports S3 offloaded files via WP Offload Media
@@ -1696,6 +1804,8 @@ class Mehrana_App_Plugin
         $backup_filename = $request->get_param('backup_filename');
         $backup_path = $request->get_param('backup_path'); // Also support direct path
 
+        $this->log("[RESTORE_MEDIA] Called for attachment ID: $id, backup: " . ($backup_filename ?: $backup_path));
+
         // Construct backup path from filename if needed
         if ($backup_filename && !$backup_path) {
             $upload_dir = wp_upload_dir();
@@ -1770,6 +1880,8 @@ class Mehrana_App_Plugin
         // Get restored info
         $new_url = wp_get_attachment_url($id);
         $metadata = wp_get_attachment_metadata($id);
+
+        $this->log("[RESTORE_MEDIA] SUCCESS! Restored $restore_path from backup, size: " . filesize($restore_path));
 
         return rest_ensure_response([
             'success' => true,
