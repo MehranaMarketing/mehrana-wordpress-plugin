@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.8.5
+ * Version: 4.8.6
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -53,6 +53,17 @@ class Mehrana_App_Plugin
         add_action('mehrana_prune_image_backups', [$this, 'prune_image_backups']);
         register_activation_hook(__FILE__, [__CLASS__, 'schedule_prune_cron']);
         register_deactivation_hook(__FILE__, [__CLASS__, 'unschedule_prune_cron']);
+
+        // Sitemap exclusion hooks — inject Mehrana's excluded post IDs / URLs into every
+        // known sitemap provider so the XML output skips them without touching noindex.
+        // Rank Math, Yoast, and WordPress core all expose filters for this.
+        add_filter('rank_math/sitemap/exclude_posts', [$this, 'filter_sitemap_excluded_ids_csv']);
+        add_filter('rank_math/sitemap/excluded_posts', [$this, 'filter_sitemap_excluded_ids_array']);
+        add_filter('rank_math/sitemap/exclude_post_ids', [$this, 'filter_sitemap_excluded_ids_array']);
+        add_filter('rank_math/sitemap/entry', [$this, 'filter_sitemap_entry_by_url'], 10, 2);
+        add_filter('wpseo_exclude_from_sitemap_by_post_ids', [$this, 'filter_sitemap_excluded_ids_array']);
+        add_filter('wpseo_sitemap_urlimages', [$this, 'filter_sitemap_urls_array']);
+        add_filter('wp_sitemaps_posts_query_args', [$this, 'filter_core_sitemap_query_args']);
     }
 
     public function init_actions()
@@ -450,6 +461,13 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/sitemap/include', [
             'methods' => 'POST',
             'callback' => [$this, 'linklab_sitemap_include'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // List current sitemap exclusions (post IDs + URLs)
+        register_rest_route($this->namespace, '/sitemap/exclusions', [
+            'methods' => 'GET',
+            'callback' => [$this, 'linklab_sitemap_exclusions'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -5366,6 +5384,154 @@ class Mehrana_App_Plugin
      * POST /sitemap/exclude — Remove a URL from the XML sitemap
      * Works with Rank Math and Yoast. For pages: sets noindex. For redirect URLs: adds to exclusion list.
      */
+    // ── Sitemap exclusion: helpers ──────────────────────────────────────────
+
+    /**
+     * Return the canonical list of post IDs we want excluded from the XML sitemap.
+     */
+    private function get_sitemap_excluded_ids() {
+        $ids = get_option('mehrana_sitemap_excluded_ids', []);
+        if (!is_array($ids)) return [];
+        return array_values(array_unique(array_map('intval', array_filter($ids))));
+    }
+
+    /**
+     * Return the canonical list of URLs (non-post URLs like archives) we want excluded.
+     */
+    private function get_sitemap_excluded_urls() {
+        // Merge new + legacy option name so old installs don't lose data.
+        $new = get_option('mehrana_sitemap_excluded_urls', []);
+        $legacy = get_option('mehrana_sitemap_exclusions', []);
+        $all = array_merge(is_array($new) ? $new : [], is_array($legacy) ? $legacy : []);
+        $all = array_values(array_unique(array_map(function($u) {
+            return is_string($u) ? untrailingslashit($u) : '';
+        }, array_filter($all))));
+        return array_values(array_filter($all));
+    }
+
+    /**
+     * Flush every sitemap cache we know about so the next request regenerates the XML.
+     */
+    private function flush_sitemap_caches() {
+        global $wpdb;
+        try {
+            // Rank Math sitemap cache (transients + options)
+            $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '%rank_math%sitemap%cache%'");
+            $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient%rank_math%sitemap%'");
+            // Yoast sitemap cache
+            $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient%yoast_sitemap%'");
+            $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient%wpseo_sitemap%'");
+            // Object cache
+            wp_cache_delete('sitemap', 'rank_math');
+            // Core WP sitemap cache (last-modified data)
+            delete_transient('wp_sitemaps_lastmod');
+            // Rank Math's own cache clear
+            if (class_exists('RankMath\\Sitemap\\Cache')) {
+                try { \RankMath\Sitemap\Cache::invalidate_storage(); } catch (\Throwable $e) {
+                    $this->log("[SITEMAP_CACHE] Cache::invalidate_storage threw: " . $e->getMessage());
+                }
+            }
+            // Yoast cache ping
+            if (class_exists('WPSEO_Sitemaps_Cache')) {
+                try { \WPSEO_Sitemaps_Cache::clear(); } catch (\Throwable $e) {
+                    $this->log("[SITEMAP_CACHE] WPSEO clear threw: " . $e->getMessage());
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->log("[SITEMAP_CACHE] flush threw: " . $e->getMessage());
+        }
+        $this->log("[SITEMAP_CACHE] Flushed sitemap caches");
+    }
+
+    // ── Sitemap exclusion: filter callbacks ─────────────────────────────────
+
+    /**
+     * Rank Math's exclude_posts hook expects a CSV string of IDs in some versions.
+     */
+    public function filter_sitemap_excluded_ids_csv($csv) {
+        $existing = [];
+        if (is_string($csv) && $csv !== '') {
+            $existing = array_map('intval', array_filter(explode(',', $csv)));
+        } elseif (is_array($csv)) {
+            $existing = array_map('intval', $csv);
+        }
+        $merged = array_unique(array_merge($existing, $this->get_sitemap_excluded_ids()));
+        return implode(',', $merged);
+    }
+
+    /**
+     * Array variant — Rank Math / Yoast both use this shape for post-ID exclusions.
+     */
+    public function filter_sitemap_excluded_ids_array($ids) {
+        $ids = is_array($ids) ? array_map('intval', $ids) : [];
+        return array_values(array_unique(array_merge($ids, $this->get_sitemap_excluded_ids())));
+    }
+
+    /**
+     * URL-based exclusion — strip URLs that match our list from the output array.
+     */
+    public function filter_sitemap_urls_array($urls) {
+        if (!is_array($urls)) return $urls;
+        $excluded = $this->get_sitemap_excluded_urls();
+        if (empty($excluded)) return $urls;
+        $excluded_set = array_flip($excluded);
+        return array_values(array_filter($urls, function($u) use ($excluded_set) {
+            if (!is_string($u)) return true;
+            return !isset($excluded_set[untrailingslashit($u)]);
+        }));
+    }
+
+    /**
+     * Per-entry filter used by Rank Math — drop the entry if its loc matches an excluded URL
+     * or if its post (when present) is in the excluded ID list. Return false to skip.
+     */
+    public function filter_sitemap_entry_by_url($url, $type = '', $post = null) {
+        // Some Rank Math hook variants pass only ($url); be defensive.
+        if (!is_array($url)) return $url;
+        $loc = isset($url['loc']) ? (string) $url['loc'] : '';
+        if ($loc) {
+            $excluded_urls = $this->get_sitemap_excluded_urls();
+            if (in_array(untrailingslashit($loc), $excluded_urls, true)) return false;
+        }
+        if (is_object($post) && isset($post->ID)) {
+            if (in_array((int) $post->ID, $this->get_sitemap_excluded_ids(), true)) return false;
+        }
+        return $url;
+    }
+
+    /**
+     * Core WordPress sitemap provider — merge post__not_in.
+     */
+    public function filter_core_sitemap_query_args($args) {
+        $excluded = $this->get_sitemap_excluded_ids();
+        if (empty($excluded)) return $args;
+        $existing = isset($args['post__not_in']) && is_array($args['post__not_in']) ? $args['post__not_in'] : [];
+        $args['post__not_in'] = array_values(array_unique(array_merge($existing, $excluded)));
+        return $args;
+    }
+
+    /**
+     * Resolve a URL to a post ID, trying url_to_postid first then a slug lookup.
+     */
+    private function resolve_url_to_post_id($url) {
+        $post_id = url_to_postid($url);
+        if ($post_id) return (int) $post_id;
+
+        $path = wp_parse_url($url, PHP_URL_PATH);
+        if (!$path) return 0;
+        $slug = trim($path, '/');
+        $parts = explode('/', $slug);
+        $final_slug = end($parts);
+        if (!$final_slug) return 0;
+
+        global $wpdb;
+        $found = $wpdb->get_var($wpdb->prepare(
+            "SELECT ID FROM $wpdb->posts WHERE post_name = %s AND post_status = 'publish' LIMIT 1",
+            $final_slug
+        ));
+        return $found ? (int) $found : 0;
+    }
+
     public function linklab_sitemap_exclude($request) {
         $body = $request->get_json_params();
         $url = isset($body['url']) ? esc_url_raw($body['url']) : '';
@@ -5373,56 +5539,33 @@ class Mehrana_App_Plugin
             return new \WP_Error('missing_url', 'URL is required', ['status' => 400]);
         }
 
-        $this->log("[SITEMAP_EXCLUDE] Excluding: {$url}");
+        $this->log("[SITEMAP_EXCLUDE] Excluding (sitemap-only, no noindex): {$url}");
 
-        // Try to find the post by URL
-        $post_id = url_to_postid($url);
-
-        // If no direct match, try searching by slug
-        if (!$post_id) {
-            $path = wp_parse_url($url, PHP_URL_PATH);
-            $slug = trim($path, '/');
-            $slug_parts = explode('/', $slug);
-            $final_slug = end($slug_parts);
-
-            if ($final_slug) {
-                global $wpdb;
-                $post_id = $wpdb->get_var($wpdb->prepare(
-                    "SELECT ID FROM $wpdb->posts WHERE post_name = %s AND post_status = 'publish' LIMIT 1",
-                    $final_slug
-                ));
-            }
-        }
-
+        $post_id = $this->resolve_url_to_post_id($url);
         $method_used = null;
 
         if ($post_id) {
-            // Found the actual page — set noindex via SEO plugin (auto-excludes from sitemap)
-            if (class_exists('RankMath')) {
-                $robots = get_post_meta($post_id, 'rank_math_robots', true);
-                if (!is_array($robots)) $robots = ['index'];
-                $robots = array_filter($robots, fn($v) => $v !== 'index' && $v !== 'noindex');
-                $robots[] = 'noindex';
-                update_post_meta($post_id, 'rank_math_robots', array_values($robots));
-                $method_used = 'rank_math_noindex';
-                $this->log("[SITEMAP_EXCLUDE] Set noindex via Rank Math for post {$post_id}");
-            } elseif (defined('WPSEO_VERSION')) {
-                update_post_meta($post_id, '_yoast_wpseo_meta-robots-noindex', '1');
-                $method_used = 'yoast_noindex';
-                $this->log("[SITEMAP_EXCLUDE] Set noindex via Yoast for post {$post_id}");
+            // Post found — exclude by ID so Rank Math / Yoast / core all drop it.
+            $ids = $this->get_sitemap_excluded_ids();
+            if (!in_array($post_id, $ids, true)) {
+                $ids[] = $post_id;
+                update_option('mehrana_sitemap_excluded_ids', array_values($ids));
             }
+            $method_used = 'post_id';
+            $this->log("[SITEMAP_EXCLUDE] Added post ID {$post_id} to excluded list");
+        } else {
+            // Non-post URL (archive, tag page, custom route) — exclude by URL string.
+            $urls = $this->get_sitemap_excluded_urls();
+            $normalized = untrailingslashit($url);
+            if (!in_array($normalized, $urls, true)) {
+                $urls[] = $normalized;
+                update_option('mehrana_sitemap_excluded_urls', array_values($urls));
+            }
+            $method_used = 'url';
+            $this->log("[SITEMAP_EXCLUDE] Added URL to excluded list");
         }
 
-        // Also add to custom exclusion list (works even for URLs without a page, e.g. redirect rules)
-        if (!$method_used) {
-            $exclusions = get_option('mehrana_sitemap_exclusions', []);
-            if (!in_array($url, $exclusions)) {
-                $exclusions[] = $url;
-                update_option('mehrana_sitemap_exclusions', $exclusions);
-                $method_used = 'custom_exclusion';
-                $this->log("[SITEMAP_EXCLUDE] Added to custom exclusion list");
-            }
-        }
+        $this->flush_sitemap_caches();
 
         return rest_ensure_response([
             'success' => true,
@@ -5444,29 +5587,71 @@ class Mehrana_App_Plugin
 
         $this->log("[SITEMAP_INCLUDE] Re-including: {$url}");
 
-        $post_id = url_to_postid($url);
+        $post_id = $this->resolve_url_to_post_id($url);
+        $normalized = untrailingslashit($url);
 
+        // Remove from excluded-IDs list
+        if ($post_id) {
+            $ids = $this->get_sitemap_excluded_ids();
+            $ids = array_values(array_filter($ids, fn($i) => (int) $i !== (int) $post_id));
+            update_option('mehrana_sitemap_excluded_ids', $ids);
+        }
+
+        // Remove from URL list (both new + legacy option names)
+        $urls = get_option('mehrana_sitemap_excluded_urls', []);
+        if (is_array($urls)) {
+            $urls = array_values(array_filter($urls, fn($u) => is_string($u) && untrailingslashit($u) !== $normalized));
+            update_option('mehrana_sitemap_excluded_urls', $urls);
+        }
+        $legacy = get_option('mehrana_sitemap_exclusions', []);
+        if (is_array($legacy)) {
+            $legacy = array_values(array_filter($legacy, fn($u) => is_string($u) && $u !== $url && untrailingslashit($u) !== $normalized));
+            update_option('mehrana_sitemap_exclusions', $legacy);
+        }
+
+        // Best-effort legacy cleanup: if a previous plugin version added noindex via
+        // this exact endpoint, remove it now so including really restores the page.
         if ($post_id) {
             if (class_exists('RankMath')) {
                 $robots = get_post_meta($post_id, 'rank_math_robots', true);
-                if (is_array($robots)) {
-                    $robots = array_filter($robots, fn($v) => $v !== 'noindex');
-                    $robots[] = 'index';
-                    update_post_meta($post_id, 'rank_math_robots', array_values($robots));
+                if (is_array($robots) && in_array('noindex', $robots, true)) {
+                    $robots = array_values(array_filter($robots, fn($v) => $v !== 'noindex'));
+                    update_post_meta($post_id, 'rank_math_robots', $robots);
+                    $this->log("[SITEMAP_INCLUDE] Removed legacy noindex for post {$post_id}");
                 }
             } elseif (defined('WPSEO_VERSION')) {
-                update_post_meta($post_id, '_yoast_wpseo_meta-robots-noindex', '0');
+                $noindex = get_post_meta($post_id, '_yoast_wpseo_meta-robots-noindex', true);
+                if ($noindex === '1') {
+                    update_post_meta($post_id, '_yoast_wpseo_meta-robots-noindex', '0');
+                    $this->log("[SITEMAP_INCLUDE] Cleared legacy Yoast noindex for post {$post_id}");
+                }
             }
         }
 
-        // Remove from custom exclusion list
-        $exclusions = get_option('mehrana_sitemap_exclusions', []);
-        $exclusions = array_values(array_filter($exclusions, fn($u) => $u !== $url));
-        update_option('mehrana_sitemap_exclusions', $exclusions);
+        $this->flush_sitemap_caches();
 
         return rest_ensure_response([
             'success' => true,
             'url' => $url,
+            'postId' => $post_id ?: null,
+        ]);
+    }
+
+    /**
+     * GET /sitemap/exclusions — list current sitemap exclusions so Patrick can show them.
+     */
+    public function linklab_sitemap_exclusions($request) {
+        $ids = $this->get_sitemap_excluded_ids();
+        $urls_from_ids = [];
+        foreach ($ids as $id) {
+            $permalink = get_permalink($id);
+            if ($permalink) {
+                $urls_from_ids[] = ['id' => (int) $id, 'url' => $permalink];
+            }
+        }
+        return rest_ensure_response([
+            'postIds' => $urls_from_ids,
+            'urls' => $this->get_sitemap_excluded_urls(),
         ]);
     }
 
