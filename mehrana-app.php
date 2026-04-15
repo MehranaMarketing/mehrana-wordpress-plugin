@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.8.4
+ * Version: 4.8.5
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -4326,14 +4326,22 @@ class Mehrana_App_Plugin
      */
     private function flush_rank_math_redirect_cache() {
         global $wpdb;
-        // Clear Rank Math's internal redirect cache (transients + options)
-        $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '%rank_math%redirection%cache%'");
-        $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient%rank_math%redirect%'");
-        // Clear object cache
-        wp_cache_delete('redirections', 'rank_math');
-        // Trigger Rank Math's own cache clear if available
-        if (class_exists('RankMath\\Redirections\\Cache')) {
-            try { \RankMath\Redirections\Cache::clear(); } catch (\Exception $e) {}
+        try {
+            // Clear Rank Math's internal redirect cache (transients + options)
+            $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '%rank_math%redirection%cache%'");
+            $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient%rank_math%redirect%'");
+            // Clear object cache
+            wp_cache_delete('redirections', 'rank_math');
+            // Trigger Rank Math's own cache clear if available. Catch Throwable because
+            // Rank Math's internals can fatal (missing deps, signature changes) and we do
+            // NOT want that to fail the outer delete/update — the DB row is already changed.
+            if (class_exists('RankMath\\Redirections\\Cache')) {
+                try { \RankMath\Redirections\Cache::clear(); } catch (\Throwable $e) {
+                    $this->log("[RANK_MATH] Cache::clear threw: " . $e->getMessage());
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->log("[RANK_MATH] flush cache threw: " . $e->getMessage());
         }
         $this->log("[RANK_MATH] Flushed redirect cache");
     }
@@ -5001,7 +5009,9 @@ class Mehrana_App_Plugin
         // 1. Rank Math redirections
         $table = $wpdb->prefix . 'rank_math_redirections';
         if ($wpdb->get_var("SHOW TABLES LIKE '$table'") === $table) {
-            $rows = $wpdb->get_results("SELECT id, sources, url_to, header_code, status FROM $table ORDER BY id DESC LIMIT 500");
+            // Exclude trashed rows — those are soft-deleted and should not appear in the UI.
+            // Keep 'active' + 'inactive' so users can toggle enabled state.
+            $rows = $wpdb->get_results("SELECT id, sources, url_to, header_code, status FROM $table WHERE status != 'trashed' ORDER BY id DESC LIMIT 500");
             foreach ($rows as $row) {
                 $sources = maybe_unserialize($row->sources);
                 $from_url = is_array($sources) && isset($sources[0]['pattern']) ? $sources[0]['pattern'] : '';
@@ -5085,6 +5095,13 @@ class Mehrana_App_Plugin
                     if (isset($body['type'])) $update_data['action_code'] = intval($body['type']);
                     if (!empty($update_data)) {
                         $item->update($update_data);
+                    }
+                    if (isset($body['isActive'])) {
+                        try {
+                            if ($body['isActive']) { $item->enable(); } else { $item->disable(); }
+                        } catch (\Throwable $e) {
+                            $this->log("[REDIRECTION_PLUGIN] toggle failed: " . $e->getMessage());
+                        }
                     }
                     return rest_ensure_response(['success' => true]);
                 }
