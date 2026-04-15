@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.8.6
+ * Version: 4.8.7
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -60,9 +60,10 @@ class Mehrana_App_Plugin
         add_filter('rank_math/sitemap/exclude_posts', [$this, 'filter_sitemap_excluded_ids_csv']);
         add_filter('rank_math/sitemap/excluded_posts', [$this, 'filter_sitemap_excluded_ids_array']);
         add_filter('rank_math/sitemap/exclude_post_ids', [$this, 'filter_sitemap_excluded_ids_array']);
-        add_filter('rank_math/sitemap/entry', [$this, 'filter_sitemap_entry_by_url'], 10, 2);
+        add_filter('rank_math/sitemap/entry', [$this, 'filter_sitemap_entry_by_url'], 10, 3);
+        add_filter('rank_math/sitemap/urls', [$this, 'filter_sitemap_urls_array']);
         add_filter('wpseo_exclude_from_sitemap_by_post_ids', [$this, 'filter_sitemap_excluded_ids_array']);
-        add_filter('wpseo_sitemap_urlimages', [$this, 'filter_sitemap_urls_array']);
+        add_filter('wpseo_sitemap_url', [$this, 'filter_sitemap_entry_by_url'], 10, 2);
         add_filter('wp_sitemaps_posts_query_args', [$this, 'filter_core_sitemap_query_args']);
     }
 
