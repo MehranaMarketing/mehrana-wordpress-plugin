@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.8.7
+ * Version: 4.9.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '4.8.4';
+    private $version = '4.9.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -322,6 +322,28 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/pages/(?P<id>\d+)/seo', [
             'methods' => 'PUT',
             'callback' => [$this, 'update_page_seo'],
+            'permission_callback' => [$this, 'check_permission'],
+            'args' => [
+                'id' => [
+                    'required' => true,
+                    'validate_callback' => function ($param) {
+                        return is_numeric($param);
+                    }
+                ]
+            ]
+        ]);
+
+        // List all public taxonomy terms (categories, tags, product_cat, product_tag, ...)
+        register_rest_route($this->namespace, '/terms', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_terms'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Update term SEO meta (Rank Math / Yoast)
+        register_rest_route($this->namespace, '/terms/(?P<id>\d+)/seo', [
+            'methods' => 'PUT',
+            'callback' => [$this, 'update_term_seo'],
             'permission_callback' => [$this, 'check_permission'],
             'args' => [
                 'id' => [
@@ -4815,8 +4837,160 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * List all public taxonomy terms.
+     * Returns categories, tags, WooCommerce product_cat/product_tag, and any other
+     * public taxonomies. Used by On-Page Studio to resolve taxonomy-archive URLs
+     * (e.g. /product-category/cabinets/) that don't exist in the /pages response.
+     *
+     * @return WP_REST_Response
+     */
+    public function get_terms()
+    {
+        $taxonomies = get_taxonomies(['public' => true], 'names');
+        $exclude = ['nav_menu', 'link_category', 'post_format'];
+        $taxonomies = array_values(array_diff($taxonomies, $exclude));
+
+        $out = [];
+        foreach ($taxonomies as $taxonomy) {
+            $terms = get_terms([
+                'taxonomy' => $taxonomy,
+                'hide_empty' => false,
+                'number' => 0,
+            ]);
+            if (is_wp_error($terms)) continue;
+
+            foreach ($terms as $t) {
+                $url = get_term_link($t);
+                if (is_wp_error($url)) $url = '';
+                $out[] = [
+                    'id' => (int) $t->term_id,
+                    'name' => $t->name,
+                    'slug' => $t->slug,
+                    'taxonomy' => $t->taxonomy,
+                    'url' => $url,
+                    'description' => $t->description,
+                    'count' => (int) $t->count,
+                ];
+            }
+        }
+
+        return rest_ensure_response([
+            'success' => true,
+            'count' => count($out),
+            'terms' => $out,
+        ]);
+    }
+
+    /**
+     * Update SEO meta for a taxonomy term (Rank Math / Yoast).
+     * Rank Math stores term meta with the same keys as posts (rank_math_title etc.)
+     * via update_term_meta(). Yoast stores all term SEO in a single option
+     * (wpseo_taxonomy_meta) keyed by taxonomy and term ID.
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public function update_term_seo($request)
+    {
+        $term_id = intval($request['id']);
+        $body = $request->get_json_params();
+        $taxonomy = isset($body['taxonomy']) ? sanitize_key($body['taxonomy']) : '';
+
+        $term = $taxonomy ? get_term($term_id, $taxonomy) : get_term($term_id);
+        if (!$term || is_wp_error($term)) {
+            return new WP_Error('term_not_found', 'Term not found', ['status' => 404]);
+        }
+        $taxonomy = $term->taxonomy;
+
+        $this->log("[UPDATE_TERM_SEO] Updating SEO for term ID: {$term_id} (taxonomy: {$taxonomy})");
+
+        $has_rank_math = defined('RANK_MATH_VERSION');
+        $has_yoast = defined('WPSEO_VERSION');
+
+        // Load Yoast taxonomy meta option once if needed
+        $yoast_meta = null;
+        if ($has_yoast) {
+            $yoast_meta = get_option('wpseo_taxonomy_meta', []);
+            if (!is_array($yoast_meta)) $yoast_meta = [];
+            if (!isset($yoast_meta[$taxonomy])) $yoast_meta[$taxonomy] = [];
+            if (!isset($yoast_meta[$taxonomy][$term_id])) $yoast_meta[$taxonomy][$term_id] = [];
+        }
+
+        $updated = [];
+
+        if (isset($body['title'])) {
+            $title = sanitize_text_field($body['title']);
+            if ($has_rank_math) update_term_meta($term_id, 'rank_math_title', $title);
+            elseif ($has_yoast) $yoast_meta[$taxonomy][$term_id]['wpseo_title'] = $title;
+            $updated['title'] = $title;
+        }
+
+        if (isset($body['description'])) {
+            $desc = sanitize_textarea_field($body['description']);
+            if ($has_rank_math) update_term_meta($term_id, 'rank_math_description', $desc);
+            elseif ($has_yoast) $yoast_meta[$taxonomy][$term_id]['wpseo_desc'] = $desc;
+            $updated['description'] = $desc;
+        }
+
+        if (isset($body['focus_keyword'])) {
+            $kw = sanitize_text_field($body['focus_keyword']);
+            if ($has_rank_math) update_term_meta($term_id, 'rank_math_focus_keyword', $kw);
+            elseif ($has_yoast) $yoast_meta[$taxonomy][$term_id]['wpseo_focuskw'] = $kw;
+            $updated['focus_keyword'] = $kw;
+        }
+
+        if (isset($body['canonical'])) {
+            $canonical = esc_url_raw($body['canonical']);
+            if ($has_rank_math) update_term_meta($term_id, 'rank_math_canonical_url', $canonical);
+            elseif ($has_yoast) $yoast_meta[$taxonomy][$term_id]['wpseo_canonical'] = $canonical;
+            $updated['canonical'] = $canonical;
+        }
+
+        if (isset($body['og_title'])) {
+            $og_title = sanitize_text_field($body['og_title']);
+            if ($has_rank_math) update_term_meta($term_id, 'rank_math_facebook_title', $og_title);
+            elseif ($has_yoast) $yoast_meta[$taxonomy][$term_id]['wpseo_opengraph-title'] = $og_title;
+            $updated['og_title'] = $og_title;
+        }
+
+        if (isset($body['og_description'])) {
+            $og_desc = sanitize_textarea_field($body['og_description']);
+            if ($has_rank_math) update_term_meta($term_id, 'rank_math_facebook_description', $og_desc);
+            elseif ($has_yoast) $yoast_meta[$taxonomy][$term_id]['wpseo_opengraph-description'] = $og_desc;
+            $updated['og_description'] = $og_desc;
+        }
+
+        if (isset($body['og_image'])) {
+            $og_image = esc_url_raw($body['og_image']);
+            if ($has_rank_math) update_term_meta($term_id, 'rank_math_facebook_image', $og_image);
+            elseif ($has_yoast) $yoast_meta[$taxonomy][$term_id]['wpseo_opengraph-image'] = $og_image;
+            $updated['og_image'] = $og_image;
+        }
+
+        if (isset($body['og_url'])) {
+            $og_url = esc_url_raw($body['og_url']);
+            if ($has_rank_math) update_term_meta($term_id, 'rank_math_facebook_url', $og_url);
+            $updated['og_url'] = $og_url;
+        }
+
+        if ($has_yoast && $yoast_meta !== null) {
+            update_option('wpseo_taxonomy_meta', $yoast_meta);
+        }
+
+        $this->log("[UPDATE_TERM_SEO] Updated fields: " . implode(', ', array_keys($updated)));
+
+        return rest_ensure_response([
+            'success' => true,
+            'term_id' => $term_id,
+            'taxonomy' => $taxonomy,
+            'seo_plugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
+            'updated' => $updated,
+        ]);
+    }
+
+    /**
      * Upload media to WordPress
-     * 
+     *
      * @param WP_REST_Request $request
      * @return WP_REST_Response|WP_Error
      */
@@ -5677,7 +5851,7 @@ class Mehrana_App_Plugin
             'sitemapExclude' => $has_rank_math,
             'seoPlugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
             'redirectPlugin' => $has_rm_redirects ? 'rank_math' : ($has_redirection ? 'redirection' : 'custom'),
-            'pluginVersion' => '4.5.0',
+            'pluginVersion' => $this->version,
         ]);
     }
 }
