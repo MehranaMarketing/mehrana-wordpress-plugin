@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 4.9.0
+ * Version: 5.0.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '4.9.0';
+    private $version = '5.0.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -45,6 +45,10 @@ class Mehrana_App_Plugin
 
         // Custom Head Code Hook (for Clarity, etc.)
         add_action('wp_head', [$this, 'inject_custom_head_code'], 2);
+
+        // On-Page Studio: JSON-LD schema markup (stored under _mehrana_schema_markup)
+        // Runs at priority 5 so it lands in the <head> early, alongside GTM/custom code.
+        add_action('wp_head', [$this, 'inject_schema_markup'], 5);
 
         // Register hooks that need 'init'
         add_action('init', [$this, 'init_actions']);
@@ -500,6 +504,125 @@ class Mehrana_App_Plugin
             'callback' => [$this, 'linklab_verify_capabilities'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
+
+        // On-Page Studio: deploy JSON-LD schema markup for a single page.
+        // Body: { "schema": [ { "@context": "https://schema.org", "@type": "...", ... }, ... ] }
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/schema', [
+            'methods' => 'POST',
+            'callback' => [$this, 'update_page_schema'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Read back the stored schema (used by Mehrana app to verify deploy).
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/schema', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_page_schema'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+    }
+
+    /**
+     * POST /pages/{id}/schema
+     *
+     * Accepts a JSON-LD array and stores it under the _mehrana_schema_markup post
+     * meta. The wp_head hook below emits one <script type="application/ld+json">
+     * block per item on the rendered page.
+     */
+    public function update_page_schema($request)
+    {
+        $page_id = intval($request['id']);
+        $post = get_post($page_id);
+        if (!$post) {
+            return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+
+        $body = $request->get_json_params();
+        if (!isset($body['schema'])) {
+            return new WP_Error('bad_request', 'Missing schema in request body', ['status' => 400]);
+        }
+
+        $schema = $body['schema'];
+        // Accept either an array of objects or a single object — normalize to array.
+        if (is_array($schema) && isset($schema['@context'])) {
+            $schema = [$schema];
+        }
+        if (!is_array($schema)) {
+            return new WP_Error('bad_request', 'schema must be an array or object', ['status' => 400]);
+        }
+
+        // Basic sanity pass — every entry must be an object with @context.
+        foreach ($schema as $entry) {
+            if (!is_array($entry) || !isset($entry['@context'])) {
+                return new WP_Error('bad_request', 'Each schema entry must include @context', ['status' => 400]);
+            }
+        }
+
+        // Store as JSON string so wp_head can emit it verbatim without re-encoding.
+        update_post_meta($page_id, '_mehrana_schema_markup', wp_json_encode($schema));
+        $this->log("[PAGE_SCHEMA] Stored " . count($schema) . " JSON-LD block(s) for page {$page_id}");
+
+        return rest_ensure_response([
+            'success' => true,
+            'page_id' => $page_id,
+            'count' => count($schema),
+        ]);
+    }
+
+    /**
+     * GET /pages/{id}/schema
+     *
+     * Returns the stored JSON-LD array for a page (empty array if none set).
+     */
+    public function get_page_schema($request)
+    {
+        $page_id = intval($request['id']);
+        $post = get_post($page_id);
+        if (!$post) {
+            return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+
+        $raw = get_post_meta($page_id, '_mehrana_schema_markup', true);
+        $schema = [];
+        if (!empty($raw)) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                $schema = $decoded;
+            }
+        }
+
+        return rest_ensure_response([
+            'page_id' => $page_id,
+            'schema' => $schema,
+        ]);
+    }
+
+    /**
+     * wp_head hook — emit stored JSON-LD markup for the current page.
+     *
+     * Runs on both singular post/page contexts and taxonomy term archives.
+     * Emits each JSON-LD object as its own <script type="application/ld+json">
+     * block so Google's structured-data testing tool parses them cleanly.
+     */
+    public function inject_schema_markup()
+    {
+        if (!is_singular()) return;
+        $page_id = get_the_ID();
+        if (!$page_id) return;
+
+        $raw = get_post_meta($page_id, '_mehrana_schema_markup', true);
+        if (empty($raw)) return;
+
+        $schema = json_decode($raw, true);
+        if (!is_array($schema) || empty($schema)) return;
+
+        echo "\n<!-- Mehrana Schema Markup -->\n";
+        foreach ($schema as $entry) {
+            if (!is_array($entry)) continue;
+            $encoded = wp_json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if (!$encoded) continue;
+            echo '<script type="application/ld+json">' . $encoded . "</script>\n";
+        }
+        echo "<!-- /Mehrana Schema Markup -->\n";
     }
 
     /**
@@ -2288,6 +2411,28 @@ class Mehrana_App_Plugin
             // Check for redirects
             $redirect_info = $this->check_redirect($page->ID);
 
+            // Page Schema (On-Page Studio): surface stored JSON-LD so the app can
+            // verify deploys and show badges without a second API call.
+            $schema_raw = get_post_meta($page->ID, '_mehrana_schema_markup', true);
+            $schema_markup = null;
+            $schema_types = [];
+            if (!empty($schema_raw)) {
+                $decoded = json_decode($schema_raw, true);
+                if (is_array($decoded)) {
+                    $schema_markup = $decoded;
+                    foreach ($decoded as $entry) {
+                        if (is_array($entry) && isset($entry['@type'])) {
+                            if (is_array($entry['@type'])) {
+                                $schema_types = array_merge($schema_types, $entry['@type']);
+                            } else {
+                                $schema_types[] = $entry['@type'];
+                            }
+                        }
+                    }
+                    $schema_types = array_values(array_unique($schema_types));
+                }
+            }
+
             $result[] = [
                 'id' => $page->ID,
                 'title' => $page->post_title,
@@ -2297,7 +2442,9 @@ class Mehrana_App_Plugin
                 'has_redirect' => $redirect_info['has_redirect'],
                 'redirect_url' => $redirect_info['redirect_url'],
                 'elementor_data' => $elementor_data,
-                'post_content' => $page->post_content
+                'post_content' => $page->post_content,
+                'schema_markup' => $schema_markup,
+                'schema_types' => $schema_types,
             ];
         }
 
