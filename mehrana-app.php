@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.0.0
+ * Version: 5.0.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.0.0';
+    private $version = '5.0.1';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -615,14 +615,16 @@ class Mehrana_App_Plugin
         $schema = json_decode($raw, true);
         if (!is_array($schema) || empty($schema)) return;
 
-        echo "\n<!-- Mehrana Schema Markup -->\n";
+        // Emit JSON-LD scripts with no identifying comments — the output should
+        // look like it was hand-authored by the site owner, not watermarked by
+        // an external tool.
         foreach ($schema as $entry) {
             if (!is_array($entry)) continue;
             $encoded = wp_json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             if (!$encoded) continue;
-            echo '<script type="application/ld+json">' . $encoded . "</script>\n";
+            echo "\n" . '<script type="application/ld+json">' . $encoded . '</script>';
         }
-        echo "<!-- /Mehrana Schema Markup -->\n";
+        echo "\n";
     }
 
     /**
