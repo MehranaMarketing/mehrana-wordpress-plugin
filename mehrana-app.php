@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.0.1
+ * Version: 5.1.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.0.1';
+    private $version = '5.1.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -4400,7 +4400,12 @@ class Mehrana_App_Plugin
     /**
      * Create a redirect (301/302) using available plugins or custom table
      * Supports: Rank Math, Yoast, Redirection plugin, or custom meta
-     * 
+     *
+     * Accepts `match_type`: one of exact|contains|start|end|regex (default exact).
+     * Regex quirk: Rank Math evaluates patterns against the URL path WITHOUT the
+     * leading slash, so we strip one `/` right after `^` before storing. Users can
+     * keep writing `^/product/(.*)$` in Patrick — we rewrite to `^product/(.*)$`.
+     *
      * @param WP_REST_Request $request
      * @return WP_REST_Response|WP_Error
      */
@@ -4409,18 +4414,35 @@ class Mehrana_App_Plugin
         $from_url = $request['from_url'];
         $to_url = $request['to_url'];
         $type = isset($request['type']) ? intval($request['type']) : 301;
-
-        // Normalize URLs - convert to paths if full URLs
-        $site_url = home_url();
-        $from_path = str_replace($site_url, '', $from_url);
-        $to_path = str_replace($site_url, '', $to_url);
-
-        // Ensure from_path starts with /
-        if (strpos($from_path, '/') !== 0) {
-            $from_path = '/' . $from_path;
+        $match_type = isset($request['match_type']) ? sanitize_key($request['match_type']) : 'exact';
+        $valid_match_types = ['exact', 'contains', 'start', 'end', 'regex'];
+        if (!in_array($match_type, $valid_match_types, true)) {
+            $match_type = 'exact';
         }
 
-        $this->log("[CREATE_REDIRECT] Creating {$type} redirect: {$from_path} → {$to_url}");
+        // Destination: strip domain if a full site URL
+        $site_url = home_url();
+        $to_path = str_replace($site_url, '', $to_url);
+
+        // Source pattern: regex patterns must NOT be treated as URL paths.
+        // Non-regex types: strip domain, enforce leading slash.
+        if ($match_type === 'regex') {
+            $from_path = trim($from_url);
+            // Rank Math matches the path without the leading slash — normalize
+            // `^/foo/...` to `^foo/...` so the user's natural regex works.
+            $from_path = preg_replace('#^\^/+#', '^', $from_path);
+            // Also handle patterns that lead with `/` but have no `^` anchor.
+            if (strpos($from_path, '^') !== 0) {
+                $from_path = ltrim($from_path, '/');
+            }
+        } else {
+            $from_path = str_replace($site_url, '', $from_url);
+            if (strpos($from_path, '/') !== 0) {
+                $from_path = '/' . $from_path;
+            }
+        }
+
+        $this->log("[CREATE_REDIRECT] Creating {$type} {$match_type} redirect: {$from_path} → {$to_url}");
 
         $method_used = null;
 
@@ -4432,16 +4454,20 @@ class Mehrana_App_Plugin
 
                 // Check if table exists
                 if ($wpdb->get_var("SHOW TABLES LIKE '$table'") === $table) {
-                    // Check if redirect already exists
+                    // Check if redirect already exists with SAME pattern + comparison.
+                    // Previous versions used a loose LIKE check which produced false
+                    // "already exists" errors for regex patterns that happened to share
+                    // a substring with another rule.
+                    $needle = serialize([[ 'pattern' => $from_path, 'comparison' => $match_type ]]);
                     $existing = $wpdb->get_row($wpdb->prepare(
-                        "SELECT id FROM $table WHERE sources LIKE %s",
-                        '%' . $wpdb->esc_like($from_path) . '%'
+                        "SELECT id FROM $table WHERE sources = %s AND status != 'trashed'",
+                        $needle
                     ));
 
                     if (!$existing) {
                         $wpdb->insert($table, [
                             'sources' => serialize([
-                                ['pattern' => $from_path, 'comparison' => 'exact']
+                                ['pattern' => $from_path, 'comparison' => $match_type]
                             ]),
                             'url_to' => $to_url,
                             'header_code' => $type,
@@ -4449,9 +4475,23 @@ class Mehrana_App_Plugin
                             'created' => current_time('mysql'),
                             'updated' => current_time('mysql')
                         ]);
+                        $new_id = $wpdb->insert_id;
                         $method_used = 'rank_math';
                         $this->flush_rank_math_redirect_cache();
-                        $this->log("[CREATE_REDIRECT] Created via Rank Math");
+                        $this->log("[CREATE_REDIRECT] Created via Rank Math (id=rm_{$new_id})");
+
+                        return rest_ensure_response([
+                            'success' => true,
+                            'id' => 'rm_' . $new_id,
+                            'fromUrl' => $from_path,
+                            'toUrl' => $to_url,
+                            'type' => $type,
+                            'matchType' => $match_type,
+                            'isActive' => true,
+                            'source' => 'rank_math',
+                            'method' => $method_used,
+                            'message' => "Redirect created via rank_math"
+                        ]);
                     } else {
                         return new WP_Error('redirect_exists', 'Redirect already exists', ['status' => 409]);
                     }
@@ -4464,16 +4504,20 @@ class Mehrana_App_Plugin
         // Method 2: Try Redirection plugin
         if (!$method_used && class_exists('Red_Item')) {
             try {
+                // Redirection plugin's match_type is different from Rank Math's:
+                // it uses 'url' / 'regex' for the source-matching strategy.
+                $rp_match = $match_type === 'regex' ? 'regex' : 'url';
                 Red_Item::create([
                     'url' => $from_path,
                     'action_data' => ['url' => $to_url],
                     'action_type' => 'url',
-                    'match_type' => 'url',
+                    'match_type' => $rp_match,
+                    'regex' => $match_type === 'regex' ? 1 : 0,
                     'action_code' => $type,
                     'group_id' => 1 // Default group
                 ]);
                 $method_used = 'redirection_plugin';
-                $this->log("[CREATE_REDIRECT] Created via Redirection plugin");
+                $this->log("[CREATE_REDIRECT] Created via Redirection plugin ({$rp_match})");
             } catch (\Exception $e) {
                 $this->log("[CREATE_REDIRECT] Redirection plugin error: " . $e->getMessage());
             }
@@ -4488,6 +4532,7 @@ class Mehrana_App_Plugin
                 'from_url' => $from_path,
                 'to_url' => sanitize_text_field($to_url),
                 'type' => $type,
+                'match_type' => $match_type,
                 'created' => current_time('mysql')
             ];
             update_option('mehrana_redirects', array_values($redirects));
@@ -4505,6 +4550,7 @@ class Mehrana_App_Plugin
             'from' => $from_path,
             'to' => $to_url,
             'type' => $type,
+            'matchType' => $match_type,
             'method' => $method_used,
             'message' => "Redirect created via {$method_used}"
         ]);
@@ -5357,12 +5403,14 @@ class Mehrana_App_Plugin
             foreach ($rows as $row) {
                 $sources = maybe_unserialize($row->sources);
                 $from_url = is_array($sources) && isset($sources[0]['pattern']) ? $sources[0]['pattern'] : '';
+                $comparison = is_array($sources) && isset($sources[0]['comparison']) ? $sources[0]['comparison'] : 'exact';
                 $redirects[] = [
                     'id' => 'rm_' . $row->id,
                     'fromUrl' => $from_url,
                     'toUrl' => $row->url_to,
                     'type' => (int) $row->header_code,
                     'isActive' => $row->status === 'active',
+                    'matchType' => $comparison,
                     'source' => 'rank_math',
                 ];
             }
@@ -5373,12 +5421,14 @@ class Mehrana_App_Plugin
             $items = \Red_Item::get_all();
             if (is_array($items)) {
                 foreach ($items as $item) {
+                    $is_regex = method_exists($item, 'is_regex') ? $item->is_regex() : false;
                     $redirects[] = [
                         'id' => 'rp_' . $item->get_id(),
                         'fromUrl' => $item->get_url(),
                         'toUrl' => $item->get_action_data(),
                         'type' => (int) $item->get_action_code(),
                         'isActive' => $item->is_enabled(),
+                        'matchType' => $is_regex ? 'regex' : 'exact',
                         'source' => 'redirection_plugin',
                     ];
                 }
@@ -5396,6 +5446,7 @@ class Mehrana_App_Plugin
                 'toUrl' => $r['to_url'] ?? ($r['to'] ?? ''),
                 'type' => (int) ($r['type'] ?? 301),
                 'isActive' => true,
+                'matchType' => $r['match_type'] ?? 'exact',
                 'source' => 'mehrana',
             ];
         }
@@ -5411,6 +5462,8 @@ class Mehrana_App_Plugin
         $id = $request['id'];
         $body = $request->get_json_params();
 
+        $valid_match_types = ['exact', 'contains', 'start', 'end', 'regex'];
+
         // Rank Math
         if (strpos($id, 'rm_') === 0) {
             $rm_id = intval(str_replace('rm_', '', $id));
@@ -5419,7 +5472,43 @@ class Mehrana_App_Plugin
             if (isset($body['toUrl'])) $update['url_to'] = esc_url_raw($body['toUrl']);
             if (isset($body['type'])) $update['header_code'] = intval($body['type']);
             if (isset($body['isActive'])) $update['status'] = $body['isActive'] ? 'active' : 'inactive';
+
+            // Rebuild the `sources` blob when fromUrl or matchType changes.
+            $new_pattern = isset($body['fromUrl']) ? trim($body['fromUrl']) : null;
+            $new_match = isset($body['matchType']) && in_array($body['matchType'], $valid_match_types, true)
+                ? $body['matchType'] : null;
+
+            if ($new_pattern !== null || $new_match !== null) {
+                // Fetch the existing sources row so we only overwrite the fields that changed.
+                $existing_sources = $wpdb->get_var($wpdb->prepare(
+                    "SELECT sources FROM $table WHERE id = %d", $rm_id
+                ));
+                $sources = maybe_unserialize($existing_sources);
+                $cur_pattern = is_array($sources) && isset($sources[0]['pattern']) ? $sources[0]['pattern'] : '';
+                $cur_match   = is_array($sources) && isset($sources[0]['comparison']) ? $sources[0]['comparison'] : 'exact';
+
+                $final_pattern = $new_pattern !== null ? $new_pattern : $cur_pattern;
+                $final_match   = $new_match !== null ? $new_match : $cur_match;
+
+                // Apply the regex leading-slash normalization on pattern edits too.
+                if ($final_match === 'regex') {
+                    $final_pattern = preg_replace('#^\^/+#', '^', $final_pattern);
+                    if (strpos($final_pattern, '^') !== 0) {
+                        $final_pattern = ltrim($final_pattern, '/');
+                    }
+                } else {
+                    if (strpos($final_pattern, '/') !== 0) {
+                        $final_pattern = '/' . $final_pattern;
+                    }
+                }
+
+                $update['sources'] = serialize([
+                    ['pattern' => $final_pattern, 'comparison' => $final_match]
+                ]);
+            }
+
             if (!empty($update)) {
+                $update['updated'] = current_time('mysql');
                 $wpdb->update($table, $update, ['id' => $rm_id]);
                 $this->flush_rank_math_redirect_cache();
             }
@@ -5435,6 +5524,11 @@ class Mehrana_App_Plugin
                     $update_data = [];
                     if (isset($body['toUrl'])) $update_data['action_data'] = ['url' => esc_url_raw($body['toUrl'])];
                     if (isset($body['type'])) $update_data['action_code'] = intval($body['type']);
+                    if (isset($body['fromUrl'])) $update_data['url'] = trim($body['fromUrl']);
+                    if (isset($body['matchType']) && in_array($body['matchType'], $valid_match_types, true)) {
+                        $update_data['regex'] = $body['matchType'] === 'regex' ? 1 : 0;
+                        $update_data['match_type'] = $body['matchType'] === 'regex' ? 'regex' : 'url';
+                    }
                     if (!empty($update_data)) {
                         $item->update($update_data);
                     }
@@ -5458,7 +5552,11 @@ class Mehrana_App_Plugin
             $custom = $this->normalize_custom_redirects($custom);
             if (isset($custom[$idx])) {
                 if (isset($body['toUrl'])) $custom[$idx]['to_url'] = sanitize_text_field($body['toUrl']);
+                if (isset($body['fromUrl'])) $custom[$idx]['from_url'] = sanitize_text_field($body['fromUrl']);
                 if (isset($body['type'])) $custom[$idx]['type'] = intval($body['type']);
+                if (isset($body['matchType']) && in_array($body['matchType'], $valid_match_types, true)) {
+                    $custom[$idx]['match_type'] = $body['matchType'];
+                }
                 update_option('mehrana_redirects', $custom);
                 return rest_ensure_response(['success' => true]);
             }
