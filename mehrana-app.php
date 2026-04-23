@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.1.0
+ * Version: 5.2.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.1.0';
+    private $version = '5.2.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -252,6 +252,13 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/find-media', [
             'methods' => 'GET',
             'callback' => [$this, 'find_media_by_url'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Find many media by URL in one request (Image Factory v2 reconcile)
+        register_rest_route($this->namespace, '/find-media-bulk', [
+            'methods' => 'POST',
+            'callback' => [$this, 'find_media_bulk'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -1608,204 +1615,250 @@ class Mehrana_App_Plugin
     }
 
     /**
-     * Find media ID by URL
+     * Check if a URL looks like an image asset by extension.
+     * Used to reject page URLs / non-image URLs before running DB queries.
      */
-    public function find_media_by_url($request)
+    private function is_image_url($url)
     {
-        $url = $request->get_param('url');
+        $path = parse_url(strtok($url, '?'), PHP_URL_PATH);
+        if (!$path) return false;
+        return (bool) preg_match('/\.(jpe?g|png|webp|gif|avif|svg|ico|bmp|tiff?)$/i', $path);
+    }
 
-        if (!$url) {
-            return new WP_Error('missing_url', 'URL parameter is required', ['status' => 400]);
+    /**
+     * Produce URL variants that WordPress's attachment_url_to_postid may
+     * accept. Handles the most common reasons that resolver fails:
+     *   - Query strings (cache busters: ?ver=123, ?timestamp)
+     *   - www vs non-www hostname
+     *   - http vs https scheme
+     *   - Percent-encoded characters (e.g. %E2%80%93 for en-dash)
+     */
+    private function build_url_variants($url)
+    {
+        $variants = [];
+
+        // Strip query string first
+        $no_query = strtok($url, '?');
+        $variants[] = $no_query;
+
+        // URL-decoded (handles %E2%80%93 etc.)
+        $decoded = rawurldecode($no_query);
+        if ($decoded !== $no_query) $variants[] = $decoded;
+
+        // Toggle www / non-www
+        $swap_www = [];
+        foreach ($variants as $v) {
+            $parsed = @parse_url($v);
+            if (empty($parsed['host'])) continue;
+            if (strpos($parsed['host'], 'www.') === 0) {
+                $swap_www[] = preg_replace('#://www\.#', '://', $v, 1);
+            } else {
+                $swap_www[] = preg_replace('#://([^/]+)#', '://www.$1', $v, 1);
+            }
+        }
+        $variants = array_merge($variants, $swap_www);
+
+        // Toggle https / http
+        $swap_scheme = [];
+        foreach ($variants as $v) {
+            if (strpos($v, 'https://') === 0) $swap_scheme[] = 'http://' . substr($v, 8);
+            elseif (strpos($v, 'http://') === 0) $swap_scheme[] = 'https://' . substr($v, 7);
+        }
+        $variants = array_merge($variants, $swap_scheme);
+
+        return array_values(array_unique($variants));
+    }
+
+    /**
+     * Build filename variants by stripping WordPress-generated suffixes.
+     * Each returned variant is a candidate `meta_value LIKE '%<name>'`
+     * match in _wp_attached_file / as3cf_items / guid lookups.
+     */
+    private function build_filename_variants($filename)
+    {
+        $names = [$filename];
+        $decoded = rawurldecode($filename);
+        if ($decoded !== $filename) $names[] = $decoded;
+
+        $stripped = [];
+        foreach ($names as $n) {
+            // Strip LiteSpeed / ShortPixel .ext.webp
+            $a = preg_replace('/\.(jpe?g|png|gif)\.webp$/i', '.$1', $n);
+            // Strip size suffix -WIDTHxHEIGHT
+            $b = preg_replace('/-\d+x\d+(\.[^.]+)$/i', '$1', $a);
+            // Strip WP editor suffix -e1234567890
+            $c = preg_replace('/-e\d+(\.[^.]+)$/i', '$1', $b);
+            // Strip -scaled
+            $d = preg_replace('/-scaled(\.[^.]+)$/i', '$1', $c);
+            // Strip -rotated
+            $e = preg_replace('/-rotated(\.[^.]+)$/i', '$1', $d);
+            $stripped[] = $a;
+            $stripped[] = $b;
+            $stripped[] = $c;
+            $stripped[] = $d;
+            $stripped[] = $e;
+        }
+        $names = array_merge($names, $stripped);
+
+        return array_values(array_unique(array_filter($names)));
+    }
+
+    /**
+     * Resolve a URL to a WordPress attachment ID. Shared by find_media_by_url
+     * and find_media_bulk. Returns ['id' => int|null, 'reason' => string].
+     *
+     * Reasons:
+     *   wp_core        — resolved via WP's attachment_url_to_postid
+     *   postmeta       — matched _wp_attached_file
+     *   as3cf          — matched Offload Media table
+     *   as3cf_obj      — matched via $as3cf global
+     *   posts_guid     — matched wp_posts guid/post_name
+     *   not-an-image   — URL has no image extension (page URL, etc.)
+     *   not-in-library — exhausted all strategies, attachment doesn't exist
+     */
+    private function resolve_attachment_id($url)
+    {
+        if (!$url || !is_string($url)) {
+            return ['id' => null, 'reason' => 'invalid-url'];
+        }
+
+        // Fast reject: page URLs and other non-image URLs that leaked into
+        // the crawl. Saves expensive DB queries.
+        if (!$this->is_image_url($url)) {
+            return ['id' => null, 'reason' => 'not-an-image'];
         }
 
         global $wpdb;
 
-        $this->log("[find_media] Looking for: $url");
+        $url_variants = $this->build_url_variants($url);
 
-        // Method 1: Try standard WordPress function first (works for local URLs)
-        $attachment_id = attachment_url_to_postid($url);
-        if ($attachment_id) {
-            $this->log("[find_media] Found via attachment_url_to_postid: $attachment_id");
+        // Strategy 1: WP core on each URL variant (authoritative when it works)
+        foreach ($url_variants as $v) {
+            $id = attachment_url_to_postid($v);
+            if ($id) return ['id' => intval($id), 'reason' => 'wp_core'];
+        }
+
+        // Derive filename variants for LIKE matches
+        $parsed = parse_url(strtok($url, '?'));
+        $filename = !empty($parsed['path']) ? basename($parsed['path']) : '';
+        if (!$filename) {
+            return ['id' => null, 'reason' => 'not-in-library'];
+        }
+        $name_variants = $this->build_filename_variants($filename);
+
+        // Strategy 2: _wp_attached_file (the most authoritative column in core)
+        foreach ($name_variants as $n) {
+            $id = $wpdb->get_var($wpdb->prepare(
+                "SELECT post_id FROM {$wpdb->postmeta}
+                 WHERE meta_key = '_wp_attached_file'
+                 AND meta_value LIKE %s
+                 LIMIT 1",
+                '%' . $wpdb->esc_like($n)
+            ));
+            if ($id) return ['id' => intval($id), 'reason' => 'postmeta'];
+        }
+
+        // Strategy 3: as3cf_items (WP Offload Media)
+        $as3cf_table = $wpdb->prefix . 'as3cf_items';
+        if ($wpdb->get_var("SHOW TABLES LIKE '$as3cf_table'") === $as3cf_table) {
+            foreach ($name_variants as $n) {
+                $id = $wpdb->get_var($wpdb->prepare(
+                    "SELECT source_id FROM $as3cf_table
+                     WHERE path LIKE %s OR source_path LIKE %s
+                     LIMIT 1",
+                    '%' . $wpdb->esc_like($n),
+                    '%' . $wpdb->esc_like($n)
+                ));
+                if ($id) return ['id' => intval($id), 'reason' => 'as3cf'];
+            }
+        }
+
+        // Strategy 4: $as3cf object's own resolver (handles CDN rewrites)
+        global $as3cf;
+        if (isset($as3cf) && is_object($as3cf) && method_exists($as3cf, 'get_attachment_id_from_url')) {
+            foreach ($url_variants as $v) {
+                $id = $as3cf->get_attachment_id_from_url($v);
+                if ($id) return ['id' => intval($id), 'reason' => 'as3cf_obj'];
+            }
+        }
+
+        // Strategy 5: wp_posts by guid / post_name (last resort, least reliable)
+        foreach ($name_variants as $n) {
+            $basename = pathinfo($n, PATHINFO_FILENAME);
+            $id = $wpdb->get_var($wpdb->prepare(
+                "SELECT ID FROM {$wpdb->posts}
+                 WHERE post_type = 'attachment'
+                 AND (guid LIKE %s OR post_name = %s)
+                 LIMIT 1",
+                '%' . $wpdb->esc_like($n) . '%',
+                $basename
+            ));
+            if ($id) return ['id' => intval($id), 'reason' => 'posts_guid'];
+        }
+
+        return ['id' => null, 'reason' => 'not-in-library'];
+    }
+
+    /**
+     * Find media ID by URL (single-URL endpoint).
+     */
+    public function find_media_by_url($request)
+    {
+        $url = $request->get_param('url');
+        if (!$url) {
+            return new WP_Error('missing_url', 'URL parameter is required', ['status' => 400]);
+        }
+
+        $result = $this->resolve_attachment_id($url);
+
+        if ($result['id']) {
             return rest_ensure_response([
                 'success' => true,
-                'media_id' => $attachment_id
+                'media_id' => $result['id'],
+                'resolver' => $result['reason']
             ]);
         }
 
-        // Method 2: Direct database query to as3cf_items table (FAST - do this before API calls)
-        $as3cf_table = $wpdb->prefix . 'as3cf_items';
-        $table_exists = $wpdb->get_var("SHOW TABLES LIKE '$as3cf_table'") === $as3cf_table;
-        $this->log("[find_media] as3cf_items table exists: " . ($table_exists ? 'yes' : 'no'));
-
-        if ($table_exists) {
-            $parsed = parse_url($url);
-            if (!empty($parsed['path'])) {
-                $path = ltrim($parsed['path'], '/');
-                $filename = basename($path);
-                $this->log("[find_media] Extracted path: $path, filename: $filename");
-
-                // Try exact path match first
-                $attachment_id = $wpdb->get_var($wpdb->prepare(
-                    "SELECT source_id FROM $as3cf_table WHERE path = %s LIMIT 1",
-                    $path
-                ));
-                if ($attachment_id) {
-                    $this->log("[find_media] Found via exact path: $attachment_id");
-                    return rest_ensure_response(['success' => true, 'media_id' => intval($attachment_id)]);
-                }
-
-                // Try filename search in path column
-                $attachment_id = $wpdb->get_var($wpdb->prepare(
-                    "SELECT source_id FROM $as3cf_table WHERE path LIKE %s LIMIT 1",
-                    '%' . $wpdb->esc_like($filename)
-                ));
-                if ($attachment_id) {
-                    $this->log("[find_media] Found via path filename: $attachment_id");
-                    return rest_ensure_response(['success' => true, 'media_id' => intval($attachment_id)]);
-                }
-
-                // Try source_path column
-                $attachment_id = $wpdb->get_var($wpdb->prepare(
-                    "SELECT source_id FROM $as3cf_table WHERE source_path LIKE %s LIMIT 1",
-                    '%' . $wpdb->esc_like($filename)
-                ));
-                if ($attachment_id) {
-                    $this->log("[find_media] Found via source_path: $attachment_id");
-                    return rest_ensure_response(['success' => true, 'media_id' => intval($attachment_id)]);
-                }
-
-                // Handle WordPress edited images: strip -eXXXXXXXXXX suffix
-                $clean_filename = preg_replace('/-e\d+(\.[^.]+)$/', '$1', $filename);
-                if ($clean_filename !== $filename) {
-                    $this->log("[find_media] Trying without editor suffix: $clean_filename");
-                    $attachment_id = $wpdb->get_var($wpdb->prepare(
-                        "SELECT source_id FROM $as3cf_table WHERE path LIKE %s OR source_path LIKE %s LIMIT 1",
-                        '%' . $wpdb->esc_like($clean_filename),
-                        '%' . $wpdb->esc_like($clean_filename)
-                    ));
-                    if ($attachment_id) {
-                        $this->log("[find_media] Found via clean filename: $attachment_id");
-                        return rest_ensure_response(['success' => true, 'media_id' => intval($attachment_id)]);
-                    }
-                }
-
-                // Try stripping -scaled suffix too
-                $base_filename = preg_replace('/-scaled(-e\d+)?(\.[^.]+)$/', '$2', $filename);
-                if ($base_filename !== $filename && $base_filename !== $clean_filename) {
-                    $this->log("[find_media] Trying without scaled suffix: $base_filename");
-                    $attachment_id = $wpdb->get_var($wpdb->prepare(
-                        "SELECT source_id FROM $as3cf_table WHERE path LIKE %s OR source_path LIKE %s LIMIT 1",
-                        '%' . $wpdb->esc_like($base_filename),
-                        '%' . $wpdb->esc_like($base_filename)
-                    ));
-                    if ($attachment_id) {
-                        $this->log("[find_media] Found via base filename: $attachment_id");
-                        return rest_ensure_response(['success' => true, 'media_id' => intval($attachment_id)]);
-                    }
-                }
-
-                // Debug: Show sample row to compare formats
-                $sample = $wpdb->get_row("SELECT source_id, path, source_path FROM $as3cf_table WHERE path LIKE '%netvue%' OR source_path LIKE '%netvue%' LIMIT 1");
-                if (!$sample) {
-                    $sample = $wpdb->get_row("SELECT source_id, path, source_path FROM $as3cf_table LIMIT 1");
-                }
-                if ($sample) {
-                    $this->log("[find_media] Sample: id={$sample->source_id}, path={$sample->path}, source_path={$sample->source_path}");
-                }
-            }
-        }
-
-        // Method 3: Try WP Offload Media's global $as3cf object
-        global $as3cf;
-        if (isset($as3cf) && is_object($as3cf) && method_exists($as3cf, 'get_attachment_id_from_url')) {
-            $this->log("[find_media] Trying \$as3cf->get_attachment_id_from_url()");
-            $attachment_id = $as3cf->get_attachment_id_from_url($url);
-            if ($attachment_id) {
-                $this->log("[find_media] Found via \$as3cf: $attachment_id");
-                return rest_ensure_response(['success' => true, 'media_id' => intval($attachment_id)]);
-            }
-        }
-
-        // Method 5: Try to find by filename in wp_postmeta (_wp_attached_file)
-        $parsed = parse_url($url);
-        $filename = !empty($parsed['path']) ? basename($parsed['path']) : '';
-
-        if ($filename) {
-            // Strip -e suffix (WordPress image editor)
-            $clean_filename = preg_replace('/-e\d+(\.[^.]+)$/', '$1', $filename);
-            // Strip -scaled suffix
-            $base_filename = preg_replace('/-scaled(\.[^.]+)$/', '$1', $clean_filename);
-            // Strip size suffix like -300x200
-            $no_size_filename = preg_replace('/-\d+x\d+(\.[^.]+)$/', '$1', $base_filename);
-
-            $this->log("[find_media] Trying wp_postmeta _wp_attached_file");
-            $this->log("[find_media] Filenames to try: original=$filename, clean=$clean_filename, base=$base_filename, no_size=$no_size_filename");
-
-            // Try each filename variant in _wp_attached_file
-            foreach ([$no_size_filename, $base_filename, $clean_filename, $filename] as $try_filename) {
-                $attachment_id = $wpdb->get_var($wpdb->prepare(
-                    "SELECT post_id FROM {$wpdb->postmeta} 
-                     WHERE meta_key = '_wp_attached_file' 
-                     AND meta_value LIKE %s 
-                     LIMIT 1",
-                    '%' . $wpdb->esc_like($try_filename)
-                ));
-
-                if ($attachment_id) {
-                    $this->log("[find_media] Found via _wp_attached_file: $attachment_id (matched: $try_filename)");
-                    return rest_ensure_response(['success' => true, 'media_id' => intval($attachment_id)]);
-                }
-            }
-
-            // Try just the base name (without extension) for partial matches
-            $base_name_only = pathinfo($no_size_filename, PATHINFO_FILENAME);
-            $this->log("[find_media] Trying base name only: $base_name_only");
-
-            $attachment_id = $wpdb->get_var($wpdb->prepare(
-                "SELECT post_id FROM {$wpdb->postmeta} 
-                 WHERE meta_key = '_wp_attached_file' 
-                 AND meta_value LIKE %s 
-                 LIMIT 1",
-                '%' . $wpdb->esc_like($base_name_only) . '%'
-            ));
-
-            if ($attachment_id) {
-                $this->log("[find_media] Found via base name: $attachment_id");
-                return rest_ensure_response(['success' => true, 'media_id' => intval($attachment_id)]);
-            }
-        }
-
-        // Method 6: Try wp_posts table by GUID
-        if ($filename) {
-            $clean_filename = preg_replace('/-\d+x\d+(\.[^.]+)$/', '$1', $filename);
-            $clean_filename = preg_replace('/-e\d+(\.[^.]+)$/', '$1', $clean_filename);
-            $clean_filename = preg_replace('/-scaled(\.[^.]+)$/', '$1', $clean_filename);
-
-            $this->log("[find_media] Trying posts table with filename: $clean_filename");
-
-            $attachment_id = $wpdb->get_var($wpdb->prepare(
-                "SELECT ID FROM {$wpdb->posts} 
-                 WHERE post_type = 'attachment' 
-                 AND (guid LIKE %s OR post_title = %s OR post_name = %s)
-                 LIMIT 1",
-                '%' . $wpdb->esc_like($clean_filename) . '%',
-                pathinfo($clean_filename, PATHINFO_FILENAME),
-                pathinfo($clean_filename, PATHINFO_FILENAME)
-            ));
-
-            if ($attachment_id) {
-                $this->log("[find_media] Found via posts table: $attachment_id");
-                return rest_ensure_response([
-                    'success' => true,
-                    'media_id' => intval($attachment_id)
-                ]);
-            }
-        }
-
-        $this->log("[find_media] Media not found for URL: $url");
         return rest_ensure_response([
             'success' => false,
-            'error' => 'Media not found in library'
+            'error' => 'Media not found in library',
+            'reason' => $result['reason']
+        ]);
+    }
+
+    /**
+     * Resolve multiple URLs in one round-trip (Image Factory v2 reconcile).
+     * Body: { urls: string[] }, max 500.
+     * Returns: { success: true, results: [{ url, media_id|null, reason }, ...] }.
+     */
+    public function find_media_bulk($request)
+    {
+        $urls = $request->get_param('urls');
+        if (!is_array($urls) || empty($urls)) {
+            return new WP_Error('missing_urls', 'urls must be a non-empty array', ['status' => 400]);
+        }
+        if (count($urls) > 500) {
+            return new WP_Error('too_many_urls', 'Max 500 URLs per request', ['status' => 400]);
+        }
+
+        $results = [];
+        foreach ($urls as $url) {
+            if (!is_string($url)) {
+                $results[] = ['url' => null, 'media_id' => null, 'reason' => 'invalid-url'];
+                continue;
+            }
+            $r = $this->resolve_attachment_id($url);
+            $results[] = [
+                'url' => $url,
+                'media_id' => $r['id'],
+                'reason' => $r['reason']
+            ];
+        }
+
+        return rest_ensure_response([
+            'success' => true,
+            'count' => count($results),
+            'results' => $results
         ]);
     }
 
