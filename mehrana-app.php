@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.3.0
+ * Version: 5.4.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.3.0';
+    private $version = '5.4.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -49,6 +49,23 @@ class Mehrana_App_Plugin
         // On-Page Studio: JSON-LD schema markup (stored under _mehrana_schema_markup)
         // Runs at priority 5 so it lands in the <head> early, alongside GTM/custom code.
         add_action('wp_head', [$this, 'inject_schema_markup'], 5);
+
+        // Schema Authority (v5.4.0+): on pages where Patrick is the authority
+        // (has a per-page override OR matches an active rule), suppress output
+        // from Yoast / Rank Math / WooCommerce so Patrick's schema is the only
+        // one on the page. Unmanaged pages are untouched — this is per-page,
+        // never site-wide.
+        //
+        // We register the filters unconditionally but they self-skip for non-
+        // managed posts at call time. That way we don't have to predict which
+        // filters each competitor uses before hitting a single URL.
+        add_filter('wpseo_schema_graph', [$this, 'filter_yoast_schema_graph'], 10, 2);
+        add_filter('wpseo_json_ld_output', [$this, 'filter_yoast_json_ld_output'], 10, 1);
+        add_filter('rank_math/json_ld', [$this, 'filter_rank_math_json_ld'], 10, 2);
+        add_filter('woocommerce_structured_data_product', [$this, 'filter_woocommerce_structured_data'], 10, 2);
+        add_filter('woocommerce_structured_data_product_offer', [$this, 'filter_woocommerce_structured_data'], 10, 2);
+        add_filter('woocommerce_structured_data_review', [$this, 'filter_woocommerce_structured_data'], 10, 2);
+        add_filter('woocommerce_structured_data_breadcrumblist', [$this, 'filter_woocommerce_structured_data'], 10, 2);
 
         // Register hooks that need 'init'
         add_action('init', [$this, 'init_actions']);
@@ -580,6 +597,14 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/schema/rules/coverage', [
             'methods' => 'POST',
             'callback' => [$this, 'coverage_for_match'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Schema authority status — used by CRM to verify that v5.4.0+ is
+        // installed and to show "Patrick owns N pages" in the UI.
+        register_rest_route($this->namespace, '/schema/authority-status', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_authority_status'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
     }
@@ -1288,6 +1313,137 @@ class Mehrana_App_Plugin
         ];
 
         return $items;
+    }
+
+    // ============================================================
+    // Schema Authority (v5.4.0+)
+    // ============================================================
+    //
+    // Per-page authority model:
+    //   • A post is "Patrick-managed" if it has a per-page override
+    //     (_mehrana_schema_markup) OR matches an active rule.
+    //   • On Patrick-managed posts, competing schema plugins are silenced
+    //     via their own filter APIs (Yoast, Rank Math, WooCommerce).
+    //   • On every OTHER post, those plugins keep working untouched.
+    //
+    // This is NOT a site-wide takeover. The team keeps using Yoast/Rank Math
+    // as normal — Patrick only claims the specific pages the team has
+    // explicitly deployed to.
+
+    /**
+     * Is this post managed by Patrick? True if there's a per-page override
+     * meta OR if at least one active rule's match block resolves for this post.
+     *
+     * Results are cached in static memory for the duration of one request so
+     * multiple filters hitting the same post don't run the match loop more
+     * than once.
+     */
+    private function is_post_managed_by_patrick($post_id)
+    {
+        static $cache = [];
+        $post_id = intval($post_id);
+        if ($post_id <= 0) return false;
+        if (isset($cache[$post_id])) return $cache[$post_id];
+
+        // Per-page override wins immediately.
+        $override = get_post_meta($post_id, '_mehrana_schema_markup', true);
+        if (!empty($override)) return $cache[$post_id] = true;
+
+        // Otherwise check rules.
+        $rules = $this->load_schema_rules();
+        foreach ($rules as $rule) {
+            if (!isset($rule['match'])) continue;
+            if ($this->rule_matches_post($rule['match'], $post_id)) {
+                return $cache[$post_id] = true;
+            }
+        }
+
+        return $cache[$post_id] = false;
+    }
+
+    /**
+     * Resolve the managed-state for the current front-end context.
+     * Returns false for non-singular pages (archives, homepage-as-blog, etc.)
+     * so competitors keep working on those.
+     */
+    private function current_page_is_managed()
+    {
+        if (!is_singular()) return false;
+        $id = get_the_ID();
+        if (!$id) return false;
+        return $this->is_post_managed_by_patrick($id);
+    }
+
+    /**
+     * Yoast filter — returns an empty @graph on managed pages, which
+     * Yoast interprets as "emit nothing." Outputs remain normal elsewhere.
+     */
+    public function filter_yoast_schema_graph($graph, $context = null)
+    {
+        if ($this->current_page_is_managed()) return [];
+        return $graph;
+    }
+
+    /**
+     * Yoast escape hatch for older versions / filters that short-circuit the
+     * whole JSON-LD output. Returning false here silences Yoast entirely.
+     */
+    public function filter_yoast_json_ld_output($output)
+    {
+        if ($this->current_page_is_managed()) return false;
+        return $output;
+    }
+
+    /**
+     * Rank Math filter — returning [] empties the graph it emits for this page.
+     */
+    public function filter_rank_math_json_ld($data, $jsonld = null)
+    {
+        if ($this->current_page_is_managed()) return [];
+        return $data;
+    }
+
+    /**
+     * WooCommerce structured data filter — returning [] suppresses each
+     * requested data type (product / offer / review / breadcrumb) on pages
+     * where Patrick is the authority.
+     */
+    public function filter_woocommerce_structured_data($markup, $context = null)
+    {
+        if ($this->current_page_is_managed()) return [];
+        return $markup;
+    }
+
+    /**
+     * GET /schema/authority-status
+     *
+     * Lets the CRM verify v5.4.0+ is installed and report how many posts the
+     * plugin currently classifies as Patrick-managed.
+     */
+    public function get_authority_status($request)
+    {
+        // Count overrides: posts with _mehrana_schema_markup meta set to
+        // anything non-empty.
+        global $wpdb;
+        $override_count = intval($wpdb->get_var(
+            "SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta}
+             WHERE meta_key = '_mehrana_schema_markup' AND meta_value != ''"
+        ));
+
+        $rules = $this->load_schema_rules();
+        $active_rules = count($rules);
+
+        return rest_ensure_response([
+            'version'             => $this->version,
+            'authority_supported' => true,
+            'override_count'      => $override_count,
+            'active_rules'        => $active_rules,
+            'suppressed_plugins'  => [
+                'yoast'       => defined('WPSEO_VERSION') || class_exists('WPSEO_Options'),
+                'rank_math'   => class_exists('RankMath') || defined('RANK_MATH_VERSION'),
+                'woocommerce' => class_exists('WooCommerce'),
+            ],
+        ]);
     }
 
     /**
