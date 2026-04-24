@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.2.0
+ * Version: 5.3.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.2.0';
+    private $version = '5.3.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -526,6 +526,62 @@ class Mehrana_App_Plugin
             'callback' => [$this, 'get_page_schema'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
+
+        // ========================================================
+        // Schema Rules (template-per-page-type)
+        // ========================================================
+        // One rule defines a JSON-LD template that auto-applies to every post
+        // matching its criteria (post_type, slug pattern, taxonomy, id lists).
+        // Templates contain tokens like {{post.title}} that are resolved live
+        // at wp_head so 2000 products share one definition with per-post data.
+        // Per-page overrides (via POST /pages/{id}/schema) still win over rules.
+
+        // List the active rule set on this site.
+        register_rest_route($this->namespace, '/schema/rules', [
+            'methods' => 'GET',
+            'callback' => [$this, 'list_schema_rules'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Replace the entire active rule set. CRM is source of truth; it ships
+        // the full active-rules array, plugin mirrors it. No partial sync —
+        // avoids drift between CRM and site.
+        register_rest_route($this->namespace, '/schema/rules', [
+            'methods' => 'PUT',
+            'callback' => [$this, 'replace_schema_rules'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Preview a rule against a specific post without saving. Used by CRM
+        // wizard to show rendered JSON before activating.
+        // Body: { "template": [...], "post_id": 123 }
+        register_rest_route($this->namespace, '/schema/rules/preview', [
+            'methods' => 'POST',
+            'callback' => [$this, 'preview_schema_rule'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Debug: which rule would match a given post, and resolved output.
+        register_rest_route($this->namespace, '/schema/rules/match', [
+            'methods' => 'GET',
+            'callback' => [$this, 'match_schema_rule_for_post'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Enumerate public post types so CRM can populate the "match" dropdown.
+        register_rest_route($this->namespace, '/schema/post-types', [
+            'methods' => 'GET',
+            'callback' => [$this, 'list_public_post_types'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Per-rule coverage: sample post IDs and total count for a given match
+        // spec. Lets CRM show "N pages matched" without crawling.
+        register_rest_route($this->namespace, '/schema/rules/coverage', [
+            'methods' => 'POST',
+            'callback' => [$this, 'coverage_for_match'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
     }
 
     /**
@@ -604,11 +660,10 @@ class Mehrana_App_Plugin
     }
 
     /**
-     * wp_head hook — emit stored JSON-LD markup for the current page.
+     * wp_head hook — emit JSON-LD markup for the current page.
      *
-     * Runs on both singular post/page contexts and taxonomy term archives.
-     * Emits each JSON-LD object as its own <script type="application/ld+json">
-     * block so Google's structured-data testing tool parses them cleanly.
+     * Precedence: per-page override wins; else first matching rule (by
+     * priority desc) renders its template with live post data.
      */
     public function inject_schema_markup()
     {
@@ -616,22 +671,623 @@ class Mehrana_App_Plugin
         $page_id = get_the_ID();
         if (!$page_id) return;
 
-        $raw = get_post_meta($page_id, '_mehrana_schema_markup', true);
-        if (empty($raw)) return;
+        $blocks = $this->resolve_schema_for_post($page_id);
+        if (empty($blocks)) return;
 
-        $schema = json_decode($raw, true);
-        if (!is_array($schema) || empty($schema)) return;
-
-        // Emit JSON-LD scripts with no identifying comments — the output should
-        // look like it was hand-authored by the site owner, not watermarked by
-        // an external tool.
-        foreach ($schema as $entry) {
+        foreach ($blocks as $entry) {
             if (!is_array($entry)) continue;
             $encoded = wp_json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             if (!$encoded) continue;
             echo "\n" . '<script type="application/ld+json">' . $encoded . '</script>';
         }
         echo "\n";
+    }
+
+    /**
+     * Resolve the schema blocks to emit for a given post.
+     *
+     * Returns an array of JSON-LD objects. Empty array = nothing to emit.
+     *
+     * Order:
+     *   1. Per-page override (_mehrana_schema_markup) — hand-crafted, wins.
+     *   2. First matching rule from _mehrana_schema_rules (priority desc).
+     *   3. Empty.
+     */
+    private function resolve_schema_for_post($post_id)
+    {
+        // 1. Per-page override
+        $raw = get_post_meta($post_id, '_mehrana_schema_markup', true);
+        if (!empty($raw)) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded) && !empty($decoded)) return $decoded;
+        }
+
+        // 2. Rule match
+        $rules = $this->load_schema_rules();
+        if (empty($rules)) return [];
+
+        usort($rules, function ($a, $b) {
+            $pa = isset($a['priority']) ? intval($a['priority']) : 10;
+            $pb = isset($b['priority']) ? intval($b['priority']) : 10;
+            return $pb - $pa;
+        });
+
+        foreach ($rules as $rule) {
+            if (!isset($rule['match']) || !isset($rule['template'])) continue;
+            if ($this->rule_matches_post($rule['match'], $post_id)) {
+                return $this->resolve_rule_template($rule['template'], $post_id);
+            }
+        }
+
+        return [];
+    }
+
+    // ============================================================
+    // Schema Rules — Storage
+    // ============================================================
+
+    /**
+     * Load rules from the _mehrana_schema_rules option. Always returns an
+     * array — missing/corrupt storage reads as empty.
+     */
+    private function load_schema_rules()
+    {
+        $raw = get_option('_mehrana_schema_rules', '');
+        if (empty($raw)) return [];
+        $decoded = is_array($raw) ? $raw : json_decode($raw, true);
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    /**
+     * Validate a single rule. Returns array [ok, error_message].
+     * Every rule must have id, template (non-empty array of JSON-LD objects
+     * with @context), and a match block (can be empty — matches everything).
+     */
+    private function validate_rule($rule)
+    {
+        if (!is_array($rule)) return [false, 'rule must be an object'];
+        if (empty($rule['id']) || !is_string($rule['id'])) return [false, 'rule.id required'];
+        if (!preg_match('/^[a-zA-Z0-9_-]+$/', $rule['id'])) return [false, 'rule.id must be alphanumeric/_/-'];
+        if (!isset($rule['template']) || !is_array($rule['template']) || empty($rule['template'])) {
+            return [false, 'rule.template must be a non-empty array'];
+        }
+        foreach ($rule['template'] as $entry) {
+            if (!is_array($entry) || !isset($entry['@context'])) {
+                return [false, 'every template entry must be an object with @context'];
+            }
+        }
+        if (isset($rule['match']) && !is_array($rule['match'])) {
+            return [false, 'rule.match must be an object'];
+        }
+        return [true, null];
+    }
+
+    // ============================================================
+    // Schema Rules — Endpoints
+    // ============================================================
+
+    /**
+     * GET /schema/rules
+     */
+    public function list_schema_rules($request)
+    {
+        $rules = $this->load_schema_rules();
+        return rest_ensure_response([
+            'rules' => $rules,
+            'count' => count($rules),
+        ]);
+    }
+
+    /**
+     * PUT /schema/rules
+     * Body: { "rules": [ {id, name?, priority?, match, template}, ... ] }
+     * Replaces the entire active rule set.
+     */
+    public function replace_schema_rules($request)
+    {
+        $body = $request->get_json_params();
+        if (!isset($body['rules']) || !is_array($body['rules'])) {
+            return new WP_Error('bad_request', 'Missing rules array', ['status' => 400]);
+        }
+
+        $clean = [];
+        $seen_ids = [];
+        foreach ($body['rules'] as $rule) {
+            list($ok, $err) = $this->validate_rule($rule);
+            if (!$ok) {
+                return new WP_Error('bad_request', 'Invalid rule: ' . $err, ['status' => 400]);
+            }
+            if (isset($seen_ids[$rule['id']])) {
+                return new WP_Error('bad_request', 'Duplicate rule id: ' . $rule['id'], ['status' => 400]);
+            }
+            $seen_ids[$rule['id']] = true;
+
+            $clean[] = [
+                'id'        => $rule['id'],
+                'name'      => isset($rule['name']) ? substr((string)$rule['name'], 0, 200) : $rule['id'],
+                'priority'  => isset($rule['priority']) ? intval($rule['priority']) : 10,
+                'match'     => isset($rule['match']) && is_array($rule['match']) ? $rule['match'] : new stdClass(),
+                'template'  => $rule['template'],
+            ];
+        }
+
+        update_option('_mehrana_schema_rules', wp_json_encode($clean), false);
+        $this->log('[SCHEMA_RULES] Replaced rule set: ' . count($clean) . ' rule(s)');
+
+        return rest_ensure_response([
+            'success' => true,
+            'count'   => count($clean),
+        ]);
+    }
+
+    /**
+     * POST /schema/rules/preview
+     * Body: { "template": [...], "post_id": 123 }
+     */
+    public function preview_schema_rule($request)
+    {
+        $body = $request->get_json_params();
+        if (!isset($body['template']) || !is_array($body['template'])) {
+            return new WP_Error('bad_request', 'Missing template', ['status' => 400]);
+        }
+        $post_id = isset($body['post_id']) ? intval($body['post_id']) : 0;
+        if ($post_id <= 0) {
+            return new WP_Error('bad_request', 'Missing post_id', ['status' => 400]);
+        }
+        if (!get_post($post_id)) {
+            return new WP_Error('not_found', 'Post not found', ['status' => 404]);
+        }
+
+        $resolved = $this->resolve_rule_template($body['template'], $post_id);
+        return rest_ensure_response([
+            'post_id'  => $post_id,
+            'resolved' => $resolved,
+        ]);
+    }
+
+    /**
+     * GET /schema/rules/match?post_id=123
+     * Shows precedence: override, matching rule, or nothing. Useful for debug.
+     */
+    public function match_schema_rule_for_post($request)
+    {
+        $post_id = isset($request['post_id']) ? intval($request['post_id']) : 0;
+        if ($post_id <= 0 || !get_post($post_id)) {
+            return new WP_Error('not_found', 'Post not found', ['status' => 404]);
+        }
+
+        $override = get_post_meta($post_id, '_mehrana_schema_markup', true);
+        if (!empty($override)) {
+            $decoded = json_decode($override, true);
+            return rest_ensure_response([
+                'post_id'  => $post_id,
+                'source'   => 'override',
+                'rule_id'  => null,
+                'resolved' => is_array($decoded) ? $decoded : [],
+            ]);
+        }
+
+        $rules = $this->load_schema_rules();
+        usort($rules, function ($a, $b) {
+            $pa = isset($a['priority']) ? intval($a['priority']) : 10;
+            $pb = isset($b['priority']) ? intval($b['priority']) : 10;
+            return $pb - $pa;
+        });
+        foreach ($rules as $rule) {
+            if ($this->rule_matches_post($rule['match'] ?? [], $post_id)) {
+                return rest_ensure_response([
+                    'post_id'  => $post_id,
+                    'source'   => 'rule',
+                    'rule_id'  => $rule['id'],
+                    'rule_name' => $rule['name'] ?? $rule['id'],
+                    'resolved' => $this->resolve_rule_template($rule['template'], $post_id),
+                ]);
+            }
+        }
+
+        return rest_ensure_response([
+            'post_id'  => $post_id,
+            'source'   => 'none',
+            'rule_id'  => null,
+            'resolved' => [],
+        ]);
+    }
+
+    /**
+     * GET /schema/post-types
+     * Returns the public post types the site uses, for the CRM match dropdown.
+     */
+    public function list_public_post_types($request)
+    {
+        $types = get_post_types(['public' => true], 'objects');
+        unset($types['attachment']); // meta, not content
+        $out = [];
+        foreach ($types as $slug => $obj) {
+            $count = wp_count_posts($slug);
+            $published = isset($count->publish) ? intval($count->publish) : 0;
+            $out[] = [
+                'slug'      => $slug,
+                'label'     => $obj->labels->name ?? $slug,
+                'singular'  => $obj->labels->singular_name ?? $slug,
+                'published' => $published,
+                'has_archive' => !empty($obj->has_archive),
+            ];
+        }
+        return rest_ensure_response(['post_types' => $out]);
+    }
+
+    /**
+     * POST /schema/rules/coverage
+     * Body: { "match": {...} }
+     * Returns total matching post count + up to 10 sample {id, title, url}.
+     * Lets CRM show "Matches N pages" without scanning its own crawl.
+     */
+    public function coverage_for_match($request)
+    {
+        $body = $request->get_json_params();
+        $match = isset($body['match']) && is_array($body['match']) ? $body['match'] : [];
+
+        $post_types = !empty($match['post_types']) && is_array($match['post_types'])
+            ? array_values(array_filter($match['post_types'], 'is_string'))
+            : ['post', 'page'];
+
+        $args = [
+            'post_type'      => $post_types,
+            'post_status'    => 'publish',
+            'posts_per_page' => 10,
+            'fields'         => 'ids',
+        ];
+        if (!empty($match['include_ids']) && is_array($match['include_ids'])) {
+            $args['post__in'] = array_map('intval', $match['include_ids']);
+        }
+        if (!empty($match['exclude_ids']) && is_array($match['exclude_ids'])) {
+            $args['post__not_in'] = array_map('intval', $match['exclude_ids']);
+        }
+        if (!empty($match['taxonomies']) && is_array($match['taxonomies'])) {
+            $tax_query = ['relation' => 'AND'];
+            foreach ($match['taxonomies'] as $tax => $terms) {
+                if (!is_array($terms) || empty($terms)) continue;
+                $tax_query[] = [
+                    'taxonomy' => (string)$tax,
+                    'field'    => 'slug',
+                    'terms'    => array_map('strval', $terms),
+                ];
+            }
+            if (count($tax_query) > 1) $args['tax_query'] = $tax_query;
+        }
+
+        // Slug patterns can't be pushed down to SQL cleanly, so we fetch a
+        // wider sample and filter in PHP. Good enough for coverage hints.
+        $slug_patterns = !empty($match['slug_patterns']) && is_array($match['slug_patterns'])
+            ? array_filter($match['slug_patterns'], 'is_string')
+            : [];
+
+        if (empty($slug_patterns)) {
+            $q = new WP_Query($args);
+            $total = (int)$q->found_posts;
+            $samples = array_map(function ($id) {
+                return ['id' => $id, 'title' => get_the_title($id), 'url' => get_permalink($id)];
+            }, $q->posts);
+            return rest_ensure_response(['total' => $total, 'samples' => $samples]);
+        }
+
+        // With slug patterns: widen the fetch, filter, then cap to 10 samples.
+        $wide_args = $args;
+        $wide_args['posts_per_page'] = 500;
+        $q = new WP_Query($wide_args);
+        $matched = [];
+        $total = 0;
+        foreach ($q->posts as $id) {
+            $url = get_permalink($id);
+            if ($this->url_matches_any_pattern($url, $slug_patterns)) {
+                $total++;
+                if (count($matched) < 10) {
+                    $matched[] = ['id' => $id, 'title' => get_the_title($id), 'url' => $url];
+                }
+            }
+        }
+        return rest_ensure_response(['total' => $total, 'samples' => $matched, 'sampled_from' => count($q->posts)]);
+    }
+
+    // ============================================================
+    // Schema Rules — Matching + Token Resolution
+    // ============================================================
+
+    /**
+     * Does a post match a rule's match criteria?
+     *
+     * All defined criteria are AND-joined. Undefined criteria are skipped.
+     * An empty match block matches everything.
+     */
+    private function rule_matches_post($match, $post_id)
+    {
+        if (!is_array($match)) return false;
+        $post = get_post($post_id);
+        if (!$post) return false;
+
+        // Explicit exclusion wins
+        if (!empty($match['exclude_ids']) && is_array($match['exclude_ids'])) {
+            if (in_array(intval($post_id), array_map('intval', $match['exclude_ids']), true)) {
+                return false;
+            }
+        }
+
+        // Explicit include short-circuit
+        if (!empty($match['include_ids']) && is_array($match['include_ids'])) {
+            if (in_array(intval($post_id), array_map('intval', $match['include_ids']), true)) {
+                return true;
+            }
+        }
+
+        // Post type filter
+        if (!empty($match['post_types']) && is_array($match['post_types'])) {
+            if (!in_array($post->post_type, $match['post_types'], true)) return false;
+        }
+
+        // Slug pattern filter (against permalink)
+        if (!empty($match['slug_patterns']) && is_array($match['slug_patterns'])) {
+            $url = get_permalink($post_id);
+            if (!$this->url_matches_any_pattern($url, $match['slug_patterns'])) return false;
+        }
+
+        // Taxonomy filter: must have at least one of the given terms in each taxonomy
+        if (!empty($match['taxonomies']) && is_array($match['taxonomies'])) {
+            foreach ($match['taxonomies'] as $tax => $terms) {
+                if (!is_array($terms) || empty($terms)) continue;
+                if (!has_term($terms, (string)$tax, $post_id)) return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Does a URL match any of the given glob-style patterns?
+     *
+     * Patterns are matched against the pathname. "*" = any chars (incl. "/"),
+     * "?" = single char. Leading "/" optional.
+     */
+    private function url_matches_any_pattern($url, $patterns)
+    {
+        if (empty($url)) return false;
+        $path = parse_url($url, PHP_URL_PATH) ?: '/';
+        foreach ($patterns as $pattern) {
+            $p = (string)$pattern;
+            if ($p === '') continue;
+            if ($p[0] !== '/') $p = '/' . $p;
+            // fnmatch with FNM_PATHNAME would block "*" from matching "/", which we want.
+            // Convert glob to regex: * => .*, ? => .
+            $regex = '#^' . str_replace(['\\*', '\\?'], ['.*', '.'], preg_quote($p, '#')) . '$#i';
+            if (preg_match($regex, $path)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Resolve tokens in a rule template against a post. Returns the template
+     * with all {{live.*}} tokens substituted. {{static.*}} tokens are
+     * pre-baked by the CRM and pass through unchanged.
+     *
+     * After resolution, string values that are empty are dropped (removing
+     * their key) so the emitted JSON-LD doesn't contain empty "" fields that
+     * cause Google validation warnings.
+     */
+    private function resolve_rule_template($template, $post_id)
+    {
+        $out = [];
+        foreach ($template as $entry) {
+            if (!is_array($entry)) continue;
+            $resolved = $this->resolve_tokens_recursive($entry, $post_id);
+            if (is_array($resolved) && !empty($resolved)) $out[] = $resolved;
+        }
+        return $out;
+    }
+
+    /**
+     * Recursively walk a JSON-LD value, substituting tokens in strings.
+     * Removes keys whose final string value is empty.
+     */
+    private function resolve_tokens_recursive($value, $post_id)
+    {
+        if (is_string($value)) {
+            return $this->substitute_tokens($value, $post_id);
+        }
+        if (is_array($value)) {
+            // Preserve associative vs list semantics
+            $is_list = array_keys($value) === range(0, count($value) - 1);
+            if ($is_list) {
+                $out = [];
+                foreach ($value as $item) {
+                    $r = $this->resolve_tokens_recursive($item, $post_id);
+                    if ($r !== '' && $r !== null && !(is_array($r) && empty($r))) $out[] = $r;
+                }
+                return $out;
+            }
+            $out = [];
+            foreach ($value as $k => $v) {
+                $r = $this->resolve_tokens_recursive($v, $post_id);
+                // Drop empty strings and empty arrays to keep JSON-LD clean
+                if ($r === '' || $r === null) continue;
+                if (is_array($r) && empty($r)) continue;
+                $out[$k] = $r;
+            }
+            return $out;
+        }
+        return $value;
+    }
+
+    /**
+     * Substitute {{token}} patterns in a string. Each token resolves via
+     * get_token_value(); unknown tokens pass through so CRM-baked static
+     * tokens (already substituted before upload) are never touched here.
+     */
+    private function substitute_tokens($str, $post_id)
+    {
+        if (strpos($str, '{{') === false) return $str;
+
+        // Handle the common case of the whole string being a single token:
+        // we want to return native types (numbers, arrays) rather than a
+        // stringified version, e.g. breadcrumb is an array.
+        if (preg_match('/^\s*\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}\s*$/', $str, $m)) {
+            $val = $this->get_token_value($m[1], $post_id);
+            // Native value (could be array, number, string)
+            return $val === null ? '' : $val;
+        }
+
+        return preg_replace_callback('/\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}/', function ($m) use ($post_id) {
+            $val = $this->get_token_value($m[1], $post_id);
+            if (is_array($val) || is_object($val)) return ''; // can't inline structured value
+            return $val === null ? '' : (string)$val;
+        }, $str);
+    }
+
+    /**
+     * Resolve a single token name to its value for the given post.
+     * Returns null when the token is unknown OR static (CRM pre-bakes static
+     * tokens, so if we see one here the rule was shipped unresolved — just
+     * return an empty string rather than leaking the placeholder).
+     */
+    private function get_token_value($token, $post_id)
+    {
+        // Static tokens should have been baked by CRM. If we see one here
+        // (e.g. rule was uploaded unresolved), drop it rather than leaking.
+        if (strpos($token, 'static.') === 0) return '';
+
+        // meta.KEY — look up arbitrary post meta
+        if (strpos($token, 'meta.') === 0) {
+            $key = substr($token, 5);
+            if ($key === '') return '';
+            $v = get_post_meta($post_id, $key, true);
+            return is_scalar($v) ? (string)$v : '';
+        }
+
+        // breadcrumb — array of {name, url}
+        if ($token === 'breadcrumb') {
+            return $this->build_breadcrumb($post_id);
+        }
+
+        // post.* family
+        if (strpos($token, 'post.') === 0) {
+            return $this->get_post_token($token, $post_id);
+        }
+
+        // product.* family (WooCommerce)
+        if (strpos($token, 'product.') === 0) {
+            return $this->get_product_token($token, $post_id);
+        }
+
+        return null;
+    }
+
+    private function get_post_token($token, $post_id)
+    {
+        $post = get_post($post_id);
+        if (!$post) return '';
+        switch ($token) {
+            case 'post.id':               return (string)$post_id;
+            case 'post.title':            return html_entity_decode(get_the_title($post_id), ENT_QUOTES, 'UTF-8');
+            case 'post.url':              return get_permalink($post_id);
+            case 'post.slug':             return $post->post_name;
+            case 'post.excerpt':
+                $ex = has_excerpt($post_id) ? get_the_excerpt($post_id) : wp_strip_all_tags($post->post_content);
+                $ex = trim(preg_replace('/\s+/', ' ', $ex));
+                return mb_substr($ex, 0, 300);
+            case 'post.featured_image':
+                return get_the_post_thumbnail_url($post_id, 'full') ?: '';
+            case 'post.date_published':   return get_the_date('c', $post_id);
+            case 'post.date_modified':    return get_the_modified_date('c', $post_id);
+            case 'post.author.name':
+                $u = get_userdata($post->post_author);
+                return $u ? $u->display_name : '';
+            case 'post.author.url':
+                return get_author_posts_url($post->post_author);
+        }
+        return '';
+    }
+
+    private function get_product_token($token, $post_id)
+    {
+        if (!function_exists('wc_get_product')) return '';
+        $product = wc_get_product($post_id);
+        if (!$product) return '';
+
+        switch ($token) {
+            case 'product.price':
+                $p = $product->get_price();
+                return $p === '' ? '' : (string)$p;
+            case 'product.currency':
+                return function_exists('get_woocommerce_currency') ? get_woocommerce_currency() : '';
+            case 'product.sku':
+                return (string)$product->get_sku();
+            case 'product.availability':
+                return $product->is_in_stock() ? 'https://schema.org/InStock' : 'https://schema.org/OutOfStock';
+            case 'product.image':
+                $img_id = $product->get_image_id();
+                if (!$img_id) return '';
+                return wp_get_attachment_image_url($img_id, 'full') ?: '';
+            case 'product.rating':
+                $r = $product->get_average_rating();
+                return $r ? (string)$r : '';
+            case 'product.review_count':
+                $c = $product->get_review_count();
+                return $c ? (string)$c : '';
+            case 'product.brand':
+                // Try an attribute named 'brand' first, then a 'product_brand' taxonomy.
+                $attr = $product->get_attribute('brand');
+                if ($attr) return $attr;
+                $terms = get_the_terms($post_id, 'product_brand');
+                if (!empty($terms) && !is_wp_error($terms)) return $terms[0]->name;
+                return '';
+            case 'product.gtin':
+                foreach (['_gtin', '_ean', '_upc', '_isbn'] as $k) {
+                    $v = get_post_meta($post_id, $k, true);
+                    if (!empty($v)) return (string)$v;
+                }
+                return '';
+        }
+        return '';
+    }
+
+    /**
+     * Build a simple breadcrumb list for JSON-LD. Walks parent chain for
+     * pages / uses primary category for posts. Returns array of
+     * {"@type": "ListItem", position, name, item}.
+     */
+    private function build_breadcrumb($post_id)
+    {
+        $post = get_post($post_id);
+        if (!$post) return [];
+        $items = [];
+        $home = home_url('/');
+        $items[] = ['@type' => 'ListItem', 'position' => 1, 'name' => 'Home', 'item' => $home];
+
+        if ($post->post_type === 'page' && $post->post_parent) {
+            $chain = [];
+            $pid = $post->post_parent;
+            while ($pid) {
+                $chain[] = $pid;
+                $parent = get_post($pid);
+                $pid = $parent ? $parent->post_parent : 0;
+            }
+            $chain = array_reverse($chain);
+            foreach ($chain as $pid) {
+                $items[] = [
+                    '@type'    => 'ListItem',
+                    'position' => count($items) + 1,
+                    'name'     => get_the_title($pid),
+                    'item'     => get_permalink($pid),
+                ];
+            }
+        }
+
+        $items[] = [
+            '@type'    => 'ListItem',
+            'position' => count($items) + 1,
+            'name'     => get_the_title($post_id),
+            'item'     => get_permalink($post_id),
+        ];
+
+        return $items;
     }
 
     /**
