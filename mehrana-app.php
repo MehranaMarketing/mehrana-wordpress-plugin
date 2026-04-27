@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.4.0
+ * Version: 5.4.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.4.0';
+    private $version = '5.4.1';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -83,6 +83,9 @@ class Mehrana_App_Plugin
         add_filter('rank_math/sitemap/exclude_post_ids', [$this, 'filter_sitemap_excluded_ids_array']);
         add_filter('rank_math/sitemap/entry', [$this, 'filter_sitemap_entry_by_url'], 10, 3);
         add_filter('rank_math/sitemap/urls', [$this, 'filter_sitemap_urls_array']);
+        // CPT archive root URLs (e.g. /service/ in service-sitemap.xml) bypass rank_math/sitemap/entry
+        // entirely — they're emitted from Post_Type_Sitemap_Provider via this dedicated filter.
+        add_filter('rank_math/sitemap/post_type_archive_link', [$this, 'filter_post_type_archive_link'], 10, 2);
         add_filter('wpseo_exclude_from_sitemap_by_post_ids', [$this, 'filter_sitemap_excluded_ids_array']);
         add_filter('wpseo_sitemap_url', [$this, 'filter_sitemap_entry_by_url'], 10, 2);
         add_filter('wp_sitemaps_posts_query_args', [$this, 'filter_core_sitemap_query_args']);
@@ -6795,6 +6798,21 @@ class Mehrana_App_Plugin
         $existing = isset($args['post__not_in']) && is_array($args['post__not_in']) ? $args['post__not_in'] : [];
         $args['post__not_in'] = array_values(array_unique(array_merge($existing, $excluded)));
         return $args;
+    }
+
+    /**
+     * Drop CPT archive root URLs (e.g. /service/) from Rank Math's per-CPT sitemap.
+     * These bypass rank_math/sitemap/entry, so we have to catch them at their own filter.
+     * Returning a falsy value tells Rank Math to skip pushing the archive entry.
+     */
+    public function filter_post_type_archive_link($archive_url, $post_type) {
+        if (!$archive_url) return $archive_url;
+        $excluded = $this->get_sitemap_excluded_urls();
+        if (empty($excluded)) return $archive_url;
+        if (in_array(untrailingslashit($archive_url), $excluded, true)) {
+            return false;
+        }
+        return $archive_url;
     }
 
     /**
