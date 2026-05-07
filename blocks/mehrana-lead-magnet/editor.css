@@ -1,0 +1,34 @@
+.mehrana-lead-magnet-block {
+    padding: 12px;
+    border: 1px dashed #c0c0c0;
+    border-radius: 6px;
+    background: #fafbfc;
+}
+
+.mehrana-lead-magnet-block__controls {
+    margin-bottom: 12px;
+}
+
+.mehrana-lead-magnet-block__preview-wrap {
+    margin-top: 8px;
+    padding-top: 12px;
+    border-top: 1px dashed #d0d0d0;
+}
+
+.mehrana-lead-magnet-block__preview-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6b7280;
+    margin-bottom: 8px;
+    font-weight: 600;
+}
+
+.mehrana-lead-magnet-block__preview {
+    pointer-events: none;
+}
+
+.mehrana-lead-magnet-block__preview mehrana-cta {
+    display: block;
+    width: 100%;
+}

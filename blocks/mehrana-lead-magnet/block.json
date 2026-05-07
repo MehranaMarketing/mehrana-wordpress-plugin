@@ -1,0 +1,42 @@
+{
+    "$schema": "https://schemas.wp.org/trunk/block.json",
+    "apiVersion": 3,
+    "name": "mehrana/lead-magnet",
+    "version": "1.0.0",
+    "title": "Mehrana Lead Magnet",
+    "category": "widgets",
+    "icon": "megaphone",
+    "description": "Drop a Mehrana inline-CTA campaign at this position. Pick the campaign from the dropdown — same form renders here as on the rest of the site.",
+    "keywords": [
+        "lead",
+        "form",
+        "cta",
+        "mehrana",
+        "campaign",
+        "lead magnet"
+    ],
+    "attributes": {
+        "token": {
+            "type": "string",
+            "default": ""
+        },
+        "campaignName": {
+            "type": "string",
+            "default": ""
+        },
+        "campaignLayout": {
+            "type": "string",
+            "default": ""
+        }
+    },
+    "supports": {
+        "html": false,
+        "reusable": true,
+        "align": [
+            "wide",
+            "full"
+        ]
+    },
+    "editorScript": "file:./editor.js",
+    "editorStyle": "file:./editor.css"
+}
