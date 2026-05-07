@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.4.1
+ * Version: 5.5.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.4.1';
+    private $version = '5.5.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -70,6 +70,13 @@ class Mehrana_App_Plugin
         // Register hooks that need 'init'
         add_action('init', [$this, 'init_actions']);
 
+        // Lead Magnet block + custom element. Registered on init so
+        // wp.blocks/register_block_type are available; the frontend
+        // script enqueues run on wp_enqueue_scripts.
+        add_action('init', [$this, 'register_lead_magnet_block']);
+        add_action('wp_enqueue_scripts', [$this, 'enqueue_lead_magnet_frontend']);
+        add_action('enqueue_block_editor_assets', [$this, 'enqueue_lead_magnet_editor']);
+
         // Daily cron that prunes image backups older than 24h
         add_action('mehrana_prune_image_backups', [$this, 'prune_image_backups']);
         register_activation_hook(__FILE__, [__CLASS__, 'schedule_prune_cron']);
@@ -95,6 +102,14 @@ class Mehrana_App_Plugin
     {
         // Register [iframe] shortcode for Google Maps
         add_shortcode('iframe', [$this, 'render_iframe_shortcode']);
+
+        // [mehrana_cta token="..."] — page-builder-friendly version of the
+        // Gutenberg block. Required because Elementor's "Shortcode" widget,
+        // Slider Revolution's HTML/Shortcode layer, classic editor, and
+        // most third-party slider plugins don't render Gutenberg blocks
+        // directly. Output is the same <mehrana-cta> tag so a single
+        // custom-element script handles both surfaces on the frontend.
+        add_shortcode('mehrana_cta', [$this, 'render_mehrana_cta_shortcode']);
 
         // Ensure cron is scheduled (self-heal in case activation hook didn't fire,
         // e.g. plugin updated via git pull rather than reinstall).
@@ -4535,6 +4550,13 @@ class Mehrana_App_Plugin
         register_setting('map_settings', 'map_api_key');
         register_setting('map_settings', 'map_gtm_id');
         register_setting('map_settings', 'map_custom_head_code');
+        // Lead Magnet block — these power the Gutenberg block dropdown
+        // (CRM URL + per-project token) and the frontend custom-element
+        // script enqueue. The token is the same project-level
+        // `leadMagnetToken` already used by the project popup embed; it's
+        // a public per-project identifier, not a secret.
+        register_setting('map_settings', 'mehrana_crm_url');
+        register_setting('map_settings', 'mehrana_lead_magnet_project_token');
     }
 
     /**
@@ -4778,6 +4800,34 @@ class Mehrana_App_Plugin
                             placeholder="https://app.example.com, https://crm.example.com" />
                         <p class="description">Comma-separated list of allowed origins. Leave empty to allow all authenticated
                             requests.</p>
+                    </div>
+                </div>
+
+                <!-- Lead Magnets -->
+                <div class="map-card">
+                    <h2>🎯 Lead Magnets</h2>
+                    <p class="description" style="margin-top:0;margin-bottom:14px;">
+                        Connect this site to a Mehrana CRM project so the <strong>Mehrana Lead Magnet</strong> block can list this project's inline-CTA campaigns in a dropdown.
+                    </p>
+
+                    <div class="map-field-row">
+                        <label for="mehrana_crm_url">CRM URL</label>
+                        <input type="text" name="mehrana_crm_url" id="mehrana_crm_url"
+                            value="<?php echo esc_attr(get_option('mehrana_crm_url', 'https://app.mehrana.agency')); ?>"
+                            placeholder="https://app.mehrana.agency" />
+                        <p class="description">
+                            Base URL of the Mehrana CRM. Defaults to production. Use <code>https://dev.mehrana.agency</code> on staging sites.
+                        </p>
+                    </div>
+
+                    <div class="map-field-row">
+                        <label for="mehrana_lead_magnet_project_token">Project Token</label>
+                        <input type="text" name="mehrana_lead_magnet_project_token" id="mehrana_lead_magnet_project_token"
+                            value="<?php echo esc_attr(get_option('mehrana_lead_magnet_project_token')); ?>"
+                            placeholder="paste the project's Lead Magnet token here" />
+                        <p class="description">
+                            Find this in the Mehrana CRM under <strong>Lead Magnets → Install Guide → Project Token</strong>. Same token used by the project-level popup embed; safe to publish (it's a public per-project identifier, not a secret).
+                        </p>
                     </div>
                 </div>
 
@@ -6135,6 +6185,115 @@ class Mehrana_App_Plugin
             esc_attr($atts['frameborder']),
             esc_attr($atts['scrolling'])
         );
+    }
+
+    // =============================================
+    // Lead Magnet block + custom element
+    // =============================================
+
+    /**
+     * Resolve the CRM origin from plugin settings, defaulting to production.
+     * Trailing slash stripped so paths can be appended cleanly.
+     */
+    private function mehrana_crm_origin()
+    {
+        $url = get_option('mehrana_crm_url', 'https://app.mehrana.agency');
+        $url = is_string($url) && trim($url) !== '' ? trim($url) : 'https://app.mehrana.agency';
+        return rtrim($url, '/');
+    }
+
+    /**
+     * Register the Mehrana Lead Magnet Gutenberg block.
+     *
+     * Static save → emits a real <mehrana-cta token="..."> tag into post
+     * content. No render_callback. The frontend custom-element script
+     * (enqueued separately) upgrades the tag and renders the campaign.
+     */
+    public function register_lead_magnet_block()
+    {
+        if (!function_exists('register_block_type')) {
+            return; // Pre-Gutenberg WP, nothing to register.
+        }
+        $block_dir = plugin_dir_path(__FILE__) . 'blocks/mehrana-lead-magnet';
+        if (!file_exists($block_dir . '/block.json')) {
+            return;
+        }
+        register_block_type($block_dir);
+    }
+
+    /**
+     * Enqueue the <mehrana-cta> custom element on every frontend page.
+     * Site-wide because the block can sit on any post/page, and
+     * has_block() doesn't see blocks rendered via shortcode or page-
+     * builder widgets that wrap our shortcode. The script is small and
+     * self-defends against double-registration; site-wide is the simple
+     * correct call.
+     */
+    public function enqueue_lead_magnet_frontend()
+    {
+        $crm = $this->mehrana_crm_origin();
+        wp_enqueue_script(
+            'mehrana-cta-element',
+            $crm . '/api/public/custom-elements/mehrana-cta.js',
+            [],
+            $this->version,
+            true // in footer; the element waits for connectedCallback so timing is fine.
+        );
+    }
+
+    /**
+     * Editor-side enqueue: load the same custom element inside the block
+     * editor iframe so the live preview in the block matches the
+     * published page exactly. Also pass CRM URL + project token to
+     * editor.js via wp_localize_script so the dropdown can fetch the
+     * project's campaigns.
+     */
+    public function enqueue_lead_magnet_editor()
+    {
+        $crm = $this->mehrana_crm_origin();
+        wp_enqueue_script(
+            'mehrana-cta-element-editor',
+            $crm . '/api/public/custom-elements/mehrana-cta.js',
+            [],
+            $this->version,
+            true
+        );
+
+        // The block's editor.js is registered via block.json, but we need
+        // to localize settings onto it. block.json registers it under a
+        // generated handle following the pattern "mehrana-lead-magnet-editor-script".
+        $handle = 'mehrana-lead-magnet-editor-script';
+        wp_localize_script($handle, 'MehranaLeadMagnetBlock', [
+            'crmUrl' => $crm,
+            'projectToken' => get_option('mehrana_lead_magnet_project_token', ''),
+            'settingsUrl' => admin_url('options-general.php?page=mehrana-app'),
+        ]);
+    }
+
+    /**
+     * [mehrana_cta token="..."] — emits the same custom element tag as
+     * the Gutenberg block. Drop-in for Elementor's Shortcode widget,
+     * Slider Revolution's HTML/shortcode layer, classic editor, and any
+     * page builder that supports shortcodes inside its content widgets.
+     *
+     * The token attribute is the only input. Validation is minimal here
+     * because the renderer ignores unknown/expired tokens silently and
+     * the CRM endpoint returns a clean error — no need to surface a
+     * page-render failure if a campaign got archived.
+     */
+    public function render_mehrana_cta_shortcode($atts)
+    {
+        $atts = shortcode_atts(['token' => ''], $atts, 'mehrana_cta');
+        $token = is_string($atts['token']) ? trim($atts['token']) : '';
+        if ($token === '') {
+            return '';
+        }
+        // Token charset is restricted to URL-safe characters; reject
+        // anything else as a hard guard against pasted HTML.
+        if (!preg_match('/^[A-Za-z0-9_\-]+$/', $token)) {
+            return '';
+        }
+        return '<mehrana-cta token="' . esc_attr($token) . '"></mehrana-cta>';
     }
 
     // =============================================
