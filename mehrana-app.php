@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.4
+ * Version: 5.7.5
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.4';
+    private $version = '5.7.5';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -175,6 +175,16 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/pages', [
             'methods' => 'GET',
             'callback' => [$this, 'get_pages'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Lightweight post-type counts. Used by the migration UI to
+        // populate per-type picker pills before pulling the heavy
+        // /pages payload — agency picks "Services (60)" and only
+        // pulls those, instead of one giant 50MB JSON over nginx.
+        register_rest_route($this->namespace, '/pages/counts', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_page_counts'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -3288,6 +3298,24 @@ class Mehrana_App_Plugin
         $exclude = ['attachment', 'elementor_library', 'elementor_font', 'elementor_icons', 'guest-author'];
         $allowed_types = array_diff(array_values($post_types), $exclude);
 
+        // Optional ?post_types=foo,bar filter — caller scopes the pull to
+        // a subset (services / news / posts / page) so the response stays
+        // small even on big sites. Anything outside the allow-list above
+        // is silently ignored.
+        $requested = $request->get_param('post_types');
+        if (is_string($requested) && strlen($requested) > 0) {
+            $requested_arr = array_filter(array_map('trim', explode(',', $requested)));
+            if (!empty($requested_arr)) {
+                $allowed_types = array_values(array_intersect($allowed_types, $requested_arr));
+                if (empty($allowed_types)) {
+                    return rest_ensure_response([
+                        'pages' => [],
+                        'debug' => ['total_found' => 0, 'note' => 'post_types filter matched no allowed types'],
+                    ]);
+                }
+            }
+        }
+
         $args = [
             'post_type' => array_values($allowed_types),
             'posts_per_page' => -1, // No limit
@@ -3421,6 +3449,35 @@ class Mehrana_App_Plugin
                 'types_found' => $debug_types,
                 'query_args' => $args
             ]
+        ]);
+    }
+
+    /**
+     * Lightweight per-post-type count. Used by the migration UI to
+     * populate picker pills before pulling the heavy /pages payload.
+     * No content / meta / images — just counts of published posts
+     * per public post type, with the same exclusions /pages applies.
+     */
+    public function get_page_counts($request)
+    {
+        $post_types = get_post_types(['public' => true], 'names');
+        $exclude = ['attachment', 'elementor_library', 'elementor_font', 'elementor_icons', 'guest-author'];
+        $allowed_types = array_diff(array_values($post_types), $exclude);
+
+        $counts = [];
+        $total = 0;
+        foreach ($allowed_types as $pt) {
+            // wp_count_posts is cached + fast; we only sum the
+            // 'publish' status to match what /pages returns.
+            $c = wp_count_posts($pt);
+            $n = (int) ($c->publish ?? 0);
+            $counts[$pt] = $n;
+            $total += $n;
+        }
+
+        return rest_ensure_response([
+            'counts' => $counts,
+            'total' => $total,
         ]);
     }
 
