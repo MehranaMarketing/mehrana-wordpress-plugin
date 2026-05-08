@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.5.0
+ * Version: 5.6.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.5.0';
+    private $version = '5.6.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -96,6 +96,8 @@ class Mehrana_App_Plugin
         add_filter('wpseo_exclude_from_sitemap_by_post_ids', [$this, 'filter_sitemap_excluded_ids_array']);
         add_filter('wpseo_sitemap_url', [$this, 'filter_sitemap_entry_by_url'], 10, 2);
         add_filter('wp_sitemaps_posts_query_args', [$this, 'filter_core_sitemap_query_args']);
+        // Any third-party sitemap plugin (e.g. Google XML Sitemaps by Auctollo)
+        add_action('template_redirect', [$this, 'maybe_hook_sitemap_post_exclusions'], 1);
     }
 
     public function init_actions()
@@ -3318,11 +3320,22 @@ class Mehrana_App_Plugin
                 }
             }
 
+            // SEO meta — Yoast → RankMath → SEOPress fallback chain. First
+            // non-empty value wins per field; sources can mix per field.
+            $seo = $this->get_post_seo_meta($page->ID);
+
             $result[] = [
                 'id' => $page->ID,
+                'slug' => $page->post_name,
                 'title' => $page->post_title,
                 'url' => get_permalink($page->ID),
                 'type' => $type,
+                'post_type' => $page->post_type,
+                'featured_media_url' => get_the_post_thumbnail_url($page->ID, 'full') ?: null,
+                'meta_title' => $seo['title'],
+                'meta_description' => $seo['description'],
+                'canonical' => $seo['canonical'],
+                'seo_source' => $seo['source'],
                 'has_elementor' => !empty($elementor_data),
                 'has_redirect' => $redirect_info['has_redirect'],
                 'redirect_url' => $redirect_info['redirect_url'],
@@ -5830,8 +5843,91 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * Read SEO meta for a post with a Yoast → RankMath → SEOPress
+     * fallback chain. Returns title/description/canonical and a `source`
+     * label naming whichever plugin held the winning value (or null when
+     * every plugin's meta is empty / no SEO plugin is installed).
+     *
+     * Each field falls back independently — a post can have a Yoast title
+     * but a RankMath canonical and we'll surface both; `source` reports
+     * the plugin that supplied the title in that case (the canonical's
+     * source isn't tracked separately to keep the response shape flat).
+     */
+    private function get_post_seo_meta($post_id)
+    {
+        $title = '';
+        $desc = '';
+        $canonical = '';
+        $source = null;
+
+        // Yoast
+        $y_title = get_post_meta($post_id, '_yoast_wpseo_title', true);
+        $y_desc = get_post_meta($post_id, '_yoast_wpseo_metadesc', true);
+        $y_canon = get_post_meta($post_id, '_yoast_wpseo_canonical', true);
+        if (!empty($y_title) || !empty($y_desc) || !empty($y_canon)) {
+            $title = $y_title;
+            $desc = $y_desc;
+            $canonical = $y_canon;
+            $source = 'yoast';
+        }
+
+        // RankMath fills any field still empty
+        if (empty($title)) {
+            $rm_title = get_post_meta($post_id, 'rank_math_title', true);
+            if (!empty($rm_title)) {
+                $title = $rm_title;
+                if ($source === null) $source = 'rankmath';
+            }
+        }
+        if (empty($desc)) {
+            $rm_desc = get_post_meta($post_id, 'rank_math_description', true);
+            if (!empty($rm_desc)) {
+                $desc = $rm_desc;
+                if ($source === null) $source = 'rankmath';
+            }
+        }
+        if (empty($canonical)) {
+            $rm_canon = get_post_meta($post_id, 'rank_math_canonical_url', true);
+            if (!empty($rm_canon)) {
+                $canonical = $rm_canon;
+                if ($source === null) $source = 'rankmath';
+            }
+        }
+
+        // SEOPress fills anything still empty
+        if (empty($title)) {
+            $sp_title = get_post_meta($post_id, '_seopress_titles_title', true);
+            if (!empty($sp_title)) {
+                $title = $sp_title;
+                if ($source === null) $source = 'seopress';
+            }
+        }
+        if (empty($desc)) {
+            $sp_desc = get_post_meta($post_id, '_seopress_titles_desc', true);
+            if (!empty($sp_desc)) {
+                $desc = $sp_desc;
+                if ($source === null) $source = 'seopress';
+            }
+        }
+        if (empty($canonical)) {
+            $sp_canon = get_post_meta($post_id, '_seopress_robots_canonical', true);
+            if (!empty($sp_canon)) {
+                $canonical = $sp_canon;
+                if ($source === null) $source = 'seopress';
+            }
+        }
+
+        return [
+            'title' => $title ?: '',
+            'description' => $desc ?: '',
+            'canonical' => $canonical ?: '',
+            'source' => $source,
+        ];
+    }
+
+    /**
      * Update page SEO meta (Rank Math / Yoast)
-     * 
+     *
      * @param WP_REST_Request $request
      * @return WP_REST_Response|WP_Error
      */
@@ -6935,8 +7031,14 @@ class Mehrana_App_Plugin
      * or if its post (when present) is in the excluded ID list. Return false to skip.
      */
     public function filter_sitemap_entry_by_url($url, $type = '', $post = null) {
-        // Some Rank Math hook variants pass only ($url); be defensive.
-        if (!is_array($url)) return $url;
+        // Some Rank Math versions pass a plain string URL instead of an array entry.
+        if (!is_array($url)) {
+            if (is_string($url) && $url !== '') {
+                $excluded_urls = $this->get_sitemap_excluded_urls();
+                if (in_array(untrailingslashit($url), $excluded_urls, true)) return false;
+            }
+            return $url;
+        }
         $loc = isset($url['loc']) ? (string) $url['loc'] : '';
         if ($loc) {
             $excluded_urls = $this->get_sitemap_excluded_urls();
@@ -6946,6 +7048,41 @@ class Mehrana_App_Plugin
             if (in_array((int) $post->ID, $this->get_sitemap_excluded_ids(), true)) return false;
         }
         return $url;
+    }
+
+    /**
+     * On any sitemap XML request, inject our excluded post IDs into every WP_Query
+     * so third-party sitemap plugins (e.g. Google XML Sitemaps by Auctollo) also
+     * drop them — even if they don't expose their own exclusion hooks.
+     */
+    public function maybe_hook_sitemap_post_exclusions() {
+        $uri = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
+        if (!$uri) return;
+        // Match: /sitemap.xml, /post-sitemap.xml, /page-sitemap2.xml, /sitemap-misc.xml, etc.
+        if (!preg_match('/\/[a-z0-9_\-]+-sitemap\d*\.xml$|\/sitemap\.xml$/i', $uri)) return;
+
+        $excluded_ids = $this->get_sitemap_excluded_ids();
+        $excluded_urls = $this->get_sitemap_excluded_urls();
+        if (empty($excluded_ids) && empty($excluded_urls)) return;
+
+        // pre_get_posts: works for plugins that use WP_Query / get_posts()
+        if (!empty($excluded_ids)) {
+            add_filter('pre_get_posts', function ($query) use ($excluded_ids) {
+                $not_in = (array) ($query->get('post__not_in') ?: []);
+                $query->set('post__not_in', array_unique(array_merge($not_in, $excluded_ids)));
+                return $query;
+            });
+        }
+
+        // posts_where: fallback for plugins that build their own WP_Query args
+        if (!empty($excluded_ids)) {
+            add_filter('posts_where', function ($where) use ($excluded_ids) {
+                global $wpdb;
+                $ids_str = implode(',', array_map('intval', $excluded_ids));
+                $where .= " AND {$wpdb->posts}.ID NOT IN ({$ids_str})";
+                return $where;
+            });
+        }
     }
 
     /**
