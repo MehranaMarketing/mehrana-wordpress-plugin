@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.6.1
+ * Version: 5.7.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.6.1';
+    private $version = '5.7.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -175,6 +175,17 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/pages', [
             'methods' => 'GET',
             'callback' => [$this, 'get_pages'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // List WordPress authors (users who have authored at least one
+        // published post). Used by Patrick's WP→Sanity migration to
+        // pre-create matching author docs in Sanity before importing
+        // posts, so each post lands with a real author ref instead of
+        // a generic fallback.
+        register_rest_route($this->namespace, '/authors', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_authors'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -3341,6 +3352,12 @@ class Mehrana_App_Plugin
                 'meta_description' => $seo['description'],
                 'canonical' => $seo['canonical'],
                 'seo_source' => $seo['source'],
+                // v5.7.0+ — original publish date, last modification, author
+                // ID. Migration uses `date` for Sanity publishedAt so the
+                // post order on the new site mirrors the WP timeline.
+                'date' => mysql_to_rfc3339($page->post_date_gmt),
+                'modified' => mysql_to_rfc3339($page->post_modified_gmt),
+                'post_author_id' => intval($page->post_author),
                 'has_elementor' => !empty($elementor_data),
                 'has_redirect' => $redirect_info['has_redirect'],
                 'redirect_url' => $redirect_info['redirect_url'],
@@ -3360,6 +3377,63 @@ class Mehrana_App_Plugin
                 'types_found' => $debug_types,
                 'query_args' => $args
             ]
+        ]);
+    }
+
+    /**
+     * List WP users who have authored at least one published post.
+     * Returns the data the WP→Sanity migration needs to create matching
+     * Sanity `author` documents — name, slug, role (display name + first
+     * /last + roles), bio (description), avatar URL, profile URL.
+     */
+    public function get_authors($request)
+    {
+        $users = get_users([
+            // Only users who could plausibly have authored content. WP
+            // exposes other roles (subscriber, customer) we don't care
+            // about — filter by capability so the response stays clean.
+            'capability__in' => ['edit_posts', 'edit_published_posts'],
+            'fields' => ['ID', 'display_name', 'user_login', 'user_email', 'user_url', 'user_registered'],
+        ]);
+
+        $result = [];
+        foreach ($users as $u) {
+            $first = get_user_meta($u->ID, 'first_name', true) ?: '';
+            $last = get_user_meta($u->ID, 'last_name', true) ?: '';
+            $description = get_user_meta($u->ID, 'description', true) ?: '';
+            $nickname = get_user_meta($u->ID, 'nickname', true) ?: '';
+
+            // WP author archive URL — handy for the Sanity sameAs field.
+            $archive_url = get_author_posts_url($u->ID);
+
+            // Avatar: the plugin doesn't ship a custom avatar field, so
+            // we fall back to Gravatar via WP's get_avatar_url().
+            $avatar_url = get_avatar_url($u->ID, ['size' => 256]) ?: null;
+
+            // Post count gives the migration UI a useful filter signal —
+            // skip authors with 0 posts to avoid creating dead Sanity
+            // author docs.
+            $post_count = (int) count_user_posts($u->ID, 'any', true);
+
+            $result[] = [
+                'id' => $u->ID,
+                'name' => $u->display_name,
+                'slug' => $u->user_login,
+                'first_name' => $first,
+                'last_name' => $last,
+                'nickname' => $nickname,
+                'email' => $u->user_email,
+                'description' => $description,
+                'avatar_url' => $avatar_url,
+                'archive_url' => $archive_url,
+                'website' => $u->user_url ?: null,
+                'post_count' => $post_count,
+            ];
+        }
+
+        return rest_ensure_response([
+            'authors' => $result,
+            'total' => count($result),
         ]);
     }
 
