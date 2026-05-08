@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.0
+ * Version: 5.7.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.0';
+    private $version = '5.7.1';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -3410,10 +3410,22 @@ class Mehrana_App_Plugin
             // we fall back to Gravatar via WP's get_avatar_url().
             $avatar_url = get_avatar_url($u->ID, ['size' => 256]) ?: null;
 
-            // Post count gives the migration UI a useful filter signal —
-            // skip authors with 0 posts to avoid creating dead Sanity
-            // author docs.
-            $post_count = (int) count_user_posts($u->ID, 'any', true);
+            // Post count across every public post type (post + custom
+            // CPTs like service / news / case-study) so the migration
+            // UI knows whether this user has any content the agency
+            // would want to migrate. count_user_posts() needs a real
+            // post_type — `'any'` is silently invalid and returns 0,
+            // which made every author show 0 posts in v5.7.0.
+            static $count_post_types = null;
+            if ($count_post_types === null) {
+                $all = get_post_types(['public' => true], 'names');
+                $exclude = ['attachment', 'elementor_library', 'elementor_font', 'elementor_icons', 'guest-author'];
+                $count_post_types = array_values(array_diff(array_values($all), $exclude));
+            }
+            $post_count = 0;
+            foreach ($count_post_types as $pt) {
+                $post_count += (int) count_user_posts($u->ID, $pt, true);
+            }
 
             $result[] = [
                 'id' => $u->ID,
