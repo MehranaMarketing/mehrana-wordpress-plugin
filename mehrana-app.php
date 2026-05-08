@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.3
+ * Version: 5.7.4
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.3';
+    private $version = '5.7.4';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -3299,6 +3299,31 @@ class Mehrana_App_Plugin
         $debug_types = array_count_values(array_map(function ($p) {
             return $p->post_type;
         }, $pages));
+
+        // Performance prime — without this, every iteration of the
+        // loop below issues 3-4 separate DB queries to resolve the
+        // featured image (thumbnail meta, attachment post, attachment
+        // file meta, alt-text meta). On a site with 200+ pages that's
+        // 600+ queries per /pages call, and the response gateways out.
+        //
+        // update_post_thumbnail_cache loads every page's _thumbnail_id
+        // in one query AND fetches the attachment posts they point to
+        // in one more query. Then we prime the alt + filename meta
+        // for those attachment IDs in one final batch via
+        // update_meta_cache. Net: 3 queries instead of 600+.
+        $pages_query = new WP_Query();
+        $pages_query->posts = $pages;
+        $pages_query->post_count = count($pages);
+        update_post_thumbnail_cache($pages_query);
+
+        $thumb_ids = [];
+        foreach ($pages as $p) {
+            $tid = (int) get_post_thumbnail_id($p->ID);
+            if ($tid > 0) $thumb_ids[$tid] = true;
+        }
+        if (!empty($thumb_ids)) {
+            update_meta_cache('post', array_keys($thumb_ids));
+        }
 
         foreach ($pages as $page) {
             $elementor_data = get_post_meta($page->ID, '_elementor_data', true);
