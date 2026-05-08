@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.6.0
+ * Version: 5.6.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.6.0';
+    private $version = '5.6.1';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -96,8 +96,13 @@ class Mehrana_App_Plugin
         add_filter('wpseo_exclude_from_sitemap_by_post_ids', [$this, 'filter_sitemap_excluded_ids_array']);
         add_filter('wpseo_sitemap_url', [$this, 'filter_sitemap_entry_by_url'], 10, 2);
         add_filter('wp_sitemaps_posts_query_args', [$this, 'filter_core_sitemap_query_args']);
-        // Any third-party sitemap plugin (e.g. Google XML Sitemaps by Auctollo)
-        add_action('template_redirect', [$this, 'maybe_hook_sitemap_post_exclusions'], 1);
+        // Any third-party sitemap plugin (e.g. Google XML Sitemaps by Auctollo).
+        // Registered directly in __construct so they fire before Auctollo generates the XML.
+        add_filter('pre_get_posts', [$this, 'filter_sitemap_query_exclude_posts']);
+        add_filter('posts_where', [$this, 'filter_sitemap_query_where'], 10, 2);
+        add_filter('get_pages', [$this, 'filter_get_pages_for_sitemap']);
+        // Final fallback: filter the rendered XML output for any plugin that uses raw SQL.
+        add_action('init', [$this, 'maybe_start_sitemap_output_filter'], 0);
     }
 
     public function init_actions()
@@ -7055,34 +7060,77 @@ class Mehrana_App_Plugin
      * so third-party sitemap plugins (e.g. Google XML Sitemaps by Auctollo) also
      * drop them — even if they don't expose their own exclusion hooks.
      */
-    public function maybe_hook_sitemap_post_exclusions() {
+    private function is_sitemap_xml_request() {
         $uri = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
-        if (!$uri) return;
-        // Match: /sitemap.xml, /post-sitemap.xml, /page-sitemap2.xml, /sitemap-misc.xml, etc.
-        if (!preg_match('/\/[a-z0-9_\-]+-sitemap\d*\.xml$|\/sitemap\.xml$/i', $uri)) return;
+        if (!$uri) return false;
+        return (bool) preg_match('/\/[a-z0-9_\-]+-sitemap\d*\.xml$|\/sitemap\.xml$/i', $uri);
+    }
+
+    public function filter_sitemap_query_exclude_posts($query) {
+        if (!$this->is_sitemap_xml_request()) return $query;
+        $excluded_ids = $this->get_sitemap_excluded_ids();
+        if (empty($excluded_ids)) return $query;
+        $not_in = (array) ($query->get('post__not_in') ?: []);
+        $query->set('post__not_in', array_unique(array_merge($not_in, $excluded_ids)));
+        return $query;
+    }
+
+    public function filter_sitemap_query_where($where, $query = null) {
+        if (!$this->is_sitemap_xml_request()) return $where;
+        $excluded_ids = $this->get_sitemap_excluded_ids();
+        if (empty($excluded_ids)) return $where;
+        global $wpdb;
+        $ids_str = implode(',', array_map('intval', $excluded_ids));
+        $where .= " AND {$wpdb->posts}.ID NOT IN ({$ids_str})";
+        return $where;
+    }
+
+    public function filter_get_pages_for_sitemap($pages) {
+        if (!$this->is_sitemap_xml_request()) return $pages;
+        $excluded_ids = $this->get_sitemap_excluded_ids();
+        if (empty($excluded_ids)) return $pages;
+        return array_values(array_filter($pages, function ($page) use ($excluded_ids) {
+            return !in_array((int) $page->ID, $excluded_ids, true);
+        }));
+    }
+
+    /**
+     * On sitemap XML requests, start an output buffer that strips excluded
+     * URLs from the rendered XML. This is the only reliable way to filter
+     * sitemap plugins that build their XML from raw $wpdb queries (e.g.
+     * Google XML Sitemaps by Auctollo).
+     */
+    public function maybe_start_sitemap_output_filter() {
+        if (!$this->is_sitemap_xml_request()) return;
 
         $excluded_ids = $this->get_sitemap_excluded_ids();
         $excluded_urls = $this->get_sitemap_excluded_urls();
         if (empty($excluded_ids) && empty($excluded_urls)) return;
 
-        // pre_get_posts: works for plugins that use WP_Query / get_posts()
-        if (!empty($excluded_ids)) {
-            add_filter('pre_get_posts', function ($query) use ($excluded_ids) {
-                $not_in = (array) ($query->get('post__not_in') ?: []);
-                $query->set('post__not_in', array_unique(array_merge($not_in, $excluded_ids)));
-                return $query;
-            });
+        $url_set = [];
+        foreach ($excluded_urls as $u) {
+            if (is_string($u) && $u !== '') $url_set[untrailingslashit($u)] = true;
         }
+        foreach ($excluded_ids as $pid) {
+            $u = get_permalink((int) $pid);
+            if ($u) $url_set[untrailingslashit($u)] = true;
+        }
+        if (empty($url_set)) return;
 
-        // posts_where: fallback for plugins that build their own WP_Query args
-        if (!empty($excluded_ids)) {
-            add_filter('posts_where', function ($where) use ($excluded_ids) {
-                global $wpdb;
-                $ids_str = implode(',', array_map('intval', $excluded_ids));
-                $where .= " AND {$wpdb->posts}.ID NOT IN ({$ids_str})";
-                return $where;
-            });
-        }
+        ob_start(function ($buffer) use ($url_set) {
+            // Only touch obvious sitemap output, never normal pages.
+            if (strpos($buffer, '<urlset') === false && strpos($buffer, '<sitemapindex') === false) {
+                return $buffer;
+            }
+            foreach ($url_set as $url => $_) {
+                $variants = [$url, $url . '/', htmlspecialchars($url, ENT_XML1 | ENT_QUOTES, 'UTF-8')];
+                foreach ($variants as $variant) {
+                    $pattern = '/<url>\s*<loc>\s*' . preg_quote($variant, '/') . '\s*<\/loc>[\s\S]*?<\/url>\s*/i';
+                    $buffer = preg_replace($pattern, '', $buffer);
+                }
+            }
+            return $buffer;
+        });
     }
 
     /**
