@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.2
+ * Version: 5.7.3
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.2';
+    private $version = '5.7.3';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -3340,6 +3340,23 @@ class Mehrana_App_Plugin
             // non-empty value wins per field; sources can mix per field.
             $seo = $this->get_post_seo_meta($page->ID);
 
+            // Featured-image bundle. v5.7.3 adds alt + filename so the
+            // migration target writes a properly-aliased Sanity asset
+            // (originalFilename = real WP filename, alt = WP alt text)
+            // instead of the previous fallback ("page title for alt,
+            // sanity-generated image-<hash>.png for filename" — both
+            // hurt SEO).
+            $featured_id = get_post_thumbnail_id($page->ID) ?: null;
+            $featured_url = $featured_id ? wp_get_attachment_image_url($featured_id, 'full') : null;
+            $featured_alt = $featured_id
+                ? (string) get_post_meta($featured_id, '_wp_attachment_image_alt_text', true)
+                : '';
+            $featured_filename = null;
+            if ($featured_id) {
+                $path = get_attached_file($featured_id);
+                if ($path) $featured_filename = basename($path);
+            }
+
             $result[] = [
                 'id' => $page->ID,
                 'slug' => $page->post_name,
@@ -3347,7 +3364,9 @@ class Mehrana_App_Plugin
                 'url' => get_permalink($page->ID),
                 'type' => $type,
                 'post_type' => $page->post_type,
-                'featured_media_url' => get_the_post_thumbnail_url($page->ID, 'full') ?: null,
+                'featured_media_url' => $featured_url,
+                'featured_media_alt' => $featured_alt,
+                'featured_media_filename' => $featured_filename,
                 'meta_title' => $seo['title'],
                 'meta_description' => $seo['description'],
                 'canonical' => $seo['canonical'],
