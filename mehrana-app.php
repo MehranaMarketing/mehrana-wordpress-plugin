@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.1
+ * Version: 5.7.2
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.1';
+    private $version = '5.7.2';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -3428,7 +3428,12 @@ class Mehrana_App_Plugin
             }
 
             $result[] = [
-                'id' => $u->ID,
+                // intval — WP's get_users() with `'fields' => ['ID', …]`
+                // returns ID as a string in some PHP/WP combinations,
+                // which broke the migration UI's selection filter
+                // (Set<number>.has("15") is false). Force numeric here
+                // so JSON consumers always see a number.
+                'id' => intval($u->ID),
                 'name' => $u->display_name,
                 'slug' => $u->user_login,
                 'first_name' => $first,
