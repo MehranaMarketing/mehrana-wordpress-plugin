@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.5
+ * Version: 5.7.6
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.5';
+    private $version = '5.7.6';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -6045,6 +6045,16 @@ class Mehrana_App_Plugin
      * label naming whichever plugin held the winning value (or null when
      * every plugin's meta is empty / no SEO plugin is installed).
      *
+     * v5.7.6: when a per-post override is empty (the common case — most
+     * teams set the title at the global template level: "%%title%% %%sep%%
+     * %%sitename%%" — and never edit per-post), fall back to the rendered
+     * frontend value the SEO plugin would emit on that URL. Also expand
+     * any template tokens (`%%title%%` etc.) when the raw meta itself is
+     * a template string. Without this the migration was returning empty
+     * meta_title / meta_description for any post whose author hadn't
+     * manually overridden the SEO fields — which on most sites is most
+     * posts.
+     *
      * Each field falls back independently — a post can have a Yoast title
      * but a RankMath canonical and we'll surface both; `source` reports
      * the plugin that supplied the title in that case (the canonical's
@@ -6056,14 +6066,15 @@ class Mehrana_App_Plugin
         $desc = '';
         $canonical = '';
         $source = null;
+        $post = get_post($post_id);
 
-        // Yoast
+        // Yoast (raw post meta first)
         $y_title = get_post_meta($post_id, '_yoast_wpseo_title', true);
         $y_desc = get_post_meta($post_id, '_yoast_wpseo_metadesc', true);
         $y_canon = get_post_meta($post_id, '_yoast_wpseo_canonical', true);
         if (!empty($y_title) || !empty($y_desc) || !empty($y_canon)) {
-            $title = $y_title;
-            $desc = $y_desc;
+            $title = $this->expand_yoast_tokens($y_title, $post);
+            $desc = $this->expand_yoast_tokens($y_desc, $post);
             $canonical = $y_canon;
             $source = 'yoast';
         }
@@ -6072,14 +6083,14 @@ class Mehrana_App_Plugin
         if (empty($title)) {
             $rm_title = get_post_meta($post_id, 'rank_math_title', true);
             if (!empty($rm_title)) {
-                $title = $rm_title;
+                $title = $this->expand_rankmath_tokens($rm_title, $post);
                 if ($source === null) $source = 'rankmath';
             }
         }
         if (empty($desc)) {
             $rm_desc = get_post_meta($post_id, 'rank_math_description', true);
             if (!empty($rm_desc)) {
-                $desc = $rm_desc;
+                $desc = $this->expand_rankmath_tokens($rm_desc, $post);
                 if ($source === null) $source = 'rankmath';
             }
         }
@@ -6114,11 +6125,195 @@ class Mehrana_App_Plugin
             }
         }
 
+        // Frontend fallback — title/description still empty. Most teams
+        // configure at the template level, so the per-post meta is empty
+        // and we have to ask the SEO plugin what it WOULD render.
+        if (empty($title)) {
+            $rendered = $this->fetch_rendered_seo_title($post);
+            if (!empty($rendered['title'])) {
+                $title = $rendered['title'];
+                if ($source === null && !empty($rendered['source'])) $source = $rendered['source'];
+            }
+        }
+        if (empty($desc)) {
+            $rendered = $this->fetch_rendered_seo_description($post);
+            if (!empty($rendered['description'])) {
+                $desc = $rendered['description'];
+                if ($source === null && !empty($rendered['source'])) $source = $rendered['source'];
+            }
+        }
+
         return [
             'title' => $title ?: '',
             'description' => $desc ?: '',
             'canonical' => $canonical ?: '',
             'source' => $source,
+        ];
+    }
+
+    /**
+     * Expand Yoast template tokens (`%%title%%`, `%%sitename%%`,
+     * `%%sep%%`, etc.) using Yoast's own replacer when the value
+     * contains tokens. No-op on plain strings.
+     */
+    private function expand_yoast_tokens($value, $post)
+    {
+        if (!is_string($value) || $value === '' || strpos($value, '%%') === false) {
+            return is_string($value) ? $value : '';
+        }
+        // wpseo_replace_vars filter is the public API; works regardless
+        // of Yoast version. Falls back to the raw string if Yoast isn't
+        // active (no listener attached).
+        $replaced = apply_filters('wpseo_replace_vars', $value, $post);
+        return is_string($replaced) ? $replaced : $value;
+    }
+
+    /**
+     * Expand RankMath template tokens via the public helper. Returns
+     * the original string when RankMath isn't active.
+     */
+    private function expand_rankmath_tokens($value, $post)
+    {
+        if (!is_string($value) || $value === '' || strpos($value, '%') === false) {
+            return is_string($value) ? $value : '';
+        }
+        if (class_exists('\\RankMath\\Helper') && method_exists('\\RankMath\\Helper', 'replace_vars')) {
+            try {
+                $replaced = \RankMath\Helper::replace_vars($value, $post);
+                if (is_string($replaced) && $replaced !== '') return $replaced;
+            } catch (\Throwable $e) {
+                // fall through to raw value
+            }
+        }
+        return $value;
+    }
+
+    /**
+     * Ask the active SEO plugin what title it would emit on this
+     * post's permalink. Used when no plugin has a per-post override —
+     * the title comes from the site-wide template the user configured
+     * in their SEO plugin's Titles & Meta settings.
+     */
+    private function fetch_rendered_seo_title($post)
+    {
+        if (!$post) return ['title' => '', 'source' => null];
+
+        // Yoast: WPSEO_Frontend::title($post) renders the configured
+        // template for this post's archetype. Wrapped in a try because
+        // some Yoast versions need the global $post set.
+        if (defined('WPSEO_VERSION') && class_exists('WPSEO_Frontend')) {
+            try {
+                $frontend = \WPSEO_Frontend::get_instance();
+                if (method_exists($frontend, 'title')) {
+                    $rendered = $frontend->title('', '', $post);
+                    if (is_string($rendered) && $rendered !== '') {
+                        return ['title' => $rendered, 'source' => 'yoast'];
+                    }
+                }
+            } catch (\Throwable $e) {
+                // fall through
+            }
+            // Yoast 14+ uses a different surface — try the modern filter.
+            $rendered = apply_filters('wpseo_title', '', $post);
+            if (is_string($rendered) && $rendered !== '') {
+                return ['title' => $rendered, 'source' => 'yoast'];
+            }
+        }
+
+        // RankMath: rank_math/frontend/title is the canonical filter.
+        if (defined('RANK_MATH_VERSION') || class_exists('RankMath')) {
+            $rendered = apply_filters('rank_math/frontend/title', '', $post);
+            if (is_string($rendered) && $rendered !== '') {
+                return ['title' => $rendered, 'source' => 'rankmath'];
+            }
+            // Older RankMath: build from the global title template.
+            if (class_exists('\\RankMath\\Helper') && method_exists('\\RankMath\\Helper', 'replace_vars')) {
+                $template = \RankMath\Helper::get_settings('titles.pt_' . $post->post_type . '_title');
+                if (is_string($template) && $template !== '') {
+                    try {
+                        $rendered = \RankMath\Helper::replace_vars($template, $post);
+                        if (is_string($rendered) && $rendered !== '') {
+                            return ['title' => $rendered, 'source' => 'rankmath'];
+                        }
+                    } catch (\Throwable $e) {
+                        // fall through
+                    }
+                }
+            }
+        }
+
+        // Last resort: post title + site name. Mirrors the default WP
+        // template "Post Title - Site Name" so we never leave meta_title
+        // empty for a published post.
+        $site = get_bloginfo('name');
+        $title = $post->post_title;
+        if ($title === '') return ['title' => '', 'source' => null];
+        return [
+            'title' => $site ? "$title - $site" : $title,
+            'source' => null,
+        ];
+    }
+
+    /**
+     * Ask the active SEO plugin what meta description it would emit
+     * for this post. Returns empty string when the plugin has no
+     * description configured at any level (post override, archetype
+     * template, or global default) — same behavior as the live page.
+     */
+    private function fetch_rendered_seo_description($post)
+    {
+        if (!$post) return ['description' => '', 'source' => null];
+
+        // Yoast
+        if (defined('WPSEO_VERSION') && class_exists('WPSEO_Frontend')) {
+            try {
+                $frontend = \WPSEO_Frontend::get_instance();
+                if (method_exists($frontend, 'metadesc')) {
+                    $rendered = $frontend->metadesc(false);
+                    if (is_string($rendered) && $rendered !== '') {
+                        return ['description' => $rendered, 'source' => 'yoast'];
+                    }
+                }
+            } catch (\Throwable $e) {
+                // fall through
+            }
+            $rendered = apply_filters('wpseo_metadesc', '', $post);
+            if (is_string($rendered) && $rendered !== '') {
+                return ['description' => $rendered, 'source' => 'yoast'];
+            }
+        }
+
+        // RankMath
+        if (defined('RANK_MATH_VERSION') || class_exists('RankMath')) {
+            $rendered = apply_filters('rank_math/frontend/description', '', $post);
+            if (is_string($rendered) && $rendered !== '') {
+                return ['description' => $rendered, 'source' => 'rankmath'];
+            }
+            if (class_exists('\\RankMath\\Helper') && method_exists('\\RankMath\\Helper', 'replace_vars')) {
+                $template = \RankMath\Helper::get_settings('titles.pt_' . $post->post_type . '_description');
+                if (is_string($template) && $template !== '') {
+                    try {
+                        $rendered = \RankMath\Helper::replace_vars($template, $post);
+                        if (is_string($rendered) && $rendered !== '') {
+                            return ['description' => $rendered, 'source' => 'rankmath'];
+                        }
+                    } catch (\Throwable $e) {
+                        // fall through
+                    }
+                }
+            }
+        }
+
+        // Last resort: post excerpt (manual or auto-generated). Matches
+        // what most themes use for og:description when no SEO plugin is
+        // installed.
+        $excerpt = has_excerpt($post) ? get_the_excerpt($post) : '';
+        if ($excerpt === '' && !empty($post->post_content)) {
+            $excerpt = wp_trim_words(wp_strip_all_tags(strip_shortcodes($post->post_content)), 30, '');
+        }
+        return [
+            'description' => is_string($excerpt) ? $excerpt : '',
+            'source' => null,
         ];
     }
 
