@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.6
+ * Version: 5.7.7
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.6';
+    private $version = '5.7.7';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -2735,7 +2735,10 @@ class Mehrana_App_Plugin
             return new WP_Error('invalid_attachment', 'Attachment not found', ['status' => 404]);
         }
 
-        // Update alt text in media library
+        // Update alt text in media library. Themes that render images via
+        // the_post_thumbnail() / wp_get_attachment_image() will reflect this
+        // on next render — but cached pages and content-embedded images need
+        // the additional passes below.
         update_post_meta($id, '_wp_attachment_image_alt', $sanitized_alt);
         $this->log("[update_media_alt] Updated alt text in media library for attachment $id: $alt");
 
@@ -2746,130 +2749,241 @@ class Mehrana_App_Plugin
                 'success' => true,
                 'media_id' => $id,
                 'alt' => $alt,
-                'posts_updated' => 0
+                'posts_updated' => 0,
+                'inline_updated' => 0,
+                'elementor_updated' => 0,
+                'featured_for' => 0,
+                'note' => 'media_library_only — attachment has no URL'
             ]);
         }
 
-        // Also get any resized versions of this image
+        // Build the full list of URL variants that may appear in content:
+        // the original + every registered intermediate size + filename-only
+        // forms used by Elementor / page-builders.
         $metadata = wp_get_attachment_metadata($id);
         $base_url = dirname($image_url);
         $image_urls = [$image_url];
 
         if ($metadata && isset($metadata['sizes'])) {
-            foreach ($metadata['sizes'] as $size => $size_data) {
-                $image_urls[] = $base_url . '/' . $size_data['file'];
+            foreach ($metadata['sizes'] as $size_data) {
+                if (!empty($size_data['file'])) {
+                    $image_urls[] = $base_url . '/' . $size_data['file'];
+                }
             }
         }
 
-        // Get the base filename for matching (handles S3 URLs too)
+        // Filename for both LIKE search and Elementor JSON matching.
         $filename = basename($image_url);
         $filename_without_ext = pathinfo($filename, PATHINFO_FILENAME);
 
-        // Find all posts containing this image
         global $wpdb;
-        $posts_updated = 0;
+        $inline_updated = 0;
+        $elementor_updated = 0;
 
-        // Search for posts containing the image URL or filename
-        $like_pattern = '%' . $wpdb->esc_like($filename_without_ext) . '%';
-        $posts = $wpdb->get_results($wpdb->prepare(
-            "SELECT ID, post_content FROM {$wpdb->posts} 
-             WHERE post_content LIKE %s 
-             AND post_status IN ('publish', 'draft', 'pending', 'private')
-             AND post_type IN ('post', 'page')",
-            $like_pattern
-        ));
+        // ── Pass 1: inline <img> tags in post_content ───────────────────
+        // Broadened from ['post','page'] to *every public post type* so
+        // WooCommerce products, custom post types (recipes, portfolios,
+        // listings, etc.) are covered. The previous filter silently
+        // skipped these — a common cause of "I deployed alt but it came
+        // back as missing on the next crawl".
+        $public_post_types = get_post_types(['public' => true], 'names');
+        if (!empty($public_post_types)) {
+            $type_placeholders = implode(',', array_fill(0, count($public_post_types), '%s'));
+            $like_pattern = '%' . $wpdb->esc_like($filename_without_ext) . '%';
 
-        $this->log("[update_media_alt] Found " . count($posts) . " posts containing image filename: $filename_without_ext");
+            $sql = "SELECT ID, post_content FROM {$wpdb->posts}
+                    WHERE post_content LIKE %s
+                      AND post_status IN ('publish', 'draft', 'pending', 'private')
+                      AND post_type IN ($type_placeholders)";
+            $params = array_merge([$like_pattern], array_values($public_post_types));
+            $posts = $wpdb->get_results($wpdb->prepare($sql, $params));
 
-        foreach ($posts as $post) {
-            $content = $post->post_content;
-            $updated = false;
+            $this->log("[update_media_alt] Pass 1 (inline): " . count($posts) . " posts contain '$filename_without_ext'");
 
-            // Pattern to match img tags with this image and any alt attribute
-            foreach ($image_urls as $url) {
-                // Escape URL for regex
-                $escaped_url = preg_quote($url, '/');
-
-                // Match img tags containing this URL and update their alt
-                // Pattern: <img ... src="URL" ... alt="anything" ...>
-                $pattern = '/(<img[^>]*src=["\']' . $escaped_url . '["\'][^>]*alt=["\'])([^"\']*)(["\']/i';
-                if (preg_match($pattern, $content)) {
-                    $content = preg_replace($pattern, '$1' . esc_attr($sanitized_alt) . '$3', $content);
-                    $updated = true;
+            foreach ($posts as $post) {
+                $content = $post->post_content;
+                $updated = $this->rewrite_inline_alt_in_content($content, $id, $image_urls, $sanitized_alt);
+                if ($updated && $content !== $post->post_content) {
+                    $wpdb->update($wpdb->posts, ['post_content' => $content], ['ID' => $post->ID]);
+                    $inline_updated++;
+                    clean_post_cache($post->ID);
+                    $this->log("[update_media_alt] Pass 1 updated inline alt on post {$post->ID}");
                 }
-
-                // Also handle when alt comes before src
-                $pattern2 = '/(<img[^>]*alt=["\'])([^"\']*)(["\']+[^>]*src=["\']' . $escaped_url . '["\'])/i';
-                if (preg_match($pattern2, $content)) {
-                    $content = preg_replace($pattern2, '$1' . esc_attr($sanitized_alt) . '$3', $content);
-                    $updated = true;
-                }
-            }
-
-            // Also update by wp-image-ID class (more reliable for Gutenberg)
-            $wp_image_class = 'wp-image-' . $id;
-            $pattern3 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*alt=["\'])([^"\']*)(["\']/i';
-            if (preg_match($pattern3, $content)) {
-                $content = preg_replace($pattern3, '$1' . esc_attr($sanitized_alt) . '$3', $content);
-                $updated = true;
-            }
-
-            // Handle alt before class
-            $pattern4 = '/(<img[^>]*alt=["\'])([^"\']*)(["\']+[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'])/i';
-            if (preg_match($pattern4, $content)) {
-                $content = preg_replace($pattern4, '$1' . esc_attr($sanitized_alt) . '$3', $content);
-                $updated = true;
-            }
-
-            // NEW: Pattern 5 - Handle img tags where alt might have spaces/quotes issues
-            // Match wp-image-ID class and replace alt regardless of position
-            $pattern5 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*)alt=["\'][^"\']*["\']([^>]*>)/i';
-            if (preg_match($pattern5, $content)) {
-                $content = preg_replace($pattern5, '$1alt="' . esc_attr($sanitized_alt) . '"$2', $content);
-                $updated = true;
-            }
-
-            // NEW: Pattern 6 - For Classic Editor: img tags with wp-image-ID but NO alt attribute (add one)
-            $pattern6 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*)(\/?>)/i';
-            if (preg_match($pattern6, $content) && !preg_match('/alt=["\']/', $content)) {
-                // Only add alt if not already present
-                $content = preg_replace($pattern6, '$1 alt="' . esc_attr($sanitized_alt) . '" $2', $content);
-                $updated = true;
-            }
-
-            // NEW: Pattern 7 - Generic img tag with this specific URL (Classic Editor friendly)
-            foreach ($image_urls as $url) {
-                $escaped_url = preg_quote($url, '/');
-                // Replace existing alt in img tag with this src
-                $pattern7 = '/(<img[^>]*src=["\']' . $escaped_url . '["\'][^>]*)alt=["\'][^"\']*["\']([^>]*>)/i';
-                if (preg_match($pattern7, $content)) {
-                    $content = preg_replace($pattern7, '$1alt="' . esc_attr($sanitized_alt) . '"$2', $content);
-                    $updated = true;
-                }
-            }
-
-            if ($updated && $content !== $post->post_content) {
-                $wpdb->update(
-                    $wpdb->posts,
-                    ['post_content' => $content],
-                    ['ID' => $post->ID]
-                );
-                $posts_updated++;
-                $this->log("[update_media_alt] Updated post ID {$post->ID} with new alt text");
-
-                // Clear post cache
-                clean_post_cache($post->ID);
             }
         }
 
-        $this->log("[update_media_alt] Finished. Updated $posts_updated posts");
+        // ── Pass 2: Elementor _elementor_data postmeta ──────────────────
+        // Elementor stores its layout as a JSON-encoded array in postmeta;
+        // image widgets carry { image: { id, url, alt, source } } objects.
+        // Without this pass, alts on Elementor sites looked deployed in our
+        // dashboard but the next crawl re-discovered them as blank because
+        // post_content was empty / wrapper-only.
+        $elementor_posts = $wpdb->get_results($wpdb->prepare(
+            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = '_elementor_data'
+               AND (meta_value LIKE %s OR meta_value LIKE %s)",
+            '%' . $wpdb->esc_like((string) $id) . '%',
+            '%' . $wpdb->esc_like($filename_without_ext) . '%'
+        ));
+
+        $this->log("[update_media_alt] Pass 2 (Elementor): " . count($elementor_posts) . " posts reference this image");
+
+        foreach ($elementor_posts as $row) {
+            $changed = $this->rewrite_elementor_alt($row->meta_value, $id, $image_urls, $sanitized_alt);
+            if ($changed !== null) {
+                update_post_meta($row->post_id, '_elementor_data', wp_slash($changed));
+                $elementor_updated++;
+                clean_post_cache($row->post_id);
+                // Bump Elementor's CSS cache so the frontend re-renders
+                delete_post_meta($row->post_id, '_elementor_css');
+                $this->log("[update_media_alt] Pass 2 updated Elementor alt on post {$row->post_id}");
+            }
+        }
+
+        // ── Pass 3: featured-image diagnostic (no write needed) ─────────
+        // Themes that render via the_post_thumbnail() already read alt from
+        // _wp_attachment_image_alt, so the media-library update above is
+        // sufficient. We just count usages for the diagnostic response so
+        // CRM-side reporting can distinguish "fixed via meta" vs "needed
+        // content rewrite".
+        $featured_for = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->postmeta}
+             WHERE meta_key = '_thumbnail_id' AND meta_value = %d",
+            $id
+        ));
+
+        $posts_updated = $inline_updated + $elementor_updated;
+        $this->log("[update_media_alt] Done. inline=$inline_updated elementor=$elementor_updated featured_for=$featured_for");
 
         return rest_ensure_response([
             'success' => true,
             'media_id' => $id,
             'alt' => $alt,
-            'posts_updated' => $posts_updated
+            // Backwards-compatible field used by older CRM versions.
+            'posts_updated' => $posts_updated,
+            // Rich diagnostic so the CRM can tell users WHY a deploy didn't
+            // visibly change a page (e.g. uses a builder we don't support).
+            'inline_updated' => $inline_updated,
+            'elementor_updated' => $elementor_updated,
+            'featured_for' => $featured_for,
+            'media_alt_updated' => true
         ]);
+    }
+
+    /**
+     * Apply every inline-<img> alt-rewrite pattern to a content string.
+     * Returns true if any pattern matched. Pulled out of update_media_alt
+     * so the same logic can be reused by future bulk endpoints.
+     */
+    private function rewrite_inline_alt_in_content(&$content, $attachment_id, $image_urls, $sanitized_alt)
+    {
+        $updated = false;
+        $wp_image_class = 'wp-image-' . intval($attachment_id);
+
+        foreach ($image_urls as $url) {
+            $escaped_url = preg_quote($url, '/');
+
+            // src=…alt=…
+            $pattern = '/(<img[^>]*src=["\']' . $escaped_url . '["\'][^>]*alt=["\'])([^"\']*)(["\']/i';
+            if (preg_match($pattern, $content)) {
+                $content = preg_replace($pattern, '$1' . esc_attr($sanitized_alt) . '$3', $content);
+                $updated = true;
+            }
+            // alt=…src=…
+            $pattern2 = '/(<img[^>]*alt=["\'])([^"\']*)(["\']+[^>]*src=["\']' . $escaped_url . '["\'])/i';
+            if (preg_match($pattern2, $content)) {
+                $content = preg_replace($pattern2, '$1' . esc_attr($sanitized_alt) . '$3', $content);
+                $updated = true;
+            }
+            // src=…alt="anything"…  (greedy alt replacement)
+            $pattern7 = '/(<img[^>]*src=["\']' . $escaped_url . '["\'][^>]*)alt=["\'][^"\']*["\']([^>]*>)/i';
+            if (preg_match($pattern7, $content)) {
+                $content = preg_replace($pattern7, '$1alt="' . esc_attr($sanitized_alt) . '"$2', $content);
+                $updated = true;
+            }
+        }
+
+        // Gutenberg / theme: match by wp-image-ID class
+        $pattern3 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*alt=["\'])([^"\']*)(["\']/i';
+        if (preg_match($pattern3, $content)) {
+            $content = preg_replace($pattern3, '$1' . esc_attr($sanitized_alt) . '$3', $content);
+            $updated = true;
+        }
+        $pattern4 = '/(<img[^>]*alt=["\'])([^"\']*)(["\']+[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'])/i';
+        if (preg_match($pattern4, $content)) {
+            $content = preg_replace($pattern4, '$1' . esc_attr($sanitized_alt) . '$3', $content);
+            $updated = true;
+        }
+        $pattern5 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*)alt=["\'][^"\']*["\']([^>]*>)/i';
+        if (preg_match($pattern5, $content)) {
+            $content = preg_replace($pattern5, '$1alt="' . esc_attr($sanitized_alt) . '"$2', $content);
+            $updated = true;
+        }
+        // Add missing alt attribute on classic-editor markup that lacks one
+        $pattern6 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*)(\/?>)/i';
+        if (preg_match($pattern6, $content) && !preg_match('/alt=["\']/', $content)) {
+            $content = preg_replace($pattern6, '$1 alt="' . esc_attr($sanitized_alt) . '" $2', $content);
+            $updated = true;
+        }
+
+        return $updated;
+    }
+
+    /**
+     * Walk an Elementor _elementor_data JSON blob and update the `alt` on
+     * any image widget whose attachment ID or URL matches.
+     * Returns the new JSON string when something changed, or null when no
+     * change was made (so the caller can skip the postmeta write).
+     */
+    private function rewrite_elementor_alt($raw_json, $attachment_id, $image_urls, $sanitized_alt)
+    {
+        if (empty($raw_json)) return null;
+
+        // Elementor stores escaped JSON; WordPress slashes it on save and
+        // get_post_meta returns the already-unslashed form. Decode straight.
+        $data = json_decode($raw_json, true);
+        if (!is_array($data)) return null;
+
+        $changed = false;
+        $url_set = array_flip($image_urls);
+
+        $walk = function (&$node) use (&$walk, $attachment_id, $url_set, $sanitized_alt, &$changed) {
+            if (!is_array($node)) return;
+
+            // Image-bearing settings shapes used by Elementor's core image
+            // widget and many third-party widgets. Image is typically at
+            // settings.image / settings.background_image / settings.bg_image.
+            if (isset($node['settings']) && is_array($node['settings'])) {
+                foreach (['image', 'background_image', 'bg_image'] as $key) {
+                    if (isset($node['settings'][$key]) && is_array($node['settings'][$key])) {
+                        $img = &$node['settings'][$key];
+                        $matches = (isset($img['id']) && intval($img['id']) === intval($attachment_id))
+                            || (isset($img['url']) && isset($url_set[$img['url']]));
+                        if ($matches) {
+                            if (!isset($img['alt']) || $img['alt'] !== $sanitized_alt) {
+                                $img['alt'] = $sanitized_alt;
+                                $changed = true;
+                            }
+                        }
+                        unset($img);
+                    }
+                }
+            }
+
+            // Recurse into Elementor's nested element trees.
+            if (isset($node['elements']) && is_array($node['elements'])) {
+                foreach ($node['elements'] as &$child) { $walk($child); }
+                unset($child);
+            }
+        };
+
+        foreach ($data as &$top) { $walk($top); }
+        unset($top);
+
+        if (!$changed) return null;
+
+        // Re-encode without escaping slashes to match Elementor's own format.
+        return wp_json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
     /**
