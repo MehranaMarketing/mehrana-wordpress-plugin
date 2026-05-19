@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.7
+ * Version: 5.7.8
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.7';
+    private $version = '5.7.8';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -66,6 +66,19 @@ class Mehrana_App_Plugin
         add_filter('woocommerce_structured_data_product_offer', [$this, 'filter_woocommerce_structured_data'], 10, 2);
         add_filter('woocommerce_structured_data_review', [$this, 'filter_woocommerce_structured_data'], 10, 2);
         add_filter('woocommerce_structured_data_breadcrumblist', [$this, 'filter_woocommerce_structured_data'], 10, 2);
+
+        // Force alt text on rendered images. Many themes (and image-optimization
+        // plugins like SPAI/ShortPixel Adaptive Images) build <img> markup that
+        // hard-codes alt="" or strips the alt during post-processing, so even
+        // when _wp_attachment_image_alt is correctly set in the media library
+        // the rendered page goes out with empty alt. Two hooks:
+        //   1. wp_get_attachment_image_attributes (priority 999) — fills alt
+        //      BEFORE WP builds the HTML, catches the standard render path.
+        //   2. post_thumbnail_html (priority 999) — regex fallback for the
+        //      featured-image render path after themes/plugins have done
+        //      their post-processing.
+        add_filter('wp_get_attachment_image_attributes', [$this, 'force_attachment_alt_from_meta'], 999, 3);
+        add_filter('post_thumbnail_html', [$this, 'force_post_thumbnail_alt_from_meta'], 999, 5);
 
         // Register hooks that need 'init'
         add_action('init', [$this, 'init_actions']);
@@ -2868,6 +2881,74 @@ class Mehrana_App_Plugin
             'featured_for' => $featured_for,
             'media_alt_updated' => true
         ]);
+    }
+
+    /**
+     * Fill empty `alt` attributes from _wp_attachment_image_alt when WP
+     * builds an <img> tag. Runs at priority 999 so it overrides any earlier
+     * filter (theme template explicitly passing alt="", lazy-load plugins,
+     * etc.) but respects an alt that some plugin meaningfully filled in.
+     *
+     * Intentionally non-destructive: only fills when the alt the caller
+     * supplied is empty AND the media library has an alt to use. Decorative
+     * images (genuinely empty library alt) are left alone.
+     */
+    public function force_attachment_alt_from_meta($attr, $attachment, $size = null)
+    {
+        if (!is_array($attr)) return $attr;
+
+        $current = isset($attr['alt']) ? trim((string) $attr['alt']) : '';
+        if ($current !== '') return $attr;
+
+        $attachment_id = is_object($attachment) && isset($attachment->ID) ? (int) $attachment->ID : 0;
+        if ($attachment_id <= 0) return $attr;
+
+        $library_alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
+        if (is_string($library_alt) && trim($library_alt) !== '') {
+            $attr['alt'] = $library_alt;
+        }
+        return $attr;
+    }
+
+    /**
+     * Regex fallback for the featured-image render path. Some image-
+     * optimization plugins (SPAI / ShortPixel Adaptive Images, EWWW,
+     * Optimole) buffer and rewrite the final <img> HTML *after* the
+     * attributes filter ran, dropping alt in the process. Patch the
+     * post-render HTML if it shipped with an empty alt and the library
+     * has a real one. Signature matches WordPress' post_thumbnail_html
+     * filter: (html, post_id, post_thumbnail_id, size, attr).
+     */
+    public function force_post_thumbnail_alt_from_meta($html, $post_id, $post_thumbnail_id, $size = null, $attr = null)
+    {
+        if (empty($html) || strpos($html, '<img') === false) return $html;
+        // Cheap check: nothing to fix if the HTML already carries a non-empty alt.
+        if (preg_match('/<img[^>]+alt=["\'](?!["\'])([^"\']+)["\']/i', $html)) return $html;
+
+        $thumbnail_id = (int) $post_thumbnail_id;
+        if ($thumbnail_id <= 0) return $html;
+
+        $library_alt = get_post_meta($thumbnail_id, '_wp_attachment_image_alt', true);
+        if (!is_string($library_alt) || trim($library_alt) === '') return $html;
+
+        $escaped = esc_attr($library_alt);
+
+        // Replace any existing empty alt attribute on an <img> tag…
+        $patched = preg_replace(
+            '/(<img[^>]*?)\salt=["\']\s*["\']/i',
+            '$1 alt="' . $escaped . '"',
+            $html,
+            1
+        );
+        if ($patched !== null && $patched !== $html) return $patched;
+
+        // …or add one if the tag had no alt attribute at all.
+        return preg_replace(
+            '/<img\b(?![^>]*\balt=)([^>]*?)(\/?>)/i',
+            '<img alt="' . $escaped . '"$1$2',
+            $html,
+            1
+        ) ?? $html;
     }
 
     /**
