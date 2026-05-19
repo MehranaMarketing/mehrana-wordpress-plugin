@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.7.8
+ * Version: 5.8.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.7.8';
+    private $version = '5.8.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -67,18 +67,48 @@ class Mehrana_App_Plugin
         add_filter('woocommerce_structured_data_review', [$this, 'filter_woocommerce_structured_data'], 10, 2);
         add_filter('woocommerce_structured_data_breadcrumblist', [$this, 'filter_woocommerce_structured_data'], 10, 2);
 
-        // Force alt text on rendered images. Many themes (and image-optimization
-        // plugins like SPAI/ShortPixel Adaptive Images) build <img> markup that
-        // hard-codes alt="" or strips the alt during post-processing, so even
-        // when _wp_attachment_image_alt is correctly set in the media library
-        // the rendered page goes out with empty alt. Two hooks:
-        //   1. wp_get_attachment_image_attributes (priority 999) — fills alt
-        //      BEFORE WP builds the HTML, catches the standard render path.
-        //   2. post_thumbnail_html (priority 999) — regex fallback for the
-        //      featured-image render path after themes/plugins have done
-        //      their post-processing.
+        // Force alt text on rendered images. Layered defense because the
+        // ecosystem of image-rewriter plugins is large and each operates at
+        // a different point in the request lifecycle:
+        //
+        // Layer 1 — WP-level attribute filters (cheap, catches most cases):
+        //   • wp_get_attachment_image_attributes — fills alt before WP
+        //     builds the <img>. Covers the_post_thumbnail, Gutenberg image
+        //     block, and any standard wp_get_attachment_image() caller.
+        //   • post_thumbnail_html — regex fallback for the featured-image
+        //     render path after themes have done their post-processing.
         add_filter('wp_get_attachment_image_attributes', [$this, 'force_attachment_alt_from_meta'], 999, 3);
         add_filter('post_thumbnail_html', [$this, 'force_post_thumbnail_alt_from_meta'], 999, 5);
+
+        // Layer 2 — outermost output buffer + named cache-plugin filters.
+        // Last-resort net for the plugins that rewrite the rendered HTML
+        // via their own output buffer and strip alt in the process —
+        // SPAI/ShortPixel Adaptive Images (data-spai-*), WP Smush /
+        // Hummingbird, EWWW LazyLoad, Optimole, Imagify, WP Rocket Lazy
+        // Load, LiteSpeed image opts, Jetpack Boost, Autoptimize image
+        // module, a3 Lazy Load, WebP Express, Perfmatters, NitroPack,
+        // WP Fastest Cache, WP Compress, Swift Performance, Robin Image
+        // Optimizer, BunnyCDN Optimizer, Flying Images, W3 Total Cache
+        // image module, and the lazy modules bundled into themes like
+        // Avada, Astra, OceanWP, etc.
+        //
+        // Strategy:
+        //   1. Register ob_start at `init` priority -PHP_INT_MAX so our
+        //      buffer is the OUTERMOST in the LIFO stack. PHP output
+        //      buffers flush from inner→outer, so our callback runs LAST
+        //      and receives the HTML AFTER every other plugin has done
+        //      its rewrite.
+        //   2. Hook the named "buffer finalize" filters for the major
+        //      page caches (WP Rocket, LiteSpeed, Autoptimize) too —
+        //      those caches write to disk inside their own callbacks and
+        //      can run BEFORE our outer ob flushes, so the cached file
+        //      would miss our fix if we relied on the buffer alone.
+        if (!defined('MEHRANA_DISABLE_ALT_ENFORCER') || !MEHRANA_DISABLE_ALT_ENFORCER) {
+            add_action('init', [$this, 'maybe_start_alt_enforcer_buffer'], -PHP_INT_MAX);
+            add_filter('rocket_buffer', [$this, 'enforce_library_alt_on_html'], PHP_INT_MAX);
+            add_filter('litespeed_buffer_finalize', [$this, 'enforce_library_alt_on_html'], PHP_INT_MAX);
+            add_filter('autoptimize_html_after_minify', [$this, 'enforce_library_alt_on_html'], PHP_INT_MAX);
+        }
 
         // Register hooks that need 'init'
         add_action('init', [$this, 'init_actions']);
@@ -2949,6 +2979,204 @@ class Mehrana_App_Plugin
             $html,
             1
         ) ?? $html;
+    }
+
+    /**
+     * Register the outermost output buffer. Called at `init` priority
+     * -PHP_INT_MAX so we beat every other plugin's buffer registration
+     * (most use `template_redirect`, a few use `init` at higher priority).
+     * PHP output buffers are LIFO — first started = outermost = last to
+     * flush — so our enforce_library_alt_on_html callback receives the
+     * fully rewritten HTML and gets the final word on alt text.
+     *
+     * Bails early on non-HTML request types so we don't burn cycles
+     * regex-scanning JSON / XML / binary responses.
+     */
+    public function maybe_start_alt_enforcer_buffer()
+    {
+        if (defined('DOING_AJAX') && DOING_AJAX) return;
+        if (defined('DOING_CRON') && DOING_CRON) return;
+        if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) return;
+        if (defined('WP_CLI') && WP_CLI) return;
+        if (defined('REST_REQUEST') && REST_REQUEST) return;
+        if (function_exists('wp_is_serving_rest_request') && wp_is_serving_rest_request()) return;
+        if (php_sapi_name() === 'cli') return;
+        if (is_admin()) return;
+
+        // Heuristic skip for sitemap / feed / known non-HTML URLs.
+        $req_uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+        if ($req_uri !== '') {
+            $lower = strtolower($req_uri);
+            if (strpos($lower, '/feed/') !== false ||
+                strpos($lower, '/wp-json/') !== false ||
+                substr($lower, -4) === '.xml' ||
+                substr($lower, -4) === '.txt' ||
+                substr($lower, -4) === '.css' ||
+                substr($lower, -3) === '.js') {
+                return;
+            }
+        }
+
+        ob_start([$this, 'enforce_library_alt_on_html']);
+    }
+
+    /**
+     * Buffer callback (also reused as a named-filter callback for
+     * Rocket / LiteSpeed / Autoptimize). Scans the final HTML for <img>
+     * tags whose alt is empty or missing, looks up the attachment's
+     * library alt, and injects it. Designed to be safe-by-default:
+     *
+     *   • Doesn't touch <img> with a non-empty alt already set.
+     *   • Doesn't touch images that can't be confidently mapped to an
+     *     attachment ID (no wp-image-{ID}, no /wp-content/uploads/ URL).
+     *   • Skips content inside <script>/<style>/<noscript> via masking
+     *     so JS-string literals like 'var html = "<img>"' aren't rewritten.
+     *   • Bails on non-HTML bodies (JSON, XML, etc.) cheaply.
+     */
+    public function enforce_library_alt_on_html($html)
+    {
+        if (!is_string($html) || $html === '') return $html;
+        if (strlen($html) < 64) return $html;
+        if (stripos($html, '<img') === false) return $html;
+        // Only operate on HTML documents.
+        if (!preg_match('/<(?:!doctype|html|body|head)\b/i', $html)) return $html;
+
+        // Mask script/style/noscript blocks so we don't rewrite <img>
+        // string literals inside JS or commented-out fallbacks.
+        $masked_blocks = [];
+        $masked = preg_replace_callback(
+            '/<(script|style|noscript)\b[^>]*>.*?<\/\1\s*>/is',
+            function ($m) use (&$masked_blocks) {
+                $token = "\x00MEH_ALT_MASK_" . count($masked_blocks) . "\x00";
+                $masked_blocks[$token] = $m[0];
+                return $token;
+            },
+            $html
+        );
+
+        // Per-request URL→ID cache so attachment_url_to_postid() isn't
+        // called repeatedly for the same image (DB hit each time).
+        $url_id_cache = [];
+
+        $masked = preg_replace_callback(
+            '/<img\b[^>]*?>/i',
+            function ($m) use (&$url_id_cache) {
+                return $this->force_alt_on_img_tag($m[0], $url_id_cache);
+            },
+            $masked
+        );
+
+        if (!empty($masked_blocks)) {
+            $masked = strtr($masked, $masked_blocks);
+        }
+
+        return $masked;
+    }
+
+    /**
+     * Per-tag rewriter. Returns the tag unchanged if (a) alt is already
+     * non-empty, or (b) we can't confidently resolve the attachment ID,
+     * or (c) the library has no alt to fill in. Otherwise replaces an
+     * empty alt or inserts a missing one.
+     */
+    private function force_alt_on_img_tag($tag, &$url_id_cache)
+    {
+        // Already has non-empty alt? Respect it — that's per-occurrence
+        // intent set by the editor or theme template.
+        if (preg_match('/\balt\s*=\s*"([^"]*)"/i', $tag, $m)) {
+            if (trim($m[1]) !== '') return $tag;
+            $has_alt_attr = true;
+            $quote = '"';
+        } elseif (preg_match("/\balt\s*=\s*'([^']*)'/i", $tag, $m)) {
+            if (trim($m[1]) !== '') return $tag;
+            $has_alt_attr = true;
+            $quote = "'";
+        } else {
+            $has_alt_attr = false;
+            $quote = '"';
+        }
+
+        $attachment_id = $this->resolve_attachment_id_from_img_tag($tag, $url_id_cache);
+        if (!$attachment_id) return $tag;
+
+        $library_alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
+        if (!is_string($library_alt) || trim($library_alt) === '') return $tag;
+
+        $escaped = esc_attr($library_alt);
+
+        if ($has_alt_attr) {
+            // Replace the empty alt="" / alt='' in place.
+            $pattern = $quote === '"'
+                ? '/\balt\s*=\s*"\s*"/i'
+                : "/\balt\s*=\s*'\s*'/i";
+            $replacement = 'alt=' . $quote . $escaped . $quote;
+            $new_tag = preg_replace($pattern, $replacement, $tag, 1, $count);
+            if ($count > 0 && $new_tag !== null) return $new_tag;
+            return $tag;
+        }
+
+        // No alt attribute at all — inject one before the closing > / />.
+        $new_tag = preg_replace(
+            '/(\s*\/?>)\s*$/',
+            ' alt="' . $escaped . '"$1',
+            $tag,
+            1,
+            $count
+        );
+        return ($count > 0 && $new_tag !== null) ? $new_tag : $tag;
+    }
+
+    /**
+     * Best-effort attachment ID resolution from a free-form <img> tag.
+     * Tries in order:
+     *   1. wp-image-{ID} class (added by WP for Gutenberg images).
+     *   2. data-attachment-id / data-image-id (some plugins emit this).
+     *   3. URL lookup via attachment_url_to_postid on src / data-* URLs,
+     *      with a parent-variant fallback (strip the -NNNxNNN size suffix).
+     * Results cached per-request to avoid redundant DB queries when the
+     * same image appears many times on one page (galleries, related posts).
+     */
+    private function resolve_attachment_id_from_img_tag($tag, &$url_id_cache)
+    {
+        if (preg_match('/\bwp-image-(\d+)\b/i', $tag, $m)) {
+            return (int) $m[1];
+        }
+        if (preg_match('/\bdata-attachment-id\s*=\s*["\']?(\d+)["\']?/i', $tag, $m)) {
+            return (int) $m[1];
+        }
+        if (preg_match('/\bdata-image-id\s*=\s*["\']?(\d+)["\']?/i', $tag, $m)) {
+            return (int) $m[1];
+        }
+
+        // URL lookup — try the attributes a rewriter is most likely to
+        // have left intact, in priority order.
+        $url_attrs = ['data-orig-file', 'data-large-file', 'data-medium-file', 'src', 'data-src', 'data-lazy-src', 'data-original'];
+        foreach ($url_attrs as $attr) {
+            $re = '/\b' . preg_quote($attr, '/') . '\s*=\s*["\']([^"\']+)["\']/i';
+            if (!preg_match($re, $tag, $m)) continue;
+            $url = $m[1];
+            if ($url === '' || strpos($url, 'data:') === 0) continue;
+            if (strpos($url, '/wp-content/uploads/') === false) continue;
+
+            if (array_key_exists($url, $url_id_cache)) {
+                if ($url_id_cache[$url] > 0) return $url_id_cache[$url];
+                continue;
+            }
+
+            $id = attachment_url_to_postid($url);
+            if (!$id) {
+                // Strip size suffix (-NNNxNNN) and retry against the parent.
+                $parent = preg_replace('/-\d+x\d+(\.[a-z0-9]+)$/i', '$1', $url);
+                if ($parent !== $url) {
+                    $id = attachment_url_to_postid($parent);
+                }
+            }
+
+            $url_id_cache[$url] = (int) $id;
+            if ($id) return (int) $id;
+        }
+
+        return 0;
     }
 
     /**
