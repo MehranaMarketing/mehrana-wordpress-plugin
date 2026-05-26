@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.8.0
+ * Version: 5.9.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.8.0';
+    private $version = '5.9.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -228,6 +228,17 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/pages/counts', [
             'methods' => 'GET',
             'callback' => [$this, 'get_page_counts'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Full per-page detail. Patrick's deploy engine lists pages with
+        // ?fields=lite (no content/meta) to map URL→ID, then calls this
+        // endpoint for the ONE page being deployed to pull its post_content
+        // / elementor_data / schema. Avoids serializing every post on the
+        // site just to mutate one heading.
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/full', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_page_full'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -3714,6 +3725,24 @@ class Mehrana_App_Plugin
      */
     public function get_pages($request)
     {
+        // Heavy /pages payloads (content + elementor_data + schema + featured
+        // image meta per row) blow PHP's execution limit on big WooCommerce
+        // sites — Patrick's deploy engine then sees a truncated response and
+        // crashes the JSON parse. ?fields=lite skips every per-post meta call
+        // below and returns only the URL/ID mapping Patrick needs to resolve
+        // a deploy target. Heavy data is fetched on-demand via /pages/{id}/full
+        // for the one page actually being deployed.
+        $lite_mode = $request->get_param('fields') === 'lite';
+
+        // Be generous with the time budget when callers ask for full data —
+        // big sites with hundreds of products take real wall-clock time even
+        // when memory isn't the bottleneck. @-prefixed so a hardened host
+        // (set_time_limit disabled in php.ini) doesn't throw a warning.
+        if (!$lite_mode) {
+            @set_time_limit(180);
+            @ignore_user_abort(true);
+        }
+
         // Get all public post types
         $post_types = get_post_types(['public' => true], 'names');
 
@@ -3745,8 +3774,45 @@ class Mehrana_App_Plugin
             'post_status' => 'publish',
         ];
 
+        // In lite mode we don't need the post body or meta — restrict the
+        // SELECT to ID/title/url/post_type fields so WP_Query skips the
+        // 'post_content' column and the auto-load of every post's metadata.
+        if ($lite_mode) {
+            $args['fields'] = 'ids';
+            $args['no_found_rows'] = true;
+            $args['update_post_meta_cache'] = false;
+            $args['update_post_term_cache'] = false;
+        }
+
         $pages = get_posts($args);
         $result = [];
+
+        if ($lite_mode) {
+            // Lite mode: id/slug/title/url/post_type only — no get_post_meta,
+            // no thumbnail resolution, no SEO meta fallback chain, no schema
+            // decode. This is the path Patrick uses to map URLs → IDs.
+            foreach ($pages as $page_id) {
+                $p = get_post($page_id);
+                if (!$p) continue;
+                $type = 'page';
+                if ($p->post_type === 'post') $type = 'blog';
+                elseif ($p->post_type !== 'page') $type = $p->post_type;
+                $result[] = [
+                    'id' => $p->ID,
+                    'slug' => $p->post_name,
+                    'title' => $p->post_title,
+                    'url' => get_permalink($p->ID),
+                    'type' => $type,
+                    'post_type' => $p->post_type,
+                ];
+            }
+            return rest_ensure_response([
+                'pages' => $result,
+                'lite' => true,
+                'debug' => ['total_found' => count($result)],
+            ]);
+        }
+
         $debug_types = array_count_values(array_map(function ($p) {
             return $p->post_type;
         }, $pages));
@@ -3872,6 +3938,108 @@ class Mehrana_App_Plugin
                 'types_found' => $debug_types,
                 'query_args' => $args
             ]
+        ]);
+    }
+
+    /**
+     * Full payload for a single page. Mirrors the per-row shape that
+     * /pages returns in heavy mode (content, elementor_data, SEO meta,
+     * schema, featured image) so callers can drop this into the same
+     * code paths that previously consumed /pages output.
+     *
+     * Patrick uses this after resolving URL→ID via /pages?fields=lite,
+     * to enrich the one page it's about to deploy without paying the
+     * cost of serializing the entire site.
+     */
+    public function get_page_full($request)
+    {
+        $page_id = (int) $request->get_param('id');
+        if ($page_id <= 0) {
+            return new WP_Error('invalid_id', 'Invalid page id', ['status' => 400]);
+        }
+
+        $page = get_post($page_id);
+        if (!$page || $page->post_status !== 'publish') {
+            return new WP_Error('not_found', 'Page not found or not published', ['status' => 404]);
+        }
+
+        // Same exclusion list /pages uses — refuse to return data for
+        // post types we never expose in listings.
+        $exclude = ['attachment', 'elementor_library', 'elementor_font', 'elementor_icons', 'guest-author'];
+        if (in_array($page->post_type, $exclude, true)) {
+            return new WP_Error('forbidden_type', 'Post type not exposed', ['status' => 403]);
+        }
+
+        $elementor_data = get_post_meta($page->ID, '_elementor_data', true);
+
+        $type = 'page';
+        if ($page->post_type === 'post') {
+            $type = 'blog';
+        } elseif ($page->post_type !== 'page') {
+            $type = $page->post_type;
+        }
+
+        $redirect_info = $this->check_redirect($page->ID);
+
+        $schema_raw = get_post_meta($page->ID, '_mehrana_schema_markup', true);
+        $schema_markup = null;
+        $schema_types = [];
+        if (!empty($schema_raw)) {
+            $decoded = json_decode($schema_raw, true);
+            if (is_array($decoded)) {
+                $schema_markup = $decoded;
+                foreach ($decoded as $entry) {
+                    if (is_array($entry) && isset($entry['@type'])) {
+                        if (is_array($entry['@type'])) {
+                            $schema_types = array_merge($schema_types, $entry['@type']);
+                        } else {
+                            $schema_types[] = $entry['@type'];
+                        }
+                    }
+                }
+                $schema_types = array_values(array_unique($schema_types));
+            }
+        }
+
+        $seo = $this->get_post_seo_meta($page->ID);
+
+        $featured_id = get_post_thumbnail_id($page->ID) ?: null;
+        $featured_url = $featured_id ? wp_get_attachment_image_url($featured_id, 'full') : null;
+        $featured_alt = $featured_id
+            ? (string) get_post_meta($featured_id, '_wp_attachment_image_alt_text', true)
+            : '';
+        $featured_filename = null;
+        if ($featured_id) {
+            $path = get_attached_file($featured_id);
+            if ($path) $featured_filename = basename($path);
+        }
+
+        return rest_ensure_response([
+            'page' => [
+                'id' => $page->ID,
+                'slug' => $page->post_name,
+                'title' => $page->post_title,
+                'url' => get_permalink($page->ID),
+                'type' => $type,
+                'post_type' => $page->post_type,
+                'featured_media_url' => $featured_url,
+                'featured_media_alt' => $featured_alt,
+                'featured_media_filename' => $featured_filename,
+                'meta_title' => $seo['title'],
+                'meta_description' => $seo['description'],
+                'canonical' => $seo['canonical'],
+                'seo_source' => $seo['source'],
+                'date' => mysql_to_rfc3339($page->post_date_gmt),
+                'modified' => mysql_to_rfc3339($page->post_modified_gmt),
+                'post_author_id' => intval($page->post_author),
+                'has_elementor' => !empty($elementor_data),
+                'has_redirect' => $redirect_info['has_redirect'],
+                'redirect_url' => $redirect_info['redirect_url'],
+                'elementor_data' => $elementor_data,
+                'post_content' => $page->post_content,
+                'schema_markup' => $schema_markup,
+                'schema_types' => $schema_types,
+            ],
         ]);
     }
 
