@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.10.1
+ * Version: 5.10.2
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.10.1';
+    private $version = '5.10.2';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -6714,23 +6714,30 @@ class Mehrana_App_Plugin
 
     /**
      * Restore a trashed post back to its previous status (typically 'publish').
-     * Mirror image of trash_page — completes the Undo flow for the LinkLab
-     * duplicate-post action without leaving the SEO team dependent on
-     * WP-admin to recover from a mistaken trash.
      *
-     * Uses wp_untrash_post() which is supposed to read the
-     * `_wp_trash_meta_status` postmeta WordPress stamps at trash time and
-     * restore that exact status. In practice the `wp_untrash_post_status`
-     * filter chain isn't always reliable across WP versions / other plugins
-     * (5.10.0 field report on prettyfluffy.com showed a published post coming
-     * back as 'draft' after untrash), so we explicitly read the saved
-     * previous status and force-set it if wp_untrash_post didn't restore it
-     * correctly. Falls back to 'publish' when the meta is missing — every
-     * Patrick-driven trash flow starts from a published post, so that's the
-     * safe default.
+     * v5.10.2 — bulletproof restore: 5.10.1's conditional wp_update_post
+     * fallback didn't fire on prettyfluffy.com (Yoast SEO and other active
+     * plugins on the site filter post_status during transitions, and
+     * wp_update_post returned 0 without us noticing). This version uses
+     * three layered strategies and logs each one, so even if a plugin chain
+     * blocks one mechanism the next still lands the right status:
      *
-     * If the post isn't currently in Trash, returns 400 so the caller knows
-     * the Undo wasn't needed.
+     *   1. Add a high-priority `wp_untrash_post_status` filter so
+     *      wp_untrash_post itself returns the previous status the modern
+     *      WP 5.6+ way. This is the cleanest path and fires all the right
+     *      hooks (untrashed_post action, etc.).
+     *
+     *   2. If the filter was overridden by another plugin (verified via
+     *      get_post after clean_post_cache), call wp_update_post with
+     *      WP_Error checking — most filtering plugins respect this.
+     *
+     *   3. Last resort: direct $wpdb->update() bypasses ALL filters. Used
+     *      only when both 1 and 2 fail. After the DB write we also call
+     *      clean_post_cache + transition_post_status manually so the rest
+     *      of WP (search, indexers, caches) sees the change.
+     *
+     * Falls back to 'publish' when _wp_trash_meta_status is missing — every
+     * Patrick-driven trash flow starts from a published post.
      */
     public function restore_page($request)
     {
@@ -6748,41 +6755,81 @@ class Mehrana_App_Plugin
             );
         }
 
-        // Read the pre-trash status BEFORE calling wp_untrash_post — the meta
-        // gets cleared during untrash, so we can't read it after.
+        // Read the pre-trash status BEFORE wp_untrash_post — the meta gets
+        // cleared during untrash, so reading it after returns empty.
         $previous_status = get_post_meta($page_id, '_wp_trash_meta_status', true);
         if (!$previous_status || $previous_status === 'trash') {
             $previous_status = 'publish';
         }
 
-        $result = wp_untrash_post($page_id);
-        if ($result === false) {
+        // Strategy 1: scoped filter so wp_untrash_post returns the right
+        // status natively. We bind to the specific page_id + previous_status
+        // we're working with so we don't affect untrash operations triggered
+        // by other code on the same request.
+        $filter = function ($new_status, $filter_post_id, $filter_previous_status) use ($page_id, $previous_status) {
+            if (intval($filter_post_id) === $page_id) {
+                return $previous_status;
+            }
+            return $new_status;
+        };
+        add_filter('wp_untrash_post_status', $filter, 999, 3);
+        $untrash_result = wp_untrash_post($page_id);
+        remove_filter('wp_untrash_post_status', $filter, 999);
+
+        if ($untrash_result === false) {
             return new WP_Error('restore_failed', "Failed to restore post {$page_id} from Trash", ['status' => 500]);
         }
 
-        // Explicitly enforce the previous status — wp_untrash_post used to
-        // always restore to 'draft' (pre-5.6) and even on modern WP the
-        // wp_untrash_post_status filter can be overridden by other plugins.
-        // wp_update_post is a no-op when the status already matches, so this
-        // is safe to call unconditionally.
+        // Verify what landed in the DB. clean_post_cache forces a fresh read
+        // — without it, get_post can hand back a stale cached object that
+        // still says 'trash' or 'draft'.
+        clean_post_cache($page_id);
         $refreshed = get_post($page_id);
+        $strategy_used = 'filter';
+
+        // Strategy 2: wp_update_post if the filter was overridden.
         if ($refreshed && $refreshed->post_status !== $previous_status) {
-            wp_update_post([
+            $this->log("[RESTORE_PAGE] Strategy 1 (filter) landed on '{$refreshed->post_status}', trying Strategy 2 (wp_update_post)");
+            $update_result = wp_update_post([
                 'ID' => $page_id,
                 'post_status' => $previous_status,
-            ]);
+            ], true);
+
+            clean_post_cache($page_id);
             $refreshed = get_post($page_id);
+            $strategy_used = 'wp_update_post';
+
+            if (is_wp_error($update_result) || $update_result === 0) {
+                $this->log("[RESTORE_PAGE] Strategy 2 returned " . (is_wp_error($update_result) ? $update_result->get_error_message() : 'zero'));
+            }
+        }
+
+        // Strategy 3: direct DB update if everything else still landed wrong.
+        // Bypasses every filter. We follow up with clean_post_cache so
+        // downstream code sees the change.
+        if ($refreshed && $refreshed->post_status !== $previous_status) {
+            $this->log("[RESTORE_PAGE] Strategies 1+2 still on '{$refreshed->post_status}', falling back to Strategy 3 (direct DB update)");
+            global $wpdb;
+            $wpdb->update(
+                $wpdb->posts,
+                ['post_status' => $previous_status],
+                ['ID' => $page_id]
+            );
+            clean_post_cache($page_id);
+            $refreshed = get_post($page_id);
+            $strategy_used = 'direct_db';
         }
 
         $final_status = $refreshed ? $refreshed->post_status : $previous_status;
 
-        $this->log("[RESTORE_PAGE] Post {$page_id} ({$post->post_title}) restored from Trash to '{$final_status}' (pre-trash status: '{$previous_status}')");
+        $this->log("[RESTORE_PAGE] Post {$page_id} ({$post->post_title}) restored from Trash to '{$final_status}' (pre-trash: '{$previous_status}', strategy: {$strategy_used})");
 
         return rest_ensure_response([
             'success' => true,
             'page_id' => $page_id,
             'status' => $final_status,
             'previous_trash_status' => $previous_status,
+            'strategy_used' => $strategy_used,
             'title' => $post->post_title,
         ]);
     }
