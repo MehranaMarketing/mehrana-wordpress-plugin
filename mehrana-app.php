@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.10.0
+ * Version: 5.10.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.10.0';
+    private $version = '5.10.1';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -6718,10 +6718,19 @@ class Mehrana_App_Plugin
      * duplicate-post action without leaving the SEO team dependent on
      * WP-admin to recover from a mistaken trash.
      *
-     * Uses wp_untrash_post() which reads the `_wp_trash_meta_status` postmeta
-     * WordPress stamps at trash time and restores that exact status. If the
-     * post isn't currently in Trash, returns 400 so the caller knows the
-     * Undo wasn't needed.
+     * Uses wp_untrash_post() which is supposed to read the
+     * `_wp_trash_meta_status` postmeta WordPress stamps at trash time and
+     * restore that exact status. In practice the `wp_untrash_post_status`
+     * filter chain isn't always reliable across WP versions / other plugins
+     * (5.10.0 field report on prettyfluffy.com showed a published post coming
+     * back as 'draft' after untrash), so we explicitly read the saved
+     * previous status and force-set it if wp_untrash_post didn't restore it
+     * correctly. Falls back to 'publish' when the meta is missing — every
+     * Patrick-driven trash flow starts from a published post, so that's the
+     * safe default.
+     *
+     * If the post isn't currently in Trash, returns 400 so the caller knows
+     * the Undo wasn't needed.
      */
     public function restore_page($request)
     {
@@ -6739,20 +6748,41 @@ class Mehrana_App_Plugin
             );
         }
 
+        // Read the pre-trash status BEFORE calling wp_untrash_post — the meta
+        // gets cleared during untrash, so we can't read it after.
+        $previous_status = get_post_meta($page_id, '_wp_trash_meta_status', true);
+        if (!$previous_status || $previous_status === 'trash') {
+            $previous_status = 'publish';
+        }
+
         $result = wp_untrash_post($page_id);
         if ($result === false) {
             return new WP_Error('restore_failed', "Failed to restore post {$page_id} from Trash", ['status' => 500]);
         }
 
+        // Explicitly enforce the previous status — wp_untrash_post used to
+        // always restore to 'draft' (pre-5.6) and even on modern WP the
+        // wp_untrash_post_status filter can be overridden by other plugins.
+        // wp_update_post is a no-op when the status already matches, so this
+        // is safe to call unconditionally.
         $refreshed = get_post($page_id);
-        $new_status = $refreshed ? $refreshed->post_status : 'draft';
+        if ($refreshed && $refreshed->post_status !== $previous_status) {
+            wp_update_post([
+                'ID' => $page_id,
+                'post_status' => $previous_status,
+            ]);
+            $refreshed = get_post($page_id);
+        }
 
-        $this->log("[RESTORE_PAGE] Post {$page_id} ({$post->post_title}) restored from Trash (now: {$new_status})");
+        $final_status = $refreshed ? $refreshed->post_status : $previous_status;
+
+        $this->log("[RESTORE_PAGE] Post {$page_id} ({$post->post_title}) restored from Trash to '{$final_status}' (pre-trash status: '{$previous_status}')");
 
         return rest_ensure_response([
             'success' => true,
             'page_id' => $page_id,
-            'status' => $new_status,
+            'status' => $final_status,
+            'previous_trash_status' => $previous_status,
             'title' => $post->post_title,
         ]);
     }
