@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.9.0
+ * Version: 5.10.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.9.0';
+    private $version = '5.10.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -419,6 +419,42 @@ class Mehrana_App_Plugin
                 'new_slug' => [
                     'required' => true,
                     'sanitize_callback' => 'sanitize_title'
+                ]
+            ]
+        ]);
+
+        // Move a published post/page to Trash. Used by Patrick LinkLab's
+        // duplicate-post resolver — a published post still living at a 3xx URL
+        // can be trashed in one call here, keeping its Redirection plugin rule
+        // active. Reversible via /pages/{id}/restore for 30 days (WP default).
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/trash', [
+            'methods' => 'POST',
+            'callback' => [$this, 'trash_page'],
+            'permission_callback' => [$this, 'check_permission'],
+            'args' => [
+                'id' => [
+                    'required' => true,
+                    'validate_callback' => function ($param) {
+                        return is_numeric($param);
+                    }
+                ]
+            ]
+        ]);
+
+        // Restore a trashed post/page back to its previous status (typically
+        // 'publish'). Mirror of /pages/{id}/trash — completes the Undo flow
+        // for the LinkLab duplicate-post action without leaving the SEO team
+        // dependent on WP-admin to recover from a mistaken trash.
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/restore', [
+            'methods' => 'POST',
+            'callback' => [$this, 'restore_page'],
+            'permission_callback' => [$this, 'check_permission'],
+            'args' => [
+                'id' => [
+                    'required' => true,
+                    'validate_callback' => function ($param) {
+                        return is_numeric($param);
+                    }
                 ]
             ]
         ]);
@@ -6627,6 +6663,97 @@ class Mehrana_App_Plugin
             'status' => $updated_post->post_status,
             'slug' => $updated_post->post_name,
             'parent_id' => $updated_post->post_parent
+        ]);
+    }
+
+    /**
+     * Move a published/draft post or page to Trash. Used by Patrick LinkLab's
+     * duplicate-post resolver: when a post still lives at a 3xx URL that the
+     * Redirection plugin redirects away from, trashing it stops the archive
+     * from listing it. The Redirection rule keeps serving the 3xx so SEO and
+     * inbound links survive.
+     *
+     * Uses wp_trash_post() which honors WP's standard Trash behavior:
+     *   • Post moves to status='trash'
+     *   • Restorable via wp_untrash_post (see restore_page below)
+     *   • Auto-empties from Trash after EMPTY_TRASH_DAYS (default 30)
+     *
+     * Idempotent: if the post is already in Trash, returns success without
+     * re-trashing (wp_trash_post is a no-op in that case).
+     */
+    public function trash_page($request)
+    {
+        $page_id = intval($request['id']);
+        $post = get_post($page_id);
+        if (!$post) {
+            return new WP_Error('post_not_found', "Post {$page_id} not found", ['status' => 404]);
+        }
+
+        $previous_status = $post->post_status;
+
+        // wp_trash_post returns the trashed post object on success, false on
+        // failure. It's a no-op when the post is already trashed — in that
+        // case the post itself is returned unchanged but post_status='trash'
+        // so we treat it as success.
+        $result = wp_trash_post($page_id);
+        if ($result === false) {
+            return new WP_Error('trash_failed', "Failed to trash post {$page_id}", ['status' => 500]);
+        }
+
+        $this->log("[TRASH_PAGE] Post {$page_id} ({$post->post_title}) moved to Trash (was: {$previous_status})");
+
+        $refreshed = get_post($page_id);
+        return rest_ensure_response([
+            'success' => true,
+            'page_id' => $page_id,
+            'previous_status' => $previous_status,
+            'status' => $refreshed ? $refreshed->post_status : 'trash',
+            'title' => $post->post_title,
+        ]);
+    }
+
+    /**
+     * Restore a trashed post back to its previous status (typically 'publish').
+     * Mirror image of trash_page — completes the Undo flow for the LinkLab
+     * duplicate-post action without leaving the SEO team dependent on
+     * WP-admin to recover from a mistaken trash.
+     *
+     * Uses wp_untrash_post() which reads the `_wp_trash_meta_status` postmeta
+     * WordPress stamps at trash time and restores that exact status. If the
+     * post isn't currently in Trash, returns 400 so the caller knows the
+     * Undo wasn't needed.
+     */
+    public function restore_page($request)
+    {
+        $page_id = intval($request['id']);
+        $post = get_post($page_id);
+        if (!$post) {
+            return new WP_Error('post_not_found', "Post {$page_id} not found", ['status' => 404]);
+        }
+
+        if ($post->post_status !== 'trash') {
+            return new WP_Error(
+                'not_trashed',
+                "Post {$page_id} is not in Trash (current status: {$post->post_status})",
+                ['status' => 400]
+            );
+        }
+
+        $result = wp_untrash_post($page_id);
+        if ($result === false) {
+            return new WP_Error('restore_failed', "Failed to restore post {$page_id} from Trash", ['status' => 500]);
+        }
+
+        $refreshed = get_post($page_id);
+        $new_status = $refreshed ? $refreshed->post_status : 'draft';
+
+        $this->log("[RESTORE_PAGE] Post {$page_id} ({$post->post_title}) restored from Trash (now: {$new_status})");
+
+        return rest_ensure_response([
+            'success' => true,
+            'page_id' => $page_id,
+            'status' => $new_status,
+            'title' => $post->post_title,
         ]);
     }
 
