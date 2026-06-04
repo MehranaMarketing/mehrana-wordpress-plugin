@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.10.2
+ * Version: 5.10.3
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.10.2';
+    private $version = '5.10.3';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -7511,6 +7511,19 @@ class Mehrana_App_Plugin
      * builder widgets that wrap our shortcode. The script is small and
      * self-defends against double-registration; site-wide is the simple
      * correct call.
+     *
+     * v5.10.3 — version bump only; the actual fix ships in mehrana-cta.js
+     * on the CRM (Patrick) at /api/public/custom-elements/mehrana-cta.js.
+     * The CRM serves that file with `no-store`, so deploying Patrick rolls
+     * the fix out to every site on the next page load — independent of
+     * this plugin's update. The bump here exists so a) sites can confirm
+     * via "Check for Updates Now" that they're on the version paired with
+     * the fix, and b) the `?ver=` cache-buster on the script URL changes.
+     * Fix: race condition in <mehrana-cta>'s render() — when a host slider
+     * (Elementor nested carousel on Morsun) re-mounts the slide during
+     * init, connectedCallback fired twice, both async config fetches
+     * resolved, and both appended a form to the shadow root. Added a
+     * renderId guard so only the latest render commits.
      */
     public function enqueue_lead_magnet_frontend()
     {
