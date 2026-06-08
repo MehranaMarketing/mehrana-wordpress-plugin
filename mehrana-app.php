@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.10.3
+ * Version: 5.11.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.10.3';
+    private $version = '5.11.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -119,6 +119,23 @@ class Mehrana_App_Plugin
         add_action('init', [$this, 'register_lead_magnet_block']);
         add_action('wp_enqueue_scripts', [$this, 'enqueue_lead_magnet_frontend']);
         add_action('enqueue_block_editor_assets', [$this, 'enqueue_lead_magnet_editor']);
+
+        // Keep the <mehrana-cta> custom-element script standalone — never let a
+        // JS optimizer combine, defer, or minify it away. When an optimizer
+        // (e.g. SiteGround Optimizer's "Combine JavaScript") merges our
+        // cross-origin script into a same-origin bundle, the element can no
+        // longer resolve its CRM origin from the script src and fetches its
+        // config from the host domain (404) — so the inline CTA silently
+        // disappears for logged-out (optimized) visitors while a logged-in
+        // admin, exempt from optimization, still sees it. SiteGround exposes
+        // these exclusion filters; the script_loader_tag markers cover
+        // Cloudflare Rocket Loader, Autoptimize, WP Rocket, WP Fastest Cache,
+        // Perfmatters and similar.
+        add_filter('sgo_javascript_combine_exclude', [$this, 'mehrana_cta_optimizer_exclude_handles']);
+        add_filter('sgo_js_async_exclude', [$this, 'mehrana_cta_optimizer_exclude_handles']);
+        add_filter('sgo_js_minify_exclude', [$this, 'mehrana_cta_optimizer_exclude_handles']);
+        add_filter('sgo_javascript_combine_excluded_external_paths', [$this, 'mehrana_cta_optimizer_exclude_paths']);
+        add_filter('script_loader_tag', [$this, 'mehrana_cta_script_loader_tag'], 10, 2);
 
         // Daily cron that prunes image backups older than 24h
         add_action('mehrana_prune_image_backups', [$this, 'prune_image_backups']);
@@ -7567,6 +7584,55 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * Exclude the <mehrana-cta> custom-element script handles from JS
+     * optimizers that expose handle-based exclusion lists (SiteGround
+     * Optimizer). Combining/deferring this cross-origin script breaks the
+     * element's origin resolution — see the enqueue note in __construct.
+     */
+    public function mehrana_cta_optimizer_exclude_handles($handles)
+    {
+        if (!is_array($handles)) {
+            $handles = [];
+        }
+        $handles[] = 'mehrana-cta-element';
+        $handles[] = 'mehrana-cta-element-editor';
+        return $handles;
+    }
+
+    /**
+     * Exclude the custom-element script by URL path for optimizers that match
+     * external scripts on their src (SiteGround Optimizer's external-paths
+     * combine exclusion).
+     */
+    public function mehrana_cta_optimizer_exclude_paths($paths)
+    {
+        if (!is_array($paths)) {
+            $paths = [];
+        }
+        $paths[] = '/api/public/custom-elements/mehrana-cta.js';
+        return $paths;
+    }
+
+    /**
+     * Tag the custom-element <script> with the opt-out attributes honored by
+     * the major non-SiteGround optimizers so it's never combined, minified,
+     * deferred, or Rocket-Loader-wrapped — any of which strips its origin.
+     */
+    public function mehrana_cta_script_loader_tag($tag, $handle)
+    {
+        if ($handle === 'mehrana-cta-element' || $handle === 'mehrana-cta-element-editor') {
+            if (strpos($tag, 'data-cfasync') === false) {
+                $tag = str_replace(
+                    '<script ',
+                    '<script data-cfasync="false" data-no-optimize="1" data-no-minify="1" data-no-defer="1" data-wpfc-render="false" ',
+                    $tag
+                );
+            }
+        }
+        return $tag;
+    }
+
+    /**
      * [mehrana_cta token="..."] — emits the same custom element tag as
      * the Gutenberg block. Drop-in for Elementor's Shortcode widget,
      * Slider Revolution's HTML/shortcode layer, classic editor, and any
@@ -7589,7 +7655,12 @@ class Mehrana_App_Plugin
         if (!preg_match('/^[A-Za-z0-9_\-]+$/', $token)) {
             return '';
         }
-        return '<mehrana-cta token="' . esc_attr($token) . '"></mehrana-cta>';
+        // Emit the resolved CRM origin as data-crm so the custom element
+        // never has to infer it from the script src. A JS optimizer that
+        // combines our script into a same-origin bundle would otherwise make
+        // the element resolve the wrong origin and 404 its config fetch — see
+        // the optimizer-exclusion filters in the constructor.
+        return '<mehrana-cta token="' . esc_attr($token) . '" data-crm="' . esc_attr($this->mehrana_crm_origin()) . '"></mehrana-cta>';
     }
 
     // =============================================

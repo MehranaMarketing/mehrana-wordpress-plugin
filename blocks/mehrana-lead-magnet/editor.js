@@ -205,7 +205,16 @@
         // No render_callback — the published page is fully self-contained.
         // The frontend custom-element script (enqueued plugin-side) handles
         // upgrade and rendering.
-        return el('mehrana-cta', { token: token })
+        var attrs = { token: token }
+        // Bake the CRM origin as data-crm so the element resolves its origin
+        // without relying on the script src — which a JS optimizer can rewrite
+        // by combining the script into a same-origin bundle (404s the config
+        // fetch, CTA disappears for logged-out visitors). settings.crmUrl is
+        // localized identically on every editor load, so the save stays
+        // deterministic for block validation.
+        var crm = (settings.crmUrl || '').replace(/\/+$/, '')
+        if (crm) attrs['data-crm'] = crm
+        return el('mehrana-cta', attrs)
     }
 
     wp.blocks.registerBlockType('mehrana/lead-magnet', {
