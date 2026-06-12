@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.11.0
+ * Version: 5.12.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.11.0';
+    private $version = '5.12.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -103,12 +103,14 @@ class Mehrana_App_Plugin
         //      those caches write to disk inside their own callbacks and
         //      can run BEFORE our outer ob flushes, so the cached file
         //      would miss our fix if we relied on the buffer alone.
-        if (!defined('MEHRANA_DISABLE_ALT_ENFORCER') || !MEHRANA_DISABLE_ALT_ENFORCER) {
-            add_action('init', [$this, 'maybe_start_alt_enforcer_buffer'], -PHP_INT_MAX);
-            add_filter('rocket_buffer', [$this, 'enforce_library_alt_on_html'], PHP_INT_MAX);
-            add_filter('litespeed_buffer_finalize', [$this, 'enforce_library_alt_on_html'], PHP_INT_MAX);
-            add_filter('autoptimize_html_after_minify', [$this, 'enforce_library_alt_on_html'], PHP_INT_MAX);
-        }
+        // The same final-HTML pipeline also applies heading overrides
+        // (render-time heading rewrites for theme-template headings), so it
+        // is registered unconditionally — the alt enforcer respects its own
+        // MEHRANA_DISABLE_ALT_ENFORCER toggle inside filter_final_html().
+        add_action('init', [$this, 'maybe_start_final_html_buffer'], -PHP_INT_MAX);
+        add_filter('rocket_buffer', [$this, 'filter_final_html'], PHP_INT_MAX);
+        add_filter('litespeed_buffer_finalize', [$this, 'filter_final_html'], PHP_INT_MAX);
+        add_filter('autoptimize_html_after_minify', [$this, 'filter_final_html'], PHP_INT_MAX);
 
         // Register hooks that need 'init'
         add_action('init', [$this, 'init_actions']);
@@ -651,6 +653,27 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/breadcrumb/override/(?P<id>\d+)', [
             'methods' => 'DELETE',
             'callback' => [$this, 'linklab_delete_breadcrumb_override'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Heading overrides — render-time heading rewrites for headings that
+        // come from theme templates (WooCommerce tabs, archive templates, …)
+        // and therefore can't be fixed by editing post_content.
+        register_rest_route($this->namespace, '/headings/override', [
+            'methods' => 'POST',
+            'callback' => [$this, 'add_heading_override'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        register_rest_route($this->namespace, '/headings/overrides', [
+            'methods' => 'GET',
+            'callback' => [$this, 'list_heading_overrides'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        register_rest_route($this->namespace, '/headings/override/(?P<id>[a-zA-Z0-9_-]+)', [
+            'methods' => 'DELETE',
+            'callback' => [$this, 'delete_heading_override'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -3056,7 +3079,7 @@ class Mehrana_App_Plugin
      * Bails early on non-HTML request types so we don't burn cycles
      * regex-scanning JSON / XML / binary responses.
      */
-    public function maybe_start_alt_enforcer_buffer()
+    public function maybe_start_final_html_buffer()
     {
         if (defined('DOING_AJAX') && DOING_AJAX) return;
         if (defined('DOING_CRON') && DOING_CRON) return;
@@ -3081,7 +3104,21 @@ class Mehrana_App_Plugin
             }
         }
 
-        ob_start([$this, 'enforce_library_alt_on_html']);
+        ob_start([$this, 'filter_final_html']);
+    }
+
+    /**
+     * Single entry point for all final-HTML rewrites (outermost ob callback
+     * + the Rocket / LiteSpeed / Autoptimize finalize filters). Runs the alt
+     * enforcer (unless disabled) and then heading overrides, so cache plugins
+     * persist both rewrites in their cached copies.
+     */
+    public function filter_final_html($html)
+    {
+        if (!defined('MEHRANA_DISABLE_ALT_ENFORCER') || !MEHRANA_DISABLE_ALT_ENFORCER) {
+            $html = $this->enforce_library_alt_on_html($html);
+        }
+        return $this->apply_heading_overrides_on_html($html);
     }
 
     /**
@@ -8194,6 +8231,257 @@ class Mehrana_App_Plugin
             update_option('mehrana_breadcrumb_overrides', $overrides);
         }
         return rest_ensure_response(['success' => true]);
+    }
+
+    // ── Heading overrides: render-time heading rewrites ─────────────────────
+    //
+    // Storage shape (option `mehrana_heading_overrides`, NOT autoloaded):
+    //   [ '/shop/ctint07' => [
+    //       [ 'id' => 'ho_…', 'match_tag' => 'h2'|null, 'match_text' => 'Description',
+    //         'occurrence' => 0,            // 1-based among matches; 0 = all
+    //         'new_tag' => 'h3'|null, 'new_text' => '…'|null, 'updated_at' => 1234567890 ],
+    //   ], … ]
+    // Keyed by URL path so the per-request lookup in the output buffer is O(1).
+
+    private function get_heading_overrides()
+    {
+        $rules = get_option('mehrana_heading_overrides', []);
+        return is_array($rules) ? $rules : [];
+    }
+
+    /**
+     * Normalize heading inner-HTML for matching: strip tags, decode entities,
+     * fold all whitespace, lowercase. Mirrors how patrick-crm normalizes the
+     * scanned heading text so both sides agree on equality.
+     */
+    private function normalize_heading_text($text)
+    {
+        $text = wp_strip_all_tags((string) $text);
+        $text = html_entity_decode($text, ENT_QUOTES, 'UTF-8');
+        $text = preg_replace('/[\x{00A0}\x{200B}\x{FEFF}\s]+/u', ' ', $text);
+        if ($text === null) return '';
+        if (function_exists('mb_strtolower')) {
+            return mb_strtolower(trim($text), 'UTF-8');
+        }
+        return strtolower(trim($text));
+    }
+
+    /** Reduce a full URL or request URI to a normalized path key. */
+    private function normalize_override_path($url)
+    {
+        $path = (string) $url;
+        if (preg_match('#^https?://#i', $path)) {
+            $parsed = wp_parse_url($path);
+            $path = isset($parsed['path']) ? $parsed['path'] : '/';
+        }
+        $qpos = strpos($path, '?');
+        if ($qpos !== false) $path = substr($path, 0, $qpos);
+        $path = untrailingslashit($path);
+        return $path === '' ? '/' : $path;
+    }
+
+    /**
+     * POST /headings/override — Add (or update) a render-time heading override.
+     * Body: url (full URL or path), match_text (required), match_tag (h1-h6, optional),
+     *       occurrence (int, 0 = all matches), new_tag (h1-h6|p, optional), new_text (optional).
+     * At least one of new_tag / new_text is required.
+     */
+    public function add_heading_override($request)
+    {
+        $body = $request->get_json_params();
+        $url        = isset($body['url']) ? (string) $body['url'] : '';
+        $match_text = isset($body['match_text']) ? trim((string) $body['match_text']) : '';
+        $match_tag  = isset($body['match_tag']) ? strtolower(trim((string) $body['match_tag'])) : '';
+        $occurrence = isset($body['occurrence']) ? max(0, intval($body['occurrence'])) : 0;
+        $new_tag    = isset($body['new_tag']) ? strtolower(trim((string) $body['new_tag'])) : '';
+        $new_text   = isset($body['new_text']) ? trim((string) $body['new_text']) : '';
+
+        if ($url === '' || $match_text === '') {
+            return new \WP_Error('missing_params', 'url and match_text are required', ['status' => 400]);
+        }
+        if ($new_tag === '' && $new_text === '') {
+            return new \WP_Error('missing_params', 'At least one of new_tag / new_text is required', ['status' => 400]);
+        }
+        if ($match_tag !== '' && !preg_match('/^h[1-6]$/', $match_tag)) {
+            return new \WP_Error('invalid_param', 'match_tag must be h1-h6', ['status' => 400]);
+        }
+        if ($new_tag !== '' && !preg_match('/^(h[1-6]|p)$/', $new_tag)) {
+            return new \WP_Error('invalid_param', 'new_tag must be h1-h6 or p', ['status' => 400]);
+        }
+
+        $path = $this->normalize_override_path($url);
+        $id = 'ho_' . substr(md5($path . '|' . $match_tag . '|' . $this->normalize_heading_text($match_text) . '|' . $occurrence), 0, 12);
+
+        $rule = [
+            'id'         => $id,
+            'match_tag'  => $match_tag !== '' ? $match_tag : null,
+            'match_text' => $match_text,
+            'occurrence' => $occurrence,
+            'new_tag'    => $new_tag !== '' ? $new_tag : null,
+            'new_text'   => $new_text !== '' ? $new_text : null,
+            'updated_at' => time(),
+        ];
+
+        $overrides = $this->get_heading_overrides();
+        if (!isset($overrides[$path]) || !is_array($overrides[$path])) {
+            $overrides[$path] = [];
+        }
+        // Upsert by id (id is deterministic over the match key)
+        $replaced = false;
+        foreach ($overrides[$path] as $i => $existing) {
+            if (isset($existing['id']) && $existing['id'] === $id) {
+                $overrides[$path][$i] = $rule;
+                $replaced = true;
+                break;
+            }
+        }
+        if (!$replaced) $overrides[$path][] = $rule;
+
+        update_option('mehrana_heading_overrides', $overrides, false);
+        $this->purge_heading_override_caches($path);
+        $this->log("[HEADING_OVERRIDE] Saved {$id} on {$path}: \"{$match_text}\" → tag=" . ($new_tag ?: '-') . " text=" . ($new_text !== '' ? '"' . substr($new_text, 0, 50) . '"' : '-'));
+
+        return rest_ensure_response(['success' => true, 'id' => $id, 'path' => $path]);
+    }
+
+    /** GET /headings/overrides — flat list of all overrides (optionally ?url= filter). */
+    public function list_heading_overrides($request)
+    {
+        $overrides = $this->get_heading_overrides();
+        $filter_path = null;
+        $url = $request->get_param('url');
+        if ($url) $filter_path = $this->normalize_override_path($url);
+
+        $result = [];
+        foreach ($overrides as $path => $rules) {
+            if ($filter_path !== null && $path !== $filter_path) continue;
+            if (!is_array($rules)) continue;
+            foreach ($rules as $rule) {
+                $rule['path'] = $path;
+                $result[] = $rule;
+            }
+        }
+        return rest_ensure_response(['overrides' => $result, 'total' => count($result)]);
+    }
+
+    /** DELETE /headings/override/{id} — remove one override and purge its page cache. */
+    public function delete_heading_override($request)
+    {
+        $id = (string) $request['id'];
+        $overrides = $this->get_heading_overrides();
+        $found_path = null;
+
+        foreach ($overrides as $path => $rules) {
+            if (!is_array($rules)) continue;
+            foreach ($rules as $i => $rule) {
+                if (isset($rule['id']) && $rule['id'] === $id) {
+                    array_splice($overrides[$path], $i, 1);
+                    if (empty($overrides[$path])) unset($overrides[$path]);
+                    $found_path = $path;
+                    break 2;
+                }
+            }
+        }
+
+        if ($found_path === null) {
+            return new \WP_Error('not_found', 'Override not found', ['status' => 404]);
+        }
+
+        update_option('mehrana_heading_overrides', $overrides, false);
+        $this->purge_heading_override_caches($found_path);
+        $this->log("[HEADING_OVERRIDE] Deleted {$id} on {$found_path}");
+
+        return rest_ensure_response(['success' => true]);
+    }
+
+    /**
+     * Apply heading overrides to the final HTML (runs inside filter_final_html).
+     * Cheap bails first; script/style/noscript blocks are masked so heading-like
+     * strings inside JS template literals are never rewritten.
+     */
+    public function apply_heading_overrides_on_html($html)
+    {
+        if (!is_string($html) || $html === '' || stripos($html, '<h') === false) return $html;
+        if (!preg_match('/<(?:!doctype|html|body|head)\b/i', $html)) return $html;
+
+        $req_uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+        if ($req_uri === '') return $html;
+        $path = $this->normalize_override_path($req_uri);
+
+        $all = $this->get_heading_overrides();
+        if (empty($all[$path]) || !is_array($all[$path])) return $html;
+        $rules = $all[$path];
+
+        // Mask script/style/noscript so we only rewrite real markup
+        $masked_blocks = [];
+        $masked = preg_replace_callback(
+            '/<(script|style|noscript)\b[^>]*>.*?<\/\1\s*>/is',
+            function ($m) use (&$masked_blocks) {
+                $token = "\x00MEH_HO_MASK_" . count($masked_blocks) . "\x00";
+                $masked_blocks[$token] = $m[0];
+                return $token;
+            },
+            $html
+        );
+        if ($masked === null) return $html; // PCRE failure — leave page untouched
+
+        foreach ($rules as $rule) {
+            if (empty($rule['match_text'])) continue;
+            $want_text  = $this->normalize_heading_text($rule['match_text']);
+            $want_tag   = !empty($rule['match_tag']) ? strtolower($rule['match_tag']) : null;
+            $occurrence = isset($rule['occurrence']) ? (int) $rule['occurrence'] : 0;
+            $new_tag    = !empty($rule['new_tag']) ? strtolower($rule['new_tag']) : null;
+            $new_text   = (isset($rule['new_text']) && $rule['new_text'] !== '') ? (string) $rule['new_text'] : null;
+            if ($new_tag === null && $new_text === null) continue;
+
+            $seen = 0;
+            $self = $this;
+            $result = preg_replace_callback(
+                '/<h([1-6])\b([^>]*)>(.*?)<\/h\1\s*>/is',
+                function ($m) use (&$seen, $self, $want_text, $want_tag, $occurrence, $new_tag, $new_text) {
+                    $tag = 'h' . $m[1];
+                    if ($want_tag !== null && $tag !== $want_tag) return $m[0];
+                    if ($self->normalize_heading_text($m[3]) !== $want_text) return $m[0];
+                    $seen++;
+                    if ($occurrence > 0 && $seen !== $occurrence) return $m[0];
+
+                    $out_tag = $new_tag !== null ? $new_tag : $tag;
+                    $inner   = $new_text !== null ? esc_html($new_text) : $m[3];
+                    return '<' . $out_tag . $m[2] . '>' . $inner . '</' . $out_tag . '>';
+                },
+                $masked
+            );
+            if ($result !== null) $masked = $result;
+        }
+
+        return strtr($masked, $masked_blocks);
+    }
+
+    /**
+     * Best-effort, URL-scoped cache purge after an override changes, so the
+     * rewrite shows up without waiting for cache expiry. Falls through every
+     * known cache plugin; all calls are no-ops when the plugin isn't active.
+     */
+    private function purge_heading_override_caches($path)
+    {
+        $urls = array_unique([
+            home_url($path),
+            home_url(trailingslashit($path)),
+        ]);
+
+        foreach ($urls as $url) {
+            // LiteSpeed Cache (QuickFit) — purge single URL
+            do_action('litespeed_purge_url', $url);
+            // W3 Total Cache
+            if (function_exists('w3tc_flush_url')) w3tc_flush_url($url);
+            // WP Super Cache
+            if (function_exists('wpsc_delete_url_cache')) wpsc_delete_url_cache($url);
+        }
+
+        // WP Rocket purges by file list
+        if (function_exists('rocket_clean_files')) rocket_clean_files($urls);
+
+        $this->log("[HEADING_OVERRIDE] Purged caches for {$path}");
     }
 
     /**
