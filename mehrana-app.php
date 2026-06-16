@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.12.0
+ * Version: 5.13.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.12.0';
+    private $version = '5.13.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -721,6 +721,26 @@ class Mehrana_App_Plugin
         ]);
 
         // ========================================================
+        // Schema 2 — per-page override DELTAS (path-keyed)
+        // ========================================================
+        // The unified model: pageSchema(page) = compose(ruleBlocks +
+        // perPageOverrides − suppressedTypes), composed at wp_head. Patrick
+        // ships the FULL path-keyed override set; the plugin mirrors it into
+        // the _mehrana_schema_page_overrides option and composes per request.
+        // Unlike POST /pages/{id}/schema (a full hand-crafted replacement keyed
+        // by post id), this is a DELTA keyed by normalized URL path.
+        register_rest_route($this->namespace, '/schema/page-overrides', [
+            'methods' => 'PUT',
+            'callback' => [$this, 'replace_page_schema_overrides'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+        register_rest_route($this->namespace, '/schema/page-overrides', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_page_schema_overrides'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // ========================================================
         // Schema Rules (template-per-page-type)
         // ========================================================
         // One rule defines a JSON-LD template that auto-applies to every post
@@ -885,42 +905,290 @@ class Mehrana_App_Plugin
     }
 
     /**
-     * Resolve the schema blocks to emit for a given post.
+     * Resolve the schema blocks to emit for a given post — Schema 2 compose model.
      *
-     * Returns an array of JSON-LD objects. Empty array = nothing to emit.
+     *   pageSchema(page) = compose(ruleBlocks + perPageOverrides − suppressedTypes)
      *
-     * Order:
-     *   1. Per-page override (_mehrana_schema_markup) — hand-crafted, wins.
-     *   2. First matching rule from _mehrana_schema_rules (priority desc).
-     *   3. Empty.
+     * This mirrors the native (Sanity) engine in lib/native/schema-compose.ts
+     * byte-for-byte so WordPress and native produce identical JSON-LD from the
+     * same rules + overrides. Order:
+     *   0. Legacy per-page full override (_mehrana_schema_markup, POST
+     *      /pages/{id}/schema) — hand-crafted escape hatch, wins outright.
+     *   1. ruleBlocks = EVERY matching rule (priority desc), token-resolved.
+     *   2. delta = the path-keyed override for this URL (blocks + suppressedTypes).
+     *   3. compose: suppress by primary @type, override replaces/adds by identity
+     *      (@id+@type, else @type+name), drop structurally-empty, de-dupe last-wins.
      */
     private function resolve_schema_for_post($post_id)
     {
-        // 1. Per-page override
+        // 0. Legacy per-page full replacement (highest precedence escape hatch).
         $raw = get_post_meta($post_id, '_mehrana_schema_markup', true);
         if (!empty($raw)) {
             $decoded = json_decode($raw, true);
             if (is_array($decoded) && !empty($decoded)) return $decoded;
         }
 
-        // 2. Rule match
+        // 1. ruleBlocks — compose ALL matching rules (not just the first).
         $rules = $this->load_schema_rules();
-        if (empty($rules)) return [];
-
         usort($rules, function ($a, $b) {
             $pa = isset($a['priority']) ? intval($a['priority']) : 10;
             $pb = isset($b['priority']) ? intval($b['priority']) : 10;
             return $pb - $pa;
         });
-
+        $rule_blocks = [];
         foreach ($rules as $rule) {
             if (!isset($rule['match']) || !isset($rule['template'])) continue;
             if ($this->rule_matches_post($rule['match'], $post_id)) {
-                return $this->resolve_rule_template($rule['template'], $post_id);
+                $resolved = $this->resolve_rule_template($rule['template'], $post_id);
+                if (is_array($resolved)) {
+                    foreach ($resolved as $b) {
+                        if (is_array($b)) $rule_blocks[] = $b;
+                    }
+                }
             }
         }
 
-        return [];
+        // 2. Per-page override delta (path-keyed), token-resolved.
+        $delta = $this->load_page_override_for_post($post_id);
+        $override_blocks = [];
+        if (!empty($delta['override']) && is_array($delta['override'])) {
+            $resolved_ov = $this->resolve_rule_template($delta['override'], $post_id);
+            if (is_array($resolved_ov)) $override_blocks = $resolved_ov;
+        }
+        $suppressed = (!empty($delta['suppressedTypes']) && is_array($delta['suppressedTypes']))
+            ? $delta['suppressedTypes'] : [];
+
+        // 3. Compose. Empty in → empty out.
+        if (empty($rule_blocks) && empty($override_blocks)) return [];
+        return $this->compose_schema_blocks($rule_blocks, $override_blocks, $suppressed);
+    }
+
+    // ============================================================
+    // Schema 2 — compose engine (PHP twin of lib/native/schema-compose.ts)
+    // ============================================================
+
+    /** Primary @type: first element if @type is an array, else the string, else ''. */
+    private function schema_primary_type($block)
+    {
+        if (!is_array($block) || !isset($block['@type'])) return '';
+        $t = $block['@type'];
+        if (is_array($t)) return (isset($t[0]) && is_string($t[0])) ? $t[0] : '';
+        return is_string($t) ? $t : '';
+    }
+
+    /**
+     * Stable identity = @id PLUS primary @type (NOT @id alone) so several blocks
+     * that deliberately share one @id but differ in @type all survive. Falls
+     * back to @type + name when there's no @id.
+     */
+    private function schema_identity_key($block)
+    {
+        $type = $this->schema_primary_type($block);
+        $id = (is_array($block) && isset($block['@id']) && is_string($block['@id'])) ? $block['@id'] : '';
+        if ($id !== '') return 'id:' . $id . '::' . $type;
+        $name = (is_array($block) && isset($block['name']) && is_string($block['name'])) ? $block['name'] : '';
+        return 'type:' . $type . '::' . $name;
+    }
+
+    /**
+     * Does an override block REPLACE a rule block? Same identity → yes. An
+     * override WITH an @id only replaces the exact @id+@type match. An override
+     * WITHOUT an @id but with a primary @type replaces the rule block of that
+     * @type (so an editor can edit "the Organization block" without its @id).
+     */
+    private function schema_override_replaces($rule, $override)
+    {
+        if ($this->schema_identity_key($rule) === $this->schema_identity_key($override)) return true;
+        $ovId = (is_array($override) && isset($override['@id']) && is_string($override['@id'])) ? $override['@id'] : '';
+        if ($ovId !== '') return false;
+        $ot = $this->schema_primary_type($override);
+        return $ot !== '' && $ot === $this->schema_primary_type($rule);
+    }
+
+    /** True when a block is a structurally-empty version of its @type (drop it). */
+    private function schema_block_structurally_empty($block)
+    {
+        if (!is_array($block)) return false;
+        $type = $this->schema_primary_type($block);
+        if ($type === '') return false;
+        $has = function ($k) use ($block) {
+            return isset($block[$k]) && is_array($block[$k]) && count($block[$k]) > 0;
+        };
+        $name_or_id = (!empty($block['name'])) || (!empty($block['@id']));
+        switch ($type) {
+            case 'FAQPage':        return !$has('mainEntity');
+            case 'BreadcrumbList': return !$has('itemListElement');
+            case 'ItemList':       return !$has('itemListElement');
+            case 'HowTo':          return !$has('step');
+            case 'Recipe':         return !$has('recipeIngredient');
+            case 'Course':         return !$has('hasCourseInstance');
+            case 'Organization':
+            case 'LocalBusiness':
+            case 'LegalService':
+            case 'MedicalBusiness':
+            case 'Restaurant':
+            case 'ProfessionalService':
+            case 'FinancialService':
+            case 'RealEstateAgent':
+            case 'HomeAndConstructionBusiness':
+            case 'AutomotiveBusiness':
+            case 'LodgingBusiness':
+            case 'BeautySalon':
+            case 'Dentist':
+            case 'EducationalOrganization':
+            case 'Store':
+                return !$name_or_id;
+            case 'Person':  return empty($block['name']);
+            case 'WebSite': return empty($block['url']) && empty($block['@id']);
+            default:        return false;
+        }
+    }
+
+    /**
+     * Compose final blocks: (1) drop rule blocks whose primary @type is
+     * suppressed; (2) apply each override (replace same-identity rule block else
+     * append); (3) drop structurally-empty; (4) de-dupe by identity, last-wins.
+     */
+    private function compose_schema_blocks($rule_blocks, $override_blocks, $suppressed)
+    {
+        $sup_set = [];
+        if (is_array($suppressed)) {
+            foreach ($suppressed as $s) { if (is_string($s) && $s !== '') $sup_set[$s] = true; }
+        }
+
+        // 1 + 2 base: keep non-suppressed rule blocks, tagged as 'rule'.
+        $annotated = [];
+        if (is_array($rule_blocks)) {
+            foreach ($rule_blocks as $rb) {
+                if (!is_array($rb)) continue;
+                $pt = $this->schema_primary_type($rb);
+                if ($pt !== '' && isset($sup_set[$pt])) continue;
+                $annotated[] = ['block' => $rb, 'origin' => 'rule'];
+            }
+        }
+
+        // 2: overrides replace the same-identity rule block, else append.
+        if (is_array($override_blocks)) {
+            foreach ($override_blocks as $ov) {
+                if (!is_array($ov)) continue;
+                $idx = -1;
+                foreach ($annotated as $i => $a) {
+                    if ($a['origin'] === 'rule' && $this->schema_override_replaces($a['block'], $ov)) { $idx = $i; break; }
+                }
+                if ($idx >= 0) array_splice($annotated, $idx, 1);
+                $annotated[] = ['block' => $ov, 'origin' => 'override'];
+            }
+        }
+
+        // 3: drop structurally-empty blocks.
+        $non_empty = [];
+        foreach ($annotated as $a) {
+            if (!$this->schema_block_structurally_empty($a['block'])) $non_empty[] = $a;
+        }
+
+        // 4: de-dupe by identity, last-wins (scan from the back, then restore order).
+        $seen = [];
+        $keep_rev = [];
+        for ($i = count($non_empty) - 1; $i >= 0; $i--) {
+            $key = $this->schema_identity_key($non_empty[$i]['block']);
+            if (isset($seen[$key])) continue;
+            $seen[$key] = true;
+            $keep_rev[] = $non_empty[$i];
+        }
+        $final = array_reverse($keep_rev);
+        $out = [];
+        foreach ($final as $a) $out[] = $a['block'];
+        return $out;
+    }
+
+    // ============================================================
+    // Schema 2 — per-page override store (path-keyed)
+    // ============================================================
+
+    /**
+     * Normalize a URL/path to the canonical key used by Patrick's by-path store
+     * (lib/native/by-path-materializer.ts pathFromUrl): lowercase, single
+     * leading slash, collapse duplicate slashes, exactly one trailing slash
+     * (root stays "/"). MUST stay byte-identical to the Patrick twin or lookups
+     * silently miss.
+     */
+    private function normalize_schema_path($raw_url)
+    {
+        $p = is_string($raw_url) ? $raw_url : '';
+        $parsed = wp_parse_url($p);
+        if (is_array($parsed) && isset($parsed['path'])) $p = $parsed['path'];
+        $p = explode('#', $p)[0];
+        $p = explode('?', $p)[0];
+        $p = strtolower($p);
+        if ($p === '' || $p[0] !== '/') $p = '/' . $p;
+        $p = preg_replace('#/{2,}#', '/', $p);
+        if ($p !== '/' && substr($p, -1) !== '/') $p .= '/';
+        return $p;
+    }
+
+    /** Decode the path-keyed override option to a map, always an array. */
+    private function load_page_overrides_map()
+    {
+        $raw = get_option('_mehrana_schema_page_overrides', '');
+        if (empty($raw)) return [];
+        $decoded = is_array($raw) ? $raw : json_decode($raw, true);
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    /** The { override:[], suppressedTypes:[] } delta for a post's permalink path. */
+    private function load_page_override_for_post($post_id)
+    {
+        $empty = ['override' => [], 'suppressedTypes' => []];
+        $map = $this->load_page_overrides_map();
+        if (empty($map)) return $empty;
+        $permalink = get_permalink($post_id);
+        if (!$permalink) return $empty;
+        $path = $this->normalize_schema_path($permalink);
+        if (!isset($map[$path]) || !is_array($map[$path])) return $empty;
+        $entry = $map[$path];
+        return [
+            'override' => (isset($entry['blocks']) && is_array($entry['blocks'])) ? $entry['blocks'] : [],
+            'suppressedTypes' => (isset($entry['suppressedTypes']) && is_array($entry['suppressedTypes'])) ? $entry['suppressedTypes'] : [],
+        ];
+    }
+
+    /**
+     * PUT /schema/page-overrides
+     * Body: { overrides: [ { path, blocks: [...], suppressedTypes: [...] }, ... ] }
+     * Mirrors the FULL set (CRM is source of truth) into the path-keyed option.
+     */
+    public function replace_page_schema_overrides($request)
+    {
+        $body = $request->get_json_params();
+        $overrides = isset($body['overrides']) ? $body['overrides'] : null;
+        if (!is_array($overrides)) {
+            return new WP_Error('bad_request', 'Missing overrides array', ['status' => 400]);
+        }
+
+        $map = [];
+        foreach ($overrides as $entry) {
+            if (!is_array($entry)) continue;
+            $path = (isset($entry['path']) && is_string($entry['path'])) ? $this->normalize_schema_path($entry['path']) : '';
+            if ($path === '') continue;
+            $blocks = (isset($entry['blocks']) && is_array($entry['blocks']))
+                ? array_values(array_filter($entry['blocks'], 'is_array')) : [];
+            $sup = [];
+            if (isset($entry['suppressedTypes']) && is_array($entry['suppressedTypes'])) {
+                foreach ($entry['suppressedTypes'] as $s) { if (is_string($s) && $s !== '') $sup[] = $s; }
+            }
+            if (empty($blocks) && empty($sup)) continue; // skip no-op deltas
+            $map[$path] = ['blocks' => $blocks, 'suppressedTypes' => $sup];
+        }
+
+        update_option('_mehrana_schema_page_overrides', wp_json_encode($map), false);
+        $this->log('[PAGE_OVERRIDES] Stored ' . count($map) . ' path override(s)');
+        return rest_ensure_response(['success' => true, 'count' => count($map)]);
+    }
+
+    /** GET /schema/page-overrides — read back the path-keyed override map. */
+    public function get_page_schema_overrides($request)
+    {
+        return rest_ensure_response(['overrides' => $this->load_page_overrides_map()]);
     }
 
     // ============================================================
@@ -1525,6 +1793,13 @@ class Mehrana_App_Plugin
         $override = get_post_meta($post_id, '_mehrana_schema_markup', true);
         if (!empty($override)) return $cache[$post_id] = true;
 
+        // Schema 2 path-keyed override delta (blocks and/or suppressedTypes) also
+        // means Patrick owns this page — suppress Yoast/RankMath/Woo here too.
+        $delta = $this->load_page_override_for_post($post_id);
+        if (!empty($delta['override']) || !empty($delta['suppressedTypes'])) {
+            return $cache[$post_id] = true;
+        }
+
         // Otherwise check rules.
         $rules = $this->load_schema_rules();
         foreach ($rules as $rule) {
@@ -1609,10 +1884,17 @@ class Mehrana_App_Plugin
         $rules = $this->load_schema_rules();
         $active_rules = count($rules);
 
+        // Schema 2 path-keyed override deltas (distinct from the legacy post-meta
+        // overrides counted above). Presence of this key tells the CRM that this
+        // build supports the compose model.
+        $override_delta_count = count($this->load_page_overrides_map());
+
         return rest_ensure_response([
             'version'             => $this->version,
             'authority_supported' => true,
+            'compose_supported'   => true,
             'override_count'      => $override_count,
+            'override_delta_count' => $override_delta_count,
             'active_rules'        => $active_rules,
             'suppressed_plugins'  => [
                 'yoast'       => defined('WPSEO_VERSION') || class_exists('WPSEO_Options'),
