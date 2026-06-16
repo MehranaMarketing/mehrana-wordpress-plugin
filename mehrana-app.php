@@ -1580,6 +1580,11 @@ class Mehrana_App_Plugin
                 if (is_array($r) && empty($r)) continue;
                 $out[$k] = $r;
             }
+            // Drop an object that baked down to only @type/@context (e.g. a
+            // nameless author Person when the post has no author) — worthless
+            // schema. Return [] so the parent prunes the field.
+            $meaningful = array_diff(array_keys($out), ['@type', '@context']);
+            if (empty($meaningful)) return [];
             return $out;
         }
         return $value;
@@ -1640,12 +1645,77 @@ class Mehrana_App_Plugin
             return $this->get_post_token($token, $post_id);
         }
 
+        // live.* family — Schema 2 catalog vocabulary. Maps to the same post
+        // data the native (Sanity) materializer's buildLiveTokens emits, so a
+        // catalog rule/override resolves identically on WordPress + native.
+        if (strpos($token, 'live.') === 0) {
+            return $this->get_live_token(substr($token, 5), $post_id);
+        }
+
         // product.* family (WooCommerce)
         if (strpos($token, 'product.') === 0) {
             return $this->get_product_token($token, $post_id);
         }
 
         return null;
+    }
+
+    /**
+     * Resolve a {{live.*}} token (field = the part after "live.") to the same
+     * value buildLiveTokens produces on native. Object/array-valued fields
+     * (image, breadcrumb) return native types so substitute_tokens drops them
+     * into the parent as real objects. Absent values return '' so the parent
+     * drop-empty cascade prunes the field.
+     */
+    private function get_live_token($field, $post_id)
+    {
+        $post = get_post($post_id);
+        if (!$post) return '';
+
+        // author.* — resolve as a unit; if there's no real author, every field
+        // returns '' so the whole Person object drops (no nameless Person).
+        if (strpos($field, 'author.') === 0) {
+            $u = get_userdata($post->post_author);
+            if (!$u || empty($u->display_name)) return '';
+            switch ($field) {
+                case 'author.name':  return $u->display_name;
+                case 'author.url':   return get_author_posts_url($post->post_author);
+                case 'author.id':    return get_author_posts_url($post->post_author) . '#person';
+                case 'author.image': return get_avatar_url($post->post_author, ['size' => 256]) ?: '';
+                default:             return ''; // jobTitle / sameAs / hasCredential — no native WP field
+            }
+        }
+
+        switch ($field) {
+            case 'title': return html_entity_decode(get_the_title($post_id), ENT_QUOTES, 'UTF-8');
+            case 'url':   return get_permalink($post_id);
+            case 'slug':  return $post->post_name;
+            case 'path':  { $p = wp_parse_url(get_permalink($post_id), PHP_URL_PATH); return $p ?: '/'; }
+            case 'description': {
+                $ex = has_excerpt($post_id) ? get_the_excerpt($post_id) : wp_strip_all_tags($post->post_content);
+                $ex = trim(preg_replace('/\s+/', ' ', $ex));
+                return mb_substr($ex, 0, 300);
+            }
+            case 'image.url': return get_the_post_thumbnail_url($post_id, 'full') ?: '';
+            case 'image': {
+                $u = get_the_post_thumbnail_url($post_id, 'full');
+                return $u ? ['@type' => 'ImageObject', 'url' => $u] : '';
+            }
+            case 'image.alt': {
+                $img_id = get_post_thumbnail_id($post_id);
+                return $img_id ? (string) get_post_meta($img_id, '_wp_attachment_image_alt', true) : '';
+            }
+            case 'publishedAt': return get_the_date('c', $post_id);
+            case 'updatedAt':   return get_the_modified_date('c', $post_id);
+            case 'inLanguage':  return get_bloginfo('language'); // e.g. en-CA
+            case 'articleSection': {
+                $cats = get_the_category($post_id);
+                return (!empty($cats) && !is_wp_error($cats)) ? $cats[0]->name : '';
+            }
+            case 'breadcrumb': return $this->build_breadcrumb($post_id);
+            case 'faqs':       return ''; // no WP FAQ parser yet → FAQPage drops cleanly
+        }
+        return '';
     }
 
     private function get_post_token($token, $post_id)
