@@ -3470,7 +3470,110 @@ class Mehrana_App_Plugin
         if (!defined('MEHRANA_DISABLE_ALT_ENFORCER') || !MEHRANA_DISABLE_ALT_ENFORCER) {
             $html = $this->enforce_library_alt_on_html($html);
         }
+        if (!defined('MEHRANA_DISABLE_INTERNAL_FOLLOW') || !MEHRANA_DISABLE_INTERNAL_FOLLOW) {
+            $html = $this->follow_internal_links_on_html($html);
+        }
         return $this->apply_heading_overrides_on_html($html);
+    }
+
+    /**
+     * Internal links should be followable. Some editor plugins add
+     * rel="nofollow" to links by default, which leaks PageRank-flow on the
+     * site's own pages. This scans the final HTML and removes ONLY the
+     * `nofollow` token from the rel of links that point to this same site
+     * (same host, or root-relative/relative paths). External links are left
+     * completely untouched — their nofollow/sponsored/ugc stays. Nothing
+     * else on the tag (href, target, classes, other rel tokens) is changed.
+     *
+     * Mirrors enforce_library_alt_on_html for safety: HTML-only, with
+     * script/style/noscript masked so we never rewrite string literals.
+     */
+    public function follow_internal_links_on_html($html)
+    {
+        if (!is_string($html) || $html === '') return $html;
+        if (strlen($html) < 64) return $html;
+        // Cheap bail: nothing to do if there's no nofollow anywhere.
+        if (stripos($html, 'nofollow') === false) return $html;
+        // Only operate on HTML documents.
+        if (!preg_match('/<(?:!doctype|html|body|head)\b/i', $html)) return $html;
+
+        $site_host = strtolower((string) parse_url(home_url(), PHP_URL_HOST));
+        if ($site_host === '') return $html;
+        $site_host = preg_replace('/^www\./', '', $site_host);
+
+        // Mask script/style/noscript blocks so we don't rewrite <a>
+        // string literals inside JS or commented-out fallbacks.
+        $masked_blocks = [];
+        $masked = preg_replace_callback(
+            '/<(script|style|noscript)\b[^>]*>.*?<\/\1\s*>/is',
+            function ($m) use (&$masked_blocks) {
+                $token = "\x00MEH_REL_MASK_" . count($masked_blocks) . "\x00";
+                $masked_blocks[$token] = $m[0];
+                return $token;
+            },
+            $html
+        );
+
+        $masked = preg_replace_callback(
+            '/<a\b[^>]*?>/i',
+            function ($m) use ($site_host) {
+                return $this->follow_internal_link_tag($m[0], $site_host);
+            },
+            $masked
+        );
+
+        if (!empty($masked_blocks)) {
+            $masked = strtr($masked, $masked_blocks);
+        }
+
+        return $masked;
+    }
+
+    /**
+     * Per-<a>-tag rewriter. Returns the tag unchanged unless it (a) has a
+     * nofollow in its rel AND (b) points to this same site. Then it strips
+     * just the nofollow token (dropping the rel attribute entirely if it
+     * becomes empty). Everything else is preserved verbatim.
+     */
+    private function follow_internal_link_tag($tag, $site_host)
+    {
+        if (stripos($tag, 'nofollow') === false) return $tag;
+
+        // Need an href to judge internal vs external.
+        if (!preg_match('/\shref\s*=\s*("|\')(.*?)\1/i', $tag, $h)) return $tag;
+        $href = trim(html_entity_decode($h[2]));
+        if ($href === '') return $tag;
+
+        $is_internal = false;
+        if (preg_match('#^https?://([^/]+)#i', $href, $hm)) {
+            // Absolute URL — internal only if same host.
+            $link_host = preg_replace('/^www\./', '', strtolower($hm[1]));
+            $is_internal = ($link_host === $site_host);
+        } elseif ($href[0] === '#') {
+            // Pure anchor — not a navigable link; leave it alone.
+            return $tag;
+        } elseif (preg_match('#^[a-z][a-z0-9+.-]*:#i', $href)) {
+            // Other scheme (mailto:, tel:, javascript:, etc.) — not internal.
+            $is_internal = false;
+        } else {
+            // Root-relative ("/foo") or relative ("foo/bar") — internal.
+            $is_internal = true;
+        }
+        if (!$is_internal) return $tag;
+
+        // Strip only the nofollow token from rel; keep other tokens.
+        return preg_replace_callback(
+            '/(\srel\s*=\s*)("|\')(.*?)\2/i',
+            function ($r) {
+                $tokens = preg_split('/\s+/', trim($r[3]));
+                $kept = array_filter($tokens, function ($t) {
+                    return strtolower($t) !== 'nofollow' && $t !== '';
+                });
+                if (empty($kept)) return ''; // rel only held nofollow → drop it
+                return $r[1] . $r[2] . implode(' ', $kept) . $r[2];
+            },
+            $tag
+        );
     }
 
     /**
