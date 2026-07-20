@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.12.1
+ * Version: 5.13.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.12.1';
+    private $version = '5.13.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -38,6 +38,13 @@ class Mehrana_App_Plugin
         add_filter('pre_set_site_transient_update_plugins', [$this, 'check_for_github_update']);
         add_filter('plugins_api', [$this, 'github_plugin_info'], 20, 3);
         add_filter('upgrader_post_install', [$this, 'after_install'], 10, 3);
+
+        // Site-wide robots.txt fallback (v5.13.0): serves the content stored
+        // via PUT /robots-txt, but only when Rank Math isn't active — Rank
+        // Math registers its own robots_txt filter and stays the authority.
+        // A physical robots.txt file on the host bypasses WordPress entirely,
+        // so this filter is naturally inert in that case too.
+        add_filter('robots_txt', [$this, 'serve_mehrana_robots_txt'], 99, 2);
 
         // Google Tag Manager Hooks
         add_action('wp_head', [$this, 'inject_gtm_head'], 1);
@@ -781,6 +788,22 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/schema/authority-status', [
             'methods' => 'GET',
             'callback' => [$this, 'get_authority_status'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Site-wide robots.txt (v5.13.0) — used by Patrick's Robots Optimizer.
+        // GET returns the current content + where it comes from; PUT saves.
+        // Storage order on save: physical robots.txt file (updated in place,
+        // with a backup) → Rank Math's robots_txt setting (stays the single
+        // source of truth) → this plugin's own robots_txt filter as fallback.
+        register_rest_route($this->namespace, '/robots-txt', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_robots_txt'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+        register_rest_route($this->namespace, '/robots-txt', [
+            'methods' => 'PUT',
+            'callback' => [$this, 'update_robots_txt'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
     }
@@ -8980,10 +9003,159 @@ class Mehrana_App_Plugin
             'breadcrumbs' => $has_rank_math || $has_yoast,
             'themeEdit' => true,
             'sitemapExclude' => $has_rank_math,
+            'robotsTxt' => true,
             'seoPlugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
             'redirectPlugin' => $has_rm_redirects ? 'rank_math' : ($has_redirection ? 'redirection' : 'custom'),
             'pluginVersion' => $this->version,
         ]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Site-wide robots.txt (v5.13.0)
+    // ─────────────────────────────────────────────────────────────────────
+
+    private function get_physical_robots_path()
+    {
+        return ABSPATH . 'robots.txt';
+    }
+
+    /**
+     * GET /robots-txt
+     *
+     * Returns the robots.txt content the site currently uses and where it
+     * comes from: 'physical-file' | 'rank-math' | 'mehrana-plugin' | 'none'.
+     */
+    public function get_robots_txt($request)
+    {
+        $physical_path = $this->get_physical_robots_path();
+        $physical_exists = file_exists($physical_path);
+        $rank_math_active = class_exists('RankMath');
+
+        $source = 'none';
+        $content = '';
+
+        if ($physical_exists) {
+            $source = 'physical-file';
+            $content = is_readable($physical_path) ? (string) file_get_contents($physical_path) : '';
+        } elseif ($rank_math_active) {
+            // Rank Math stores its robots.txt editor content under the
+            // 'robots_txt_content' key (see RM's robots-txt module options).
+            $options = get_option('rank-math-options-general', []);
+            $rm = (is_array($options) && isset($options['robots_txt_content'])) ? (string) $options['robots_txt_content'] : '';
+            if ($rm !== '') {
+                $source = 'rank-math';
+                $content = $rm;
+            }
+        } else {
+            // Fallback branch mirrors serve_mehrana_robots_txt: the stored
+            // option is only actually served when Rank Math is NOT active.
+            $stored = (string) get_option('mehrana_robots_txt', '');
+            if ($stored !== '') {
+                $source = 'mehrana-plugin';
+                $content = $stored;
+            }
+        }
+
+        return rest_ensure_response([
+            'success' => true,
+            'content' => $content,
+            'source' => $source,
+            'physical_file' => $physical_exists,
+            'rank_math_active' => $rank_math_active,
+            'plugin_version' => $this->version,
+        ]);
+    }
+
+    /**
+     * PUT /robots-txt   Body: { "content": "User-agent: *\n..." }
+     *
+     * Saves site-wide robots.txt. Rank Math stays the single source of
+     * truth when active (the team sees the same content in Rank Math →
+     * General Settings → Edit robots.txt). A physical robots.txt file on
+     * the host bypasses WordPress entirely, so in that case the file
+     * itself is updated in place after a timestamped backup.
+     */
+    public function update_robots_txt($request)
+    {
+        $params = $request->get_json_params();
+        if (!is_array($params) || !array_key_exists('content', $params)) {
+            return new WP_Error('missing_content', 'content is required', ['status' => 400]);
+        }
+
+        $content = (string) $params['content'];
+        $content = str_replace(["\r\n", "\r"], "\n", $content);
+        $content = str_replace("\0", '', $content);
+
+        $physical_path = $this->get_physical_robots_path();
+        $physical_exists = file_exists($physical_path);
+        $backup = null;
+
+        if ($physical_exists) {
+            if (!is_writable($physical_path)) {
+                return new WP_Error(
+                    'not_writable',
+                    'A physical robots.txt exists on the host but is not writable by WordPress',
+                    ['status' => 500]
+                );
+            }
+            // Single fixed backup name so publishes don't pile files up in
+            // the web root; each publish overwrites the previous backup.
+            $backup = $physical_path . '.mehrana-backup';
+            if (!@copy($physical_path, $backup)) {
+                $backup = null;
+            }
+            $written = @file_put_contents($physical_path, $content, LOCK_EX);
+            if ($written === false || $written !== strlen($content)) {
+                return new WP_Error('write_failed', 'Failed to write robots.txt file', ['status' => 500]);
+            }
+            $saved_via = 'physical-file';
+        } elseif (class_exists('RankMath')) {
+            // Rank Math's robots.txt editor reads 'robots_txt_content' from
+            // the general options — writing there keeps RM the single source
+            // of truth and its own robots_txt filter serves the content.
+            $options = get_option('rank-math-options-general', []);
+            if (!is_array($options)) {
+                $options = [];
+            }
+            $options['robots_txt_content'] = $content;
+            update_option('rank-math-options-general', $options);
+            $saved_via = 'rank-math';
+        } else {
+            update_option('mehrana_robots_txt', $content);
+            $saved_via = 'mehrana-plugin';
+        }
+
+        $this->log("robots.txt updated via {$saved_via} (" . strlen($content) . ' bytes)');
+
+        return rest_ensure_response([
+            'success' => true,
+            'saved_via' => $saved_via,
+            'physical_file' => $physical_exists,
+            'backup' => $backup ? basename($backup) : null,
+            'plugin_version' => $this->version,
+        ]);
+    }
+
+    /**
+     * robots_txt filter fallback — only serves when Rank Math isn't active
+     * (Rank Math registers its own robots_txt filter and wins otherwise).
+     */
+    public function serve_mehrana_robots_txt($output, $public)
+    {
+        // Respect "Discourage search engines" — core outputs Disallow: /
+        // for non-public sites and we must not replace that (staging/clone
+        // sites with a copied DB would otherwise start inviting crawlers).
+        if (0 === absint($public)) {
+            return $output;
+        }
+        if (class_exists('RankMath')) {
+            return $output;
+        }
+        $stored = (string) get_option('mehrana_robots_txt', '');
+        if ($stored === '') {
+            return $output;
+        }
+        return $stored;
     }
 }
 
