@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.15.0
+ * Version: 5.16.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.15.0';
+    private $version = '5.16.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -8471,8 +8471,12 @@ class Mehrana_App_Plugin
         $redirects = [];
 
         // 1. Rank Math redirections
+        // The table survives plugin deactivation, so rows can exist that
+        // nothing serves — report those as 'rank_math_orphaned' so the UI
+        // can say why they fail instead of listing them as live rules.
         $table = $wpdb->prefix . 'rank_math_redirections';
         if ($wpdb->get_var("SHOW TABLES LIKE '$table'") === $table) {
+            $rank_math_active = class_exists('RankMath') || defined('RANK_MATH_VERSION');
             // Exclude trashed rows — those are soft-deleted and should not appear in the UI.
             // Keep 'active' + 'inactive' so users can toggle enabled state.
             $rows = $wpdb->get_results("SELECT id, sources, url_to, header_code, status FROM $table WHERE status != 'trashed' ORDER BY id DESC LIMIT 500");
@@ -8487,7 +8491,7 @@ class Mehrana_App_Plugin
                     'type' => (int) $row->header_code,
                     'isActive' => $row->status === 'active',
                     'matchType' => $comparison,
-                    'source' => 'rank_math',
+                    'source' => $rank_math_active ? 'rank_math' : 'rank_math_orphaned',
                 ];
             }
         }
