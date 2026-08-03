@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.14.0
+ * Version: 5.15.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.14.0';
+    private $version = '5.15.0';
     private $namespace = 'mehrana/v1';
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
@@ -39,12 +39,34 @@ class Mehrana_App_Plugin
         add_filter('plugins_api', [$this, 'github_plugin_info'], 20, 3);
         add_filter('upgrader_post_install', [$this, 'after_install'], 10, 3);
 
-        // Site-wide robots.txt fallback (v5.13.0): serves the content stored
-        // via PUT /robots-txt, but only when Rank Math isn't active — Rank
-        // Math registers its own robots_txt filter and stays the authority.
+        // Site-wide robots.txt (v5.13.0, authority since v5.15.0): serves the
+        // content stored via PUT /robots-txt. Runs at PHP_INT_MAX so it is the
+        // LAST robots_txt filter — SEO plugins that append their own block
+        // after ours (Yoast hooks at 99999 and adds "# START YOAST BLOCK …")
+        // otherwise make the live file differ from what Patrick published.
+        // When Rank Math is active the published content lives in Rank Math's
+        // own robots setting (still the single source of truth for its UI);
+        // serving it verbatim here just strips third-party appendages.
         // A physical robots.txt file on the host bypasses WordPress entirely,
         // so this filter is naturally inert in that case too.
-        add_filter('robots_txt', [$this, 'serve_mehrana_robots_txt'], 99, 2);
+        add_filter('robots_txt', [$this, 'serve_mehrana_robots_txt'], PHP_INT_MAX, 2);
+
+        // Custom option-based redirects (fallback store when neither Rank Math
+        // nor the Redirection plugin is available). v5.15.0: this hook was
+        // previously only registered inside the REST create call — i.e. never
+        // on real front-end page loads — so option-stored redirects never
+        // actually fired. Registered unconditionally; the handler exits
+        // immediately when the option is empty.
+        add_action('template_redirect', [$this, 'handle_custom_redirects'], 1);
+
+        // Never let a proxy/page cache store our REST responses. With API-key
+        // auth no WP user is logged in, so core skips its nocache headers and
+        // host-level caches (e.g. SiteGround's NGINX proxy) may cache GET
+        // responses. Patrick's read-modify-write flows (LinkLab inline fixes,
+        // On-Page deploys) would then read a STALE copy and push it back —
+        // silently reverting every change made since the cache entry was
+        // created. Observed live on hardbodydancer.com (2026-08-03).
+        add_filter('rest_post_dispatch', [$this, 'send_nocache_headers_for_mehrana_routes'], 10, 3);
 
         // Google Tag Manager Hooks
         add_action('wp_head', [$this, 'inject_gtm_head'], 1);
@@ -6741,11 +6763,21 @@ class Mehrana_App_Plugin
 
                 // Check if table exists
                 if ($wpdb->get_var("SHOW TABLES LIKE '$table'") === $table) {
+                    // Rank Math stores non-regex patterns slash-trimmed
+                    // ("old-page", never "/old-page/") — its own admin
+                    // sanitizer does ltrim('/') and its matcher compares
+                    // against a trim($uri, '/') request path. Store the
+                    // native format so rules made here look and behave
+                    // exactly like rules made in Rank Math's UI (older RM
+                    // versions compare the raw pattern and never match a
+                    // slashed one).
+                    $rm_pattern = $match_type === 'regex' ? $from_path : trim($from_path, '/');
+
                     // Check if redirect already exists with SAME pattern + comparison.
                     // Previous versions used a loose LIKE check which produced false
                     // "already exists" errors for regex patterns that happened to share
                     // a substring with another rule.
-                    $needle = serialize([[ 'pattern' => $from_path, 'comparison' => $match_type ]]);
+                    $needle = serialize([[ 'pattern' => $rm_pattern, 'comparison' => $match_type ]]);
                     $existing = $wpdb->get_row($wpdb->prepare(
                         "SELECT id FROM $table WHERE sources = %s AND status != 'trashed'",
                         $needle
@@ -6754,7 +6786,7 @@ class Mehrana_App_Plugin
                     if (!$existing) {
                         $wpdb->insert($table, [
                             'sources' => serialize([
-                                ['pattern' => $from_path, 'comparison' => $match_type]
+                                ['pattern' => $rm_pattern, 'comparison' => $match_type]
                             ]),
                             'url_to' => $to_url,
                             'header_code' => $type,
@@ -6765,6 +6797,9 @@ class Mehrana_App_Plugin
                         $new_id = $wpdb->insert_id;
                         $method_used = 'rank_math';
                         $this->flush_rank_math_redirect_cache();
+                        if ($match_type !== 'regex') {
+                            $this->purge_site_caches(null, home_url($from_path));
+                        }
                         $this->log("[CREATE_REDIRECT] Created via Rank Math (id=rm_{$new_id})");
 
                         return rest_ensure_response([
@@ -6824,12 +6859,12 @@ class Mehrana_App_Plugin
             ];
             update_option('mehrana_redirects', array_values($redirects));
             $method_used = 'mehrana_custom';
-            $this->log("[CREATE_REDIRECT] Created via Mehrana custom option");
-
-            // Add template_redirect hook if not already added
-            if (!has_action('template_redirect', [$this, 'handle_custom_redirects'])) {
-                add_action('template_redirect', [$this, 'handle_custom_redirects']);
+            if ($match_type !== 'regex') {
+                $this->purge_site_caches(null, home_url($from_path));
             }
+            $this->log("[CREATE_REDIRECT] Created via Mehrana custom option");
+            // (The template_redirect handler is registered unconditionally in
+            // the constructor since v5.15.0 — nothing to hook here.)
         }
 
         return rest_ensure_response([
@@ -6894,28 +6929,138 @@ class Mehrana_App_Plugin
     }
 
     /**
-     * Handle custom redirects (fallback when no plugin available)
+     * Handle custom redirects (fallback when no redirect plugin is available).
+     *
+     * v5.15.0 rewrite: the old handler looked rules up as a path-keyed map
+     * with 'to'/'type' values — the storage format create_redirect stopped
+     * writing long ago (it appends numeric entries with from_url/to_url and a
+     * match_type). Result: every option-stored redirect was silently dead.
+     * This version normalizes the stored rules and honors match_type.
      */
     public function handle_custom_redirects()
     {
         $redirects = get_option('mehrana_redirects', []);
-        if (empty($redirects))
+        if (empty($redirects)) {
             return;
-
-        $current_path = $_SERVER['REQUEST_URI'];
-
-        // Check with and without trailing slash
-        if (isset($redirects[$current_path])) {
-            $redirect = $redirects[$current_path];
-            wp_redirect($redirect['to'], $redirect['type']);
-            exit;
         }
+        $redirects = $this->normalize_custom_redirects($redirects);
 
-        $alt_path = rtrim($current_path, '/');
-        if (isset($redirects[$alt_path])) {
-            $redirect = $redirects[$alt_path];
-            wp_redirect($redirect['to'], $redirect['type']);
-            exit;
+        $request_uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+        if ($request_uri === '') {
+            return;
+        }
+        // Compare on the decoded path only (no query string), tolerant of
+        // trailing slashes — the same equivalence exact rules are written with.
+        $request_path = rawurldecode((string) parse_url($request_uri, PHP_URL_PATH));
+        $request_norm = '/' . trim($request_path, '/');
+
+        foreach ($redirects as $rule) {
+            $from = isset($rule['from_url']) ? (string) $rule['from_url'] : '';
+            $to = isset($rule['to_url']) ? (string) $rule['to_url'] : (isset($rule['to']) ? (string) $rule['to'] : '');
+            if ($from === '' || $to === '') {
+                continue;
+            }
+            $type = isset($rule['type']) ? intval($rule['type']) : 301;
+            if ($type < 300 || $type > 399) {
+                $type = 301;
+            }
+            $match_type = isset($rule['match_type']) ? (string) $rule['match_type'] : 'exact';
+
+            $matched = false;
+            if ($match_type === 'regex') {
+                // Same convention as Rank Math: pattern matches the path
+                // without the leading slash.
+                $subject = ltrim($request_norm, '/');
+                $matched = @preg_match('#' . str_replace('#', '\#', $from) . '#', $subject) === 1;
+            } else {
+                $from_norm = '/' . trim(rawurldecode($from), '/');
+                if ($match_type === 'contains') {
+                    $matched = $from_norm !== '/' && strpos($request_norm, trim($from_norm, '/')) !== false;
+                } elseif ($match_type === 'start') {
+                    $matched = strpos($request_norm, $from_norm) === 0;
+                } elseif ($match_type === 'end') {
+                    $needle = trim($from_norm, '/');
+                    $matched = $needle !== '' && substr(trim($request_norm, '/'), -strlen($needle)) === $needle;
+                } else { // exact
+                    $matched = $request_norm === $from_norm;
+                }
+            }
+
+            if ($matched) {
+                $target = preg_match('#^https?://#i', $to) ? $to : home_url($to);
+                // wp_redirect + exit, wp_safe_redirect would eat external targets
+                wp_redirect($target, $type);
+                exit;
+            }
+        }
+    }
+
+    /**
+     * rest_post_dispatch: stamp no-store headers on every mehrana/v1 response
+     * so host/proxy caches never serve a stale copy of our API to Patrick.
+     */
+    public function send_nocache_headers_for_mehrana_routes($response, $server, $request)
+    {
+        if ($response instanceof WP_REST_Response
+            && strpos((string) $request->get_route(), '/' . $this->namespace) === 0) {
+            $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+            $response->header('Pragma', 'no-cache');
+            $response->header('Expires', 'Wed, 11 Jan 1984 05:00:00 GMT');
+            // nginx-specific (SiteGround et al.): forbid proxy-cache storage.
+            $response->header('X-Accel-Expires', '0');
+        }
+        return $response;
+    }
+
+    /**
+     * Purge host/page caches after a server-side content change, so the fix
+     * is immediately visible instead of hiding behind a stale cached page
+     * (SiteGround's proxy cache holds pages for hours). URL-targeted where the
+     * cache plugin supports it, best-effort everywhere — a purge failure must
+     * never fail the write that triggered it.
+     *
+     * @param int|null    $post_id Optional post whose permalink to purge.
+     * @param string|null $url     Optional explicit URL to purge (e.g. robots.txt).
+     */
+    private function purge_site_caches($post_id = null, $url = null)
+    {
+        try {
+            if ($post_id) {
+                clean_post_cache($post_id);
+                if (!$url) {
+                    $url = get_permalink($post_id);
+                }
+            }
+
+            // SiteGround Optimizer
+            if (function_exists('sg_cachepress_purge_cache')) {
+                @sg_cachepress_purge_cache($url ? $url : false);
+            }
+            // WP Rocket
+            if ($post_id && function_exists('rocket_clean_post')) {
+                @rocket_clean_post($post_id);
+            }
+            // LiteSpeed Cache
+            if ($post_id) {
+                do_action('litespeed_purge_post', $post_id);
+            } elseif ($url) {
+                do_action('litespeed_purge_url', $url);
+            }
+            // W3 Total Cache
+            if ($post_id && function_exists('w3tc_flush_post')) {
+                @w3tc_flush_post($post_id);
+            }
+            // WP Super Cache
+            if ($post_id && function_exists('wp_cache_post_change')) {
+                @wp_cache_post_change($post_id);
+            }
+            // WP Fastest Cache
+            if ($post_id && function_exists('wpfc_clear_post_cache_by_id')) {
+                @wpfc_clear_post_cache_by_id($post_id);
+            }
+            $this->log('[CACHE] Purged site caches' . ($post_id ? " for post {$post_id}" : '') . ($url ? " ({$url})" : ''));
+        } catch (\Throwable $e) {
+            $this->log('[CACHE] Purge threw: ' . $e->getMessage());
         }
     }
 
@@ -7008,9 +7153,11 @@ class Mehrana_App_Plugin
             'ID' => $page_id
         ];
 
-        // Update content if provided
+        // Update content if provided. wp_update_post expects SLASHED data
+        // (it wp_unslash()es internally) — without wp_slash, every literal
+        // backslash in the content is silently stripped on save.
         if (isset($body['content'])) {
-            $update_data['post_content'] = $body['content'];
+            $update_data['post_content'] = wp_slash($body['content']);
             $this->log("[UPDATE_PAGE] Content length: " . strlen($body['content']));
         }
 
@@ -7151,8 +7298,19 @@ class Mehrana_App_Plugin
             $this->log("[UPDATE_PAGE] Changing post_type to: " . $body['post_type']);
         }
 
-        // Perform the update
+        // Perform the update. API-key requests run with no WP user, so core
+        // treats them as unprivileged and pipes post_content through kses —
+        // which strips iframes/embeds/svg from otherwise-valid page-builder
+        // content. The request already passed our API-key auth (full trust),
+        // so suspend kses for this one write and restore it right after.
+        $had_kses = has_filter('content_save_pre', 'wp_filter_post_kses') !== false;
+        if ($had_kses) {
+            kses_remove_filters();
+        }
         $result = wp_update_post($update_data, true);
+        if ($had_kses) {
+            kses_init_filters();
+        }
 
         if (is_wp_error($result)) {
             $this->log("[UPDATE_PAGE] Error: " . $result->get_error_message());
@@ -7185,6 +7343,10 @@ class Mehrana_App_Plugin
         $updated_post = get_post($page_id);
         $permalink = get_permalink($page_id);
 
+        // The edit is only real once the cached page stops serving the old
+        // HTML — purge host/page caches for this permalink.
+        $this->purge_site_caches($page_id);
+
         $this->log("[UPDATE_PAGE] Success. New URL: {$permalink}");
 
         return rest_ensure_response([
@@ -7194,7 +7356,12 @@ class Mehrana_App_Plugin
             'title' => $updated_post->post_title,
             'status' => $updated_post->post_status,
             'slug' => $updated_post->post_name,
-            'parent_id' => $updated_post->post_parent
+            'parent_id' => $updated_post->post_parent,
+            // Fingerprint of what actually landed in the DB — lets the caller
+            // detect a write that was accepted but not persisted (host cache,
+            // security layer, competing editor) instead of trusting success.
+            'content_sha1' => sha1((string) $updated_post->post_content),
+            'content_length' => strlen((string) $updated_post->post_content)
         ]);
     }
 
@@ -8406,9 +8573,10 @@ class Mehrana_App_Plugin
                         $final_pattern = ltrim($final_pattern, '/');
                     }
                 } else {
-                    if (strpos($final_pattern, '/') !== 0) {
-                        $final_pattern = '/' . $final_pattern;
-                    }
+                    // Rank Math's native pattern format is slash-trimmed
+                    // ("old-page") — writing "/old-page/" makes the rule look
+                    // foreign in RM's UI and never match on older RM versions.
+                    $final_pattern = trim($final_pattern, '/');
                 }
 
                 $update['sources'] = serialize([
@@ -9477,6 +9645,10 @@ class Mehrana_App_Plugin
             $saved_via = 'mehrana-plugin';
         }
 
+        // The host may cache /robots.txt for hours (SiteGround serves it with
+        // max-age=14400) — purge it so the publish is verifiable immediately.
+        $this->purge_site_caches(null, home_url('/robots.txt'));
+
         $this->log("robots.txt updated via {$saved_via} (" . strlen($content) . ' bytes)');
 
         return rest_ensure_response([
@@ -9489,8 +9661,13 @@ class Mehrana_App_Plugin
     }
 
     /**
-     * robots_txt filter fallback — only serves when Rank Math isn't active
-     * (Rank Math registers its own robots_txt filter and wins otherwise).
+     * robots_txt filter — runs at PHP_INT_MAX (last) and serves the published
+     * content EXACTLY. Earlier filters may append their own blocks (Yoast adds
+     * "# START YOAST BLOCK …" at priority 99999); replacing the accumulated
+     * output here keeps the live file byte-identical to what was published.
+     * When Rank Math is active its own robots setting (where PUT /robots-txt
+     * saves) stays the source of truth — we serve that setting verbatim so a
+     * teammate editing it in Rank Math's UI is never masked.
      */
     public function serve_mehrana_robots_txt($output, $public)
     {
@@ -9501,7 +9678,10 @@ class Mehrana_App_Plugin
             return $output;
         }
         if (class_exists('RankMath')) {
-            return $output;
+            $options = get_option('rank-math-options-general', []);
+            $rm = (is_array($options) && isset($options['robots_txt_content']))
+                ? (string) $options['robots_txt_content'] : '';
+            return trim($rm) !== '' ? $rm : $output;
         }
         $stored = (string) get_option('mehrana_robots_txt', '');
         if ($stored === '') {
