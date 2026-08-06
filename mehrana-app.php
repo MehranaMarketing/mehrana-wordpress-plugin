@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.19.0
+ * Version: 5.19.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.19.0';
+    private $version = '5.19.1';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -4124,6 +4124,34 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * Turn a root-relative ("/wp-content/…") or protocol-relative
+     * ("//host/wp-content/…") image URL into an absolute one. Root-relative
+     * URLs resolve against the ORIGIN, not against home_url()'s path, so a
+     * subdirectory install ( https://example.com/blog ) must not have its
+     * path prepended twice. Absolute URLs are returned untouched.
+     */
+    private function absolutise_upload_url($url)
+    {
+        if ($url === '' || preg_match('#^https?://#i', $url)) return $url;
+
+        if (strpos($url, '//') === 0) {
+            return (is_ssl() ? 'https:' : 'http:') . $url;
+        }
+
+        if ($url[0] === '/') {
+            $home   = home_url('/');
+            $scheme = parse_url($home, PHP_URL_SCHEME);
+            $host   = parse_url($home, PHP_URL_HOST);
+            $port   = parse_url($home, PHP_URL_PORT);
+            if ($scheme && $host) {
+                return $scheme . '://' . $host . ($port ? ':' . $port : '') . $url;
+            }
+        }
+
+        return $url;
+    }
+
+    /**
      * Best-effort attachment ID resolution from a free-form <img> tag.
      * Tries in order:
      *   1. wp-image-{ID} class (added by WP for Gutenberg images).
@@ -4153,6 +4181,14 @@ class Mehrana_App_Plugin
             $url = $m[1];
             if ($url === '' || strpos($url, 'data:') === 0) continue;
             if (strpos($url, '/wp-content/uploads/') === false) continue;
+
+            // Hand-written theme markup often ships a root-relative src
+            // ("/wp-content/uploads/…"). attachment_url_to_postid() only
+            // understands absolute URLs — it matches against the uploads
+            // baseurl and falls back to a guid lookup, both absolute — so a
+            // relative src resolved to nothing and the image never got its
+            // alt. Normalise before asking.
+            $url = $this->absolutise_upload_url($url);
 
             if (array_key_exists($url, $url_id_cache)) {
                 if ($url_id_cache[$url] > 0) return $url_id_cache[$url];
