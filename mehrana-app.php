@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.16.0
+ * Version: 5.19.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,8 +18,20 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.16.0';
+    private $version = '5.19.0';
     private $namespace = 'mehrana/v1';
+
+    /**
+     * Attributes an <img> may carry its real upload URL in, most-trustworthy
+     * first. Lazy-loaders (Woodmart's data-wood-src, WP Rocket, Smush…) park
+     * a data: URI or a placeholder in src and stash the true URL in one of
+     * these, so alt enforcement has to look past src alone.
+     */
+    const IMG_URL_ATTRS = [
+        'data-orig-file', 'data-large-file', 'data-medium-file',
+        'src', 'data-src', 'data-lazy-src', 'data-original',
+        'data-wood-src', 'data-srcset-src', 'data-cfsrc',
+    ];
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
 
@@ -143,6 +155,17 @@ class Mehrana_App_Plugin
 
         // Register hooks that need 'init'
         add_action('init', [$this, 'init_actions']);
+
+        // Stamp taxonomy edits. WordPress records post_modified for a post and
+        // nothing at all for a term, so a category page rewritten today looks
+        // exactly like one untouched for a year — and Quick Fit's content work
+        // happens on category pages. Without this the reporting side is left
+        // diffing rendered text, which reads a product grid re-ordering itself
+        // as an edit and misses an edit made between two readings.
+        add_action('edited_term', [$this, 'stamp_term_modified'], 10, 3);
+        add_action('created_term', [$this, 'stamp_term_modified'], 10, 3);
+        add_action('added_term_meta', [$this, 'stamp_term_modified_from_meta'], 10, 4);
+        add_action('updated_term_meta', [$this, 'stamp_term_modified_from_meta'], 10, 4);
 
         // Lead Magnet block + custom element. Registered on init so
         // wp.blocks/register_block_type are available; the frontend
@@ -442,6 +465,16 @@ class Mehrana_App_Plugin
                 'alt' => [
                     'required' => true,
                     'sanitize_callback' => 'sanitize_text_field'
+                ],
+                // Pages the CRM's crawl saw this image on. Alt is applied at
+                // render time too, so pages that only *display* the image get
+                // nothing written to them and would keep serving a cached copy
+                // with the old alt. WordPress can't know which pages those are.
+                'purge_urls' => [
+                    'required' => false,
+                    'type' => 'array',
+                    'items' => ['type' => 'string'],
+                    'default' => []
                 ]
             ]
         ]);
@@ -1706,6 +1739,148 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * The post's content as parseable HTML.
+     *
+     * NOT strip_shortcodes(): for an ENCLOSING shortcode that throws the inner
+     * text away too, which is exactly the text we're here to read. Removing only
+     * the [markers] leaves a page builder's real headings and lists intact.
+     */
+    private function content_html_for_parsing($post)
+    {
+        if (!$post || !is_string($post->post_content)) return '';
+        $html = preg_replace('/\[\/?[^\]\[]{1,200}\]/', ' ', $post->post_content);
+        return is_string($html) ? $html : '';
+    }
+
+    /** DOMXPath over an HTML fragment, or null when it can't be parsed. */
+    private function xpath_for_html($html)
+    {
+        if (!class_exists('DOMDocument') || trim($html) === '') return null;
+        $doc = new \DOMDocument();
+        $prev = libxml_use_internal_errors(true);
+        $ok = @$doc->loadHTML('<?xml encoding="utf-8" ?><body>' . $html . '</body>', LIBXML_NOWARNING | LIBXML_NOERROR);
+        libxml_clear_errors();
+        libxml_use_internal_errors($prev);
+        if (!$ok) return null;
+        return new \DOMXPath($doc);
+    }
+
+    /**
+     * The <li> texts of the list introduced by a heading matching $regex.
+     *
+     * Anchoring on the heading is what makes this safe: a page is full of lists
+     * (menus, related posts), and only the one introduced by the right words is
+     * the recipe's. Mirrors listUnderHeading() in lib/native/schema2/list-items.ts.
+     */
+    private function list_under_heading($html, $regex)
+    {
+        $xp = $this->xpath_for_html($html);
+        if (!$xp) return [];
+        $heads = $xp->query('//h2 | //h3 | //h4 | //strong | //b');
+        if (!$heads) return [];
+        foreach ($heads as $h) {
+            $text = trim(preg_replace('/\s+/', ' ', $h->textContent));
+            if ($text === '' || strlen($text) > 60 || !preg_match($regex, $text)) continue;
+            $list = $xp->query('following-sibling::ul[1] | following-sibling::ol[1]', $h);
+            if (!$list || $list->length === 0) {
+                $list = $xp->query('../following-sibling::ul[1] | ../following-sibling::ol[1]', $h);
+            }
+            if (!$list || $list->length === 0) continue;
+            $items = [];
+            foreach ($list->item(0)->childNodes as $li) {
+                if (strtolower($li->nodeName) !== 'li') continue;
+                $t = trim(preg_replace('/\s+/', ' ', $li->textContent));
+                if ($t !== '' && strlen($t) < 400) $items[] = $t;
+            }
+            if (count($items) >= 2) return $items;
+        }
+        return [];
+    }
+
+    /**
+     * {{live.items}} — schema.org ListItem[] for a page that lists things.
+     * A listing is a repeated "heading with a link"; fewer than three of them is
+     * page furniture, not a list, so we return nothing and ItemList drops.
+     */
+    private function live_items_for_post($post_id, $post)
+    {
+        $xp = $this->xpath_for_html($this->content_html_for_parsing($post));
+        if (!$xp) return [];
+        $heads = $xp->query('//h2 | //h3');
+        if (!$heads) return [];
+        $items = [];
+        $seen = [];
+        foreach ($heads as $h) {
+            if (count($items) >= 30) break;
+            $name = trim(preg_replace('/\s+/', ' ', $h->textContent));
+            if ($name === '') continue;
+            $href = '';
+            $inside = $xp->query('.//a[@href]', $h);
+            if ($inside && $inside->length > 0) {
+                $href = $inside->item(0)->getAttribute('href');
+            } else {
+                $near = $xp->query('..//a[@href]', $h);
+                if ($near && $near->length > 0) $href = $near->item(0)->getAttribute('href');
+            }
+            $key = strtolower($href !== '' ? $href : $name);
+            if (isset($seen[$key])) continue;
+            $seen[$key] = true;
+            $entry = ['@type' => 'ListItem', 'position' => count($items) + 1, 'name' => $name];
+            if ($href !== '') $entry['url'] = $href;
+            $items[] = $entry;
+        }
+        return count($items) >= 3 ? $items : [];
+    }
+
+    /**
+     * Plain-text description for a post, safe to publish inside JSON-LD.
+     *
+     * A manual excerpt wins. Otherwise we derive one from the content — and the
+     * derivation MUST strip shortcodes BEFORE stripping tags. Page-builder pages
+     * (WPBakery, Divi, Fusion) are pure shortcode with no HTML at all, so
+     * wp_strip_all_tags() on its own removes nothing and the raw
+     * "[vc_section woodmart_css_id=...]" soup ships as the description.
+     *
+     * If anything builder-shaped survives anyway (strip_shortcodes only knows
+     * REGISTERED tags), return '' instead: an absent description is valid
+     * schema, a markup-filled one is not.
+     */
+    private function plain_text_description($post_id, $post)
+    {
+        // The agency edits SEO in Patrick and has no WordPress logins. Patrick
+        // stores the description it is given in the site's SEO plugin
+        // (rank_math_description / _yoast_wpseo_metadesc), so that field IS the
+        // Patrick-authored value — read it first and the schema says exactly
+        // what the team typed, with nobody touching wp-admin.
+        $ex = '';
+        $seo = $this->fetch_rendered_seo_description($post);
+        if (is_array($seo) && isset($seo['description']) && is_string($seo['description'])) {
+            $ex = trim($seo['description']);
+        }
+
+        // Nothing authored anywhere — derive something from the page itself.
+        if ($ex === '') {
+            $ex = has_excerpt($post_id) ? get_the_excerpt($post_id) : '';
+        }
+        if ($ex === '') {
+            $raw = $post->post_content;
+            if (function_exists('excerpt_remove_blocks')) {
+                $raw = excerpt_remove_blocks($raw);
+            }
+            $ex = wp_strip_all_tags(strip_shortcodes($raw));
+        }
+
+        $ex = trim(preg_replace('/\s+/', ' ', $ex));
+        // Last line of defence, whatever the source: page builders register
+        // their shortcodes on `init`, so at wp_head time strip_shortcodes() can
+        // be a no-op and the raw "[vc_section ...]" survives. Never publish it.
+        if ($ex !== '' && preg_match('/^\s*\[|\[(vc_|et_pb_|fusion_|elementor)/i', $ex)) {
+            return '';
+        }
+        return mb_substr($ex, 0, 300);
+    }
+
+    /**
      * Resolve a {{live.*}} token (field = the part after "live.") to the same
      * value buildLiveTokens produces on native. Object/array-valued fields
      * (image, breadcrumb) return native types so substitute_tokens drops them
@@ -1736,11 +1911,7 @@ class Mehrana_App_Plugin
             case 'url':   return get_permalink($post_id);
             case 'slug':  return $post->post_name;
             case 'path':  { $p = wp_parse_url(get_permalink($post_id), PHP_URL_PATH); return $p ?: '/'; }
-            case 'description': {
-                $ex = has_excerpt($post_id) ? get_the_excerpt($post_id) : wp_strip_all_tags($post->post_content);
-                $ex = trim(preg_replace('/\s+/', ' ', $ex));
-                return mb_substr($ex, 0, 300);
-            }
+            case 'description': return $this->plain_text_description($post_id, $post);
             case 'image.url': return get_the_post_thumbnail_url($post_id, 'full') ?: '';
             case 'image': {
                 $u = get_the_post_thumbnail_url($post_id, 'full');
@@ -1759,6 +1930,23 @@ class Mehrana_App_Plugin
             }
             case 'breadcrumb': return $this->build_breadcrumb($post_id);
             case 'faqs':       return ''; // no WP FAQ parser yet → FAQPage drops cleanly
+            // Read off the page itself, exactly like the native engine's
+            // {{live.items}} / {{live.ingredients}} / {{live.steps}}. Absent on
+            // pages that aren't a listing or a recipe, so those blocks drop.
+            case 'items':      return $this->live_items_for_post($post_id, $post);
+            case 'ingredients': {
+                $ing = $this->list_under_heading($this->content_html_for_parsing($post), '/^\s*ingredients\b|\bingredients\s*:?\s*$/i');
+                return empty($ing) ? '' : $ing;
+            }
+            case 'steps': {
+                $raw = $this->list_under_heading($this->content_html_for_parsing($post), '/^\s*(instructions|method|directions|steps)\b|\b(instructions|method|directions|steps)\s*:?\s*$/i');
+                if (empty($raw)) return '';
+                $steps = [];
+                foreach ($raw as $i => $t) {
+                    $steps[] = ['@type' => 'HowToStep', 'position' => $i + 1, 'text' => $t];
+                }
+                return $steps;
+            }
         }
         return '';
     }
@@ -1772,10 +1960,7 @@ class Mehrana_App_Plugin
             case 'post.title':            return html_entity_decode(get_the_title($post_id), ENT_QUOTES, 'UTF-8');
             case 'post.url':              return get_permalink($post_id);
             case 'post.slug':             return $post->post_name;
-            case 'post.excerpt':
-                $ex = has_excerpt($post_id) ? get_the_excerpt($post_id) : wp_strip_all_tags($post->post_content);
-                $ex = trim(preg_replace('/\s+/', ' ', $ex));
-                return mb_substr($ex, 0, 300);
+            case 'post.excerpt':          return $this->plain_text_description($post_id, $post);
             case 'post.featured_image':
                 return get_the_post_thumbnail_url($post_id, 'full') ?: '';
             case 'post.date_published':   return get_the_date('c', $post_id);
@@ -3306,6 +3491,12 @@ class Mehrana_App_Plugin
         global $wpdb;
         $inline_updated = 0;
         $elementor_updated = 0;
+        // Every post whose cached HTML could now be stale. Alt is also applied
+        // at render time by the final-HTML enforcer, so pages that merely
+        // *display* this image (theme sliders, related-post grids) need a
+        // purge too even though nothing was written to them — the CRM knows
+        // those from its crawl and passes them in `purge_urls`.
+        $touched_post_ids = [];
 
         // ── Pass 1: inline <img> tags in post_content ───────────────────
         // Broadened from ['post','page'] to *every public post type* so
@@ -3334,6 +3525,7 @@ class Mehrana_App_Plugin
                     $wpdb->update($wpdb->posts, ['post_content' => $content], ['ID' => $post->ID]);
                     $inline_updated++;
                     clean_post_cache($post->ID);
+                    $touched_post_ids[] = (int) $post->ID;
                     $this->log("[update_media_alt] Pass 1 updated inline alt on post {$post->ID}");
                 }
             }
@@ -3361,26 +3553,39 @@ class Mehrana_App_Plugin
                 update_post_meta($row->post_id, '_elementor_data', wp_slash($changed));
                 $elementor_updated++;
                 clean_post_cache($row->post_id);
+                $touched_post_ids[] = (int) $row->post_id;
                 // Bump Elementor's CSS cache so the frontend re-renders
                 delete_post_meta($row->post_id, '_elementor_css');
                 $this->log("[update_media_alt] Pass 2 updated Elementor alt on post {$row->post_id}");
             }
         }
 
-        // ── Pass 3: featured-image diagnostic (no write needed) ─────────
+        // ── Pass 3: featured-image usages (no write needed) ─────────────
         // Themes that render via the_post_thumbnail() already read alt from
         // _wp_attachment_image_alt, so the media-library update above is
-        // sufficient. We just count usages for the diagnostic response so
+        // sufficient — but their cached HTML still holds the old alt, so we
+        // collect the IDs for the purge below and report the count so
         // CRM-side reporting can distinguish "fixed via meta" vs "needed
         // content rewrite".
-        $featured_for = (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM {$wpdb->postmeta}
+        $featured_ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta}
              WHERE meta_key = '_thumbnail_id' AND meta_value = %d",
             $id
         ));
+        $featured_for = count($featured_ids);
+        foreach ($featured_ids as $fid) {
+            $touched_post_ids[] = (int) $fid;
+        }
+
+        // ── Pass 4: purge, or the change stays invisible ────────────────
+        // Without this an alt edit only appeared once the page cache expired,
+        // which is what "I changed it in Patrick and the site never updated"
+        // usually turns out to be.
+        $purge_urls = $request->get_param('purge_urls');
+        $purged = $this->purge_caches_for_alt_change($touched_post_ids, is_array($purge_urls) ? $purge_urls : []);
 
         $posts_updated = $inline_updated + $elementor_updated;
-        $this->log("[update_media_alt] Done. inline=$inline_updated elementor=$elementor_updated featured_for=$featured_for");
+        $this->log("[update_media_alt] Done. inline=$inline_updated elementor=$elementor_updated featured_for=$featured_for purged=$purged");
 
         return rest_ensure_response([
             'success' => true,
@@ -3393,29 +3598,181 @@ class Mehrana_App_Plugin
             'inline_updated' => $inline_updated,
             'elementor_updated' => $elementor_updated,
             'featured_for' => $featured_for,
+            'caches_purged' => $purged,
             'media_alt_updated' => true
         ]);
     }
 
     /**
-     * Fill empty `alt` attributes from _wp_attachment_image_alt when WP
-     * builds an <img> tag. Runs at priority 999 so it overrides any earlier
-     * filter (theme template explicitly passing alt="", lazy-load plugins,
-     * etc.) but respects an alt that some plugin meaningfully filled in.
+     * Purge every cache layer that could still be serving the old alt, for
+     * the posts we rewrote plus any URLs the CRM says display this image.
+     *
+     * Deliberately scoped rather than a site-wide flush: an alt run can touch
+     * hundreds of images, and purging the whole site each time would keep a
+     * busy site permanently cold. Returns how many targets were purged.
+     */
+    private function purge_caches_for_alt_change($post_ids, $urls)
+    {
+        $post_ids = array_values(array_unique(array_filter(array_map('intval', (array) $post_ids))));
+
+        // Map incoming URLs onto post IDs where we can — a post-scoped purge
+        // reaches more cache plugins than a URL-scoped one.
+        $extra_urls = [];
+        foreach ((array) $urls as $url) {
+            $url = esc_url_raw(trim((string) $url));
+            if ($url === '') continue;
+            $mapped = url_to_postid($url);
+            if ($mapped) {
+                $post_ids[] = (int) $mapped;
+            } else {
+                $extra_urls[] = $url;
+            }
+        }
+        $post_ids = array_values(array_unique($post_ids));
+        $extra_urls = array_values(array_unique($extra_urls));
+
+        // Safety valve: a single alt shouldn't fan out into an unbounded purge.
+        $post_ids = array_slice($post_ids, 0, 50);
+        $extra_urls = array_slice($extra_urls, 0, 50);
+
+        foreach ($post_ids as $pid) {
+            $this->purge_site_caches($pid);
+        }
+        foreach ($extra_urls as $url) {
+            $this->purge_site_caches(null, $url);
+            if (function_exists('w3tc_flush_url')) @w3tc_flush_url($url);
+            if (function_exists('wpsc_delete_url_cache')) @wpsc_delete_url_cache($url);
+        }
+        if (!empty($extra_urls) && function_exists('rocket_clean_files')) {
+            @rocket_clean_files($extra_urls);
+        }
+
+        return count($post_ids) + count($extra_urls);
+    }
+
+    /**
+     * Does this alt text carry any information, or is it filler?
+     *
+     * The alt enforcers below refuse to overwrite an alt someone meant —
+     * that's per-occurrence intent and it outranks the media library. But a
+     * lot of themes, sliders and page-builders stamp out enumerated filler
+     * ("Image 1", "slide 3"), camera filenames ("DSC_0042") or the upload's
+     * own filename. Those read as noise to a screen reader and are worth
+     * exactly as much as alt="" — so we treat them as empty and let the
+     * library alt win.
+     *
+     * Why this is safe: every caller only substitutes when the attachment
+     * has a NON-EMPTY library alt, i.e. when a human deliberately wrote alt
+     * text for that exact image in Patrick. No library alt → nothing moves.
+     *
+     * @param string $alt      The alt currently on the tag.
+     * @param string $filename Optional upload filename, to catch alts that
+     *                         are just the file's own name.
+     */
+    private function is_placeholder_alt($alt, $filename = '')
+    {
+        $raw = strtolower(trim(html_entity_decode((string) $alt, ENT_QUOTES)));
+        // Fold every separator into a single space so "image-3", "image_3"
+        // and "Image  3" all normalise to "image 3".
+        $norm = trim(preg_replace('/[\s._\-–—]+/u', ' ', $raw));
+        if ($norm === '') return true;
+
+        // A bare number, or a bare file extension.
+        if (preg_match('/^\d+$/', $norm)) return true;
+        if (preg_match('/^(?:jpe?g|png|gif|webp|avif|svg|bmp|tiff?)$/', $norm)) return true;
+
+        // Contentless nouns, with or without an index: "image", "image 3",
+        // "photo", "untitled", "placeholder".
+        $bare = 'image|images|img|imgs|photo|photos|picture|pictures|pic|pics'
+              . '|graphic|graphics|untitled|unnamed|no alt|noalt|alt|alt text'
+              . '|none|n a|na|default|placeholder|blank|empty|spacer|dummy|test|tbd|xxx';
+        if (preg_match('/^(?:' . $bare . ')(?: \d+)?$/', $norm)) return true;
+
+        // Nouns that only become meaningless once they're enumerated. A bare
+        // "banner" or "logo" may well be the real, intended alt, so those are
+        // left alone — only "banner 3" / "logo 2" count as filler.
+        $numbered = 'slide|slider|gallery|thumbnail|thumb|banner|figure|fig|item'
+                  . '|media|file|upload|logo|icon|frame|asset|screenshot|screen shot';
+        if (preg_match('/^(?:' . $numbered . ') \d+$/', $norm)) return true;
+
+        // Camera / phone / export filenames: DSC_0042, IMG 1234, PXL 20240101.
+        if (preg_match('/^(?:dsc|dscn|dscf|img|imgp|imag|pxl|gopr|mvimg|pano|vid|photo)\s?\d{2,}$/', $norm)) return true;
+
+        // The alt is just the file's own name, which several builders
+        // auto-fill when nobody typed anything. Two shapes, judged apart:
+        if ($filename !== '') {
+            $f = strtolower((string) $filename);
+            $f = preg_replace('/\.[a-z0-9]+$/', '', $f);   // drop extension
+            $f = preg_replace('/-\d+x\d+$/', '', $f);      // drop -300x200
+            $f = trim(preg_replace('/[\s._\-]+/', ' ', $f));
+
+            $alt_base = preg_replace('/\.[a-z0-9]+$/', '', $raw);
+            $alt_base = trim(preg_replace('/[\s._\-]+/', ' ', $alt_base));
+
+            if ($f !== '' && $f === $alt_base) {
+                // (a) The alt is still shaped like a filename — hyphens or
+                // underscores with no spaces, or a trailing extension. Nobody
+                // writes that for a reader; it was pasted from the file.
+                if ((strpos($raw, ' ') === false && preg_match('/\w[_\-]\w/', $raw))
+                    || preg_match('/\.(?:jpe?g|png|gif|webp|avif|svg|bmp|tiff?)$/', $raw)) {
+                    return true;
+                }
+                // (b) A humanised echo — "Nathan Phillips Square" for
+                // nathan-phillips-square.jpg. On an SEO-named file that is a
+                // real, if terse, alt, so it stays. Only when the filename
+                // itself says nothing ("049 493 1") is the echo filler too.
+                if (!preg_match('/[a-z]{3,}/', $f)) return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Pull the upload filename out of a free-form <img> tag, skipping the
+     * data: URI that lazy-loaders park in src. Used to spot alts that are
+     * just an echo of the filename.
+     */
+    private function filename_from_img_tag($tag)
+    {
+        foreach (self::IMG_URL_ATTRS as $attr) {
+            $re = '/\b' . preg_quote($attr, '/') . '\s*=\s*["\']([^"\']+)["\']/i';
+            if (!preg_match($re, $tag, $m)) continue;
+            $url = $m[1];
+            if ($url === '' || strpos($url, 'data:') === 0) continue;
+            $path = parse_url($url, PHP_URL_PATH);
+            if (!$path) continue;
+            return basename($path);
+        }
+        return '';
+    }
+
+    /**
+     * Fill empty or placeholder `alt` attributes from _wp_attachment_image_alt
+     * when WP builds an <img> tag. Runs at priority 999 so it overrides any
+     * earlier filter (theme template explicitly passing alt="", lazy-load
+     * plugins, etc.) but respects an alt that some plugin meaningfully
+     * filled in.
      *
      * Intentionally non-destructive: only fills when the alt the caller
-     * supplied is empty AND the media library has an alt to use. Decorative
-     * images (genuinely empty library alt) are left alone.
+     * supplied is empty or filler (see is_placeholder_alt) AND the media
+     * library has an alt to use. Decorative images (genuinely empty library
+     * alt) are left alone.
      */
     public function force_attachment_alt_from_meta($attr, $attachment, $size = null)
     {
         if (!is_array($attr)) return $attr;
 
-        $current = isset($attr['alt']) ? trim((string) $attr['alt']) : '';
-        if ($current !== '') return $attr;
-
         $attachment_id = is_object($attachment) && isset($attachment->ID) ? (int) $attachment->ID : 0;
         if ($attachment_id <= 0) return $attr;
+
+        $current = isset($attr['alt']) ? trim((string) $attr['alt']) : '';
+        if ($current !== '') {
+            $file = (string) get_post_meta($attachment_id, '_wp_attached_file', true);
+            if (!$this->is_placeholder_alt($current, $file !== '' ? basename($file) : '')) {
+                return $attr;
+            }
+        }
 
         $library_alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
         if (is_string($library_alt) && trim($library_alt) !== '') {
@@ -3436,24 +3793,45 @@ class Mehrana_App_Plugin
     public function force_post_thumbnail_alt_from_meta($html, $post_id, $post_thumbnail_id, $size = null, $attr = null)
     {
         if (empty($html) || strpos($html, '<img') === false) return $html;
-        // Cheap check: nothing to fix if the HTML already carries a non-empty alt.
-        if (preg_match('/<img[^>]+alt=["\'](?!["\'])([^"\']+)["\']/i', $html)) return $html;
 
         $thumbnail_id = (int) $post_thumbnail_id;
         if ($thumbnail_id <= 0) return $html;
 
+        // Nothing to fix if the HTML already carries a real, informative alt.
+        // Empty and filler alts fall through to the library value.
+        $current = null;
+        if (preg_match('/<img[^>]+\balt\s*=\s*"([^"]*)"/i', $html, $m)) {
+            $current = $m[1];
+        } elseif (preg_match("/<img[^>]+\balt\s*=\s*'([^']*)'/i", $html, $m)) {
+            $current = $m[1];
+        }
+        if ($current !== null && trim($current) !== ''
+            && !$this->is_placeholder_alt($current, $this->filename_from_img_tag($html))) {
+            return $html;
+        }
+
         $library_alt = get_post_meta($thumbnail_id, '_wp_attachment_image_alt', true);
         if (!is_string($library_alt) || trim($library_alt) === '') return $html;
 
-        $escaped = esc_attr($library_alt);
+        // preg_replace reads $n / \n in the replacement as backreferences, so
+        // an alt containing "$1" would corrupt the tag. Neutralise it.
+        $escaped = addcslashes(esc_attr($library_alt), '\\$');
 
-        // Replace any existing empty alt attribute on an <img> tag…
+        // Replace the existing (empty or placeholder) alt attribute…
         $patched = preg_replace(
-            '/(<img[^>]*?)\salt=["\']\s*["\']/i',
+            '/(<img[^>]*?)\salt\s*=\s*"[^"]*"/i',
             '$1 alt="' . $escaped . '"',
             $html,
             1
         );
+        if ($patched === null || $patched === $html) {
+            $patched = preg_replace(
+                "/(<img[^>]*?)\salt\s*=\s*'[^']*'/i",
+                '$1 alt="' . $escaped . '"',
+                $html,
+                1
+            );
+        }
         if ($patched !== null && $patched !== $html) return $patched;
 
         // …or add one if the tag had no alt attribute at all.
@@ -3676,25 +4054,36 @@ class Mehrana_App_Plugin
 
     /**
      * Per-tag rewriter. Returns the tag unchanged if (a) alt is already
-     * non-empty, or (b) we can't confidently resolve the attachment ID,
-     * or (c) the library has no alt to fill in. Otherwise replaces an
-     * empty alt or inserts a missing one.
+     * non-empty and says something, or (b) we can't confidently resolve the
+     * attachment ID, or (c) the library has no alt to fill in. Otherwise it
+     * replaces the empty/placeholder alt or inserts a missing one.
+     *
+     * The placeholder case is what makes an alt edited in Patrick actually
+     * land on themes that hard-code filler into their own markup — a slider
+     * that prints alt="Image 3" never reads the media library, so filling
+     * only alt="" left those pages permanently stale.
      */
     private function force_alt_on_img_tag($tag, &$url_id_cache)
     {
-        // Already has non-empty alt? Respect it — that's per-occurrence
-        // intent set by the editor or theme template.
+        $current = null;
+        $has_alt_attr = false;
+        $quote = '"';
+
         if (preg_match('/\balt\s*=\s*"([^"]*)"/i', $tag, $m)) {
-            if (trim($m[1]) !== '') return $tag;
+            $current = $m[1];
             $has_alt_attr = true;
             $quote = '"';
         } elseif (preg_match("/\balt\s*=\s*'([^']*)'/i", $tag, $m)) {
-            if (trim($m[1]) !== '') return $tag;
+            $current = $m[1];
             $has_alt_attr = true;
             $quote = "'";
-        } else {
-            $has_alt_attr = false;
-            $quote = '"';
+        }
+
+        // A real alt is per-occurrence intent set by the editor or theme —
+        // respect it. Filler loses to the library value.
+        if ($has_alt_attr && trim($current) !== ''
+            && !$this->is_placeholder_alt($current, $this->filename_from_img_tag($tag))) {
+            return $tag;
         }
 
         $attachment_id = $this->resolve_attachment_id_from_img_tag($tag, $url_id_cache);
@@ -3702,14 +4091,21 @@ class Mehrana_App_Plugin
 
         $library_alt = get_post_meta($attachment_id, '_wp_attachment_image_alt', true);
         if (!is_string($library_alt) || trim($library_alt) === '') return $tag;
+        // Already saying exactly what the library says — leave the tag alone.
+        // Compared both raw and escaped: the buffer can run twice (ob_start
+        // plus a cache plugin's finalize filter) and the second pass sees the
+        // HTML-escaped form of what the first pass wrote.
+        if ($has_alt_attr && ($current === $library_alt || $current === esc_attr($library_alt))) return $tag;
 
-        $escaped = esc_attr($library_alt);
+        // preg_replace reads $n / \n in the replacement as backreferences, so
+        // an alt containing "$1" would corrupt the tag. Neutralise it.
+        $escaped = addcslashes(esc_attr($library_alt), '\\$');
 
         if ($has_alt_attr) {
-            // Replace the empty alt="" / alt='' in place.
+            // Replace the existing alt value in place, keeping its quote style.
             $pattern = $quote === '"'
-                ? '/\balt\s*=\s*"\s*"/i'
-                : "/\balt\s*=\s*'\s*'/i";
+                ? '/\balt\s*=\s*"[^"]*"/i'
+                : "/\balt\s*=\s*'[^']*'/i";
             $replacement = 'alt=' . $quote . $escaped . $quote;
             $new_tag = preg_replace($pattern, $replacement, $tag, 1, $count);
             if ($count > 0 && $new_tag !== null) return $new_tag;
@@ -3751,8 +4147,7 @@ class Mehrana_App_Plugin
 
         // URL lookup — try the attributes a rewriter is most likely to
         // have left intact, in priority order.
-        $url_attrs = ['data-orig-file', 'data-large-file', 'data-medium-file', 'src', 'data-src', 'data-lazy-src', 'data-original'];
-        foreach ($url_attrs as $attr) {
+        foreach (self::IMG_URL_ATTRS as $attr) {
             $re = '/\b' . preg_quote($attr, '/') . '\s*=\s*["\']([^"\']+)["\']/i';
             if (!preg_match($re, $tag, $m)) continue;
             $url = $m[1];
@@ -4394,6 +4789,12 @@ class Mehrana_App_Plugin
                     'url' => get_permalink($p->ID),
                     'type' => $type,
                     'post_type' => $p->post_type,
+                    // Both sit on the post row already — no meta call, so they
+                    // don't cost lite mode the thing it exists for. Patrick
+                    // reads `modified` to report what changed and when, rather
+                    // than inferring it from rendered text.
+                    'date' => mysql_to_rfc3339($p->post_date_gmt),
+                    'modified' => mysql_to_rfc3339($p->post_modified_gmt),
                 ];
             }
             return rest_ensure_response([
@@ -7931,6 +8332,48 @@ class Mehrana_App_Plugin
         ]);
     }
 
+    /** Term meta keys holding our own bookkeeping — never a reason to re-stamp. */
+    const TERM_MODIFIED_KEY = '_mehrana_modified_gmt';
+    const TERM_MODIFIED_BY_KEY = '_mehrana_modified_by';
+
+    /**
+     * Record when a term was last edited, and by whom.
+     *
+     * Fires on the term itself changing (name, slug, description). The stamp is
+     * GMT so it compares directly against post_modified_gmt.
+     *
+     * @param int    $term_id
+     * @param int    $tt_id
+     * @param string $taxonomy
+     * @return void
+     */
+    public function stamp_term_modified($term_id, $tt_id = 0, $taxonomy = '')
+    {
+        update_term_meta($term_id, self::TERM_MODIFIED_KEY, current_time('mysql', 1));
+        $user = get_current_user_id();
+        if ($user) {
+            update_term_meta($term_id, self::TERM_MODIFIED_BY_KEY, (int) $user);
+        }
+    }
+
+    /**
+     * Same stamp, for a term whose META changed rather than the term row —
+     * an SEO title or description written by Rank Math, Yoast, or by us
+     * through /terms/{id}/seo. Skips our own two keys so the stamp can't
+     * re-trigger itself.
+     *
+     * @param int    $meta_id
+     * @param int    $term_id
+     * @param string $meta_key
+     * @param mixed  $meta_value
+     * @return void
+     */
+    public function stamp_term_modified_from_meta($meta_id, $term_id, $meta_key = '', $meta_value = null)
+    {
+        if ($meta_key === self::TERM_MODIFIED_KEY || $meta_key === self::TERM_MODIFIED_BY_KEY) return;
+        $this->stamp_term_modified($term_id);
+    }
+
     /**
      * List all public taxonomy terms.
      * Returns categories, tags, WooCommerce product_cat/product_tag, and any other
@@ -7957,6 +8400,13 @@ class Mehrana_App_Plugin
             foreach ($terms as $t) {
                 $url = get_term_link($t);
                 if (is_wp_error($url)) $url = '';
+                // Null until this term is next edited: the stamp starts the day
+                // the plugin does, and inventing a date would be worse than
+                // saying we don't know.
+                $modified = get_term_meta($t->term_id, self::TERM_MODIFIED_KEY, true);
+                $modified_by = (int) get_term_meta($t->term_id, self::TERM_MODIFIED_BY_KEY, true);
+                $editor = $modified_by ? get_userdata($modified_by) : null;
+
                 $out[] = [
                     'id' => (int) $t->term_id,
                     'name' => $t->name,
@@ -7965,6 +8415,8 @@ class Mehrana_App_Plugin
                     'url' => $url,
                     'description' => $t->description,
                     'count' => (int) $t->count,
+                    'modified' => $modified ? mysql_to_rfc3339($modified) : null,
+                    'modified_by' => $editor ? $editor->display_name : null,
                 ];
             }
         }
