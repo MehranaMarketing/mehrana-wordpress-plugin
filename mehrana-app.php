@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.30.0
+ * Version: 5.30.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.30.0';
+    private $version = '5.30.1';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -92,7 +92,10 @@ class Mehrana_App_Plugin
         // in the project's Leads table. Hooks fire only after the builder
         // has accepted the submission (mail sent / entry stored), so what
         // reaches Patrick is exactly what the client received.
-        add_action('wpcf7_mail_sent', [$this, 'forward_cf7_submission'], 10, 1);
+        // CF7: hooked on wpcf7_submit (not wpcf7_mail_sent) so a lead still
+        // reaches Patrick when the host can't send the notification email —
+        // a dead mail setup must not also mean a lost lead.
+        add_action('wpcf7_submit', [$this, 'forward_cf7_submission'], 10, 2);
         add_action('fluentform/submission_inserted', [$this, 'forward_fluentform_submission'], 10, 3);
         add_action('elementor_pro/forms/new_record', [$this, 'forward_elementor_submission'], 10, 2);
 
@@ -6453,12 +6456,17 @@ class Mehrana_App_Plugin
     // =========================================================================
 
     /**
-     * Contact Form 7 — fires after the notification mail went out.
+     * Contact Form 7 — fires once the submission passed validation and spam
+     * checks, whether or not the notification email could be sent.
      */
-    public function forward_cf7_submission($contact_form)
+    public function forward_cf7_submission($contact_form, $result = [])
     {
         if (!class_exists('WPCF7_Submission')) {
             return;
+        }
+        $status = is_array($result) && isset($result['status']) ? $result['status'] : '';
+        if (!in_array($status, ['mail_sent', 'mail_failed'], true)) {
+            return; // validation_failed, spam, acceptance_missing, …
         }
         $submission = WPCF7_Submission::get_instance();
         if (!$submission) {
