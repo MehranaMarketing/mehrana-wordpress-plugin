@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.19.2
+ * Version: 5.30.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.19.2';
+    private $version = '5.30.0';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -86,6 +86,15 @@ class Mehrana_App_Plugin
 
         // Custom Head Code Hook (for Clarity, etc.)
         add_action('wp_head', [$this, 'inject_custom_head_code'], 2);
+
+        // Inbound lead webhook — every native form submission on the site is
+        // forwarded to Patrick's /api/public/lead-ingest/<token> so it lands
+        // in the project's Leads table. Hooks fire only after the builder
+        // has accepted the submission (mail sent / entry stored), so what
+        // reaches Patrick is exactly what the client received.
+        add_action('wpcf7_mail_sent', [$this, 'forward_cf7_submission'], 10, 1);
+        add_action('fluentform/submission_inserted', [$this, 'forward_fluentform_submission'], 10, 3);
+        add_action('elementor_pro/forms/new_record', [$this, 'forward_elementor_submission'], 10, 2);
 
         // On-Page Studio: JSON-LD schema markup (stored under _mehrana_schema_markup)
         // Runs at priority 5 so it lands in the <head> early, alongside GTM/custom code.
@@ -6385,6 +6394,8 @@ class Mehrana_App_Plugin
         // a public per-project identifier, not a secret.
         register_setting('map_settings', 'mehrana_crm_url');
         register_setting('map_settings', 'mehrana_lead_magnet_project_token');
+        register_setting('map_settings', 'mehrana_lead_webhook_url', ['sanitize_callback' => 'esc_url_raw']);
+        register_setting('map_settings', 'mehrana_lead_webhook_secret', ['sanitize_callback' => 'sanitize_text_field']);
     }
 
     /**
@@ -6435,6 +6446,217 @@ class Mehrana_App_Plugin
         }
         // Output the custom code as-is (already contains script tags)
         echo "\n" . $custom_code . "\n";
+    }
+
+    // =========================================================================
+    // Inbound lead webhook (form submissions → Patrick lead-ingest)
+    // =========================================================================
+
+    /**
+     * Contact Form 7 — fires after the notification mail went out.
+     */
+    public function forward_cf7_submission($contact_form)
+    {
+        if (!class_exists('WPCF7_Submission')) {
+            return;
+        }
+        $submission = WPCF7_Submission::get_instance();
+        if (!$submission) {
+            return;
+        }
+        $fields = [];
+        foreach ((array) $submission->get_posted_data() as $key => $value) {
+            // CF7 internals (_wpcf7, _wpcf7_unit_tag, …) carry nothing useful.
+            if (strpos($key, '_wpcf7') === 0) {
+                continue;
+            }
+            $fields[$key] = $value;
+        }
+        // Uploaded files are attached to the client's email, not stored;
+        // send the filenames so the lead card still shows what was sent.
+        $files = (array) $submission->uploaded_files();
+        foreach ($files as $key => $paths) {
+            $names = array_map('basename', (array) $paths);
+            $fields[$key] = implode(', ', $names);
+        }
+        $this->forward_lead_submission($fields, [
+            'plugin'    => 'contact-form-7',
+            'form_id'   => (string) $contact_form->id(),
+            'form_name' => (string) $contact_form->title(),
+            'page_url'  => (string) $submission->get_meta('url'),
+            'ip'        => (string) $submission->get_meta('remote_ip'),
+            'ua'        => (string) $submission->get_meta('user_agent'),
+        ]);
+    }
+
+    /**
+     * Fluent Forms — fires once the entry is stored.
+     */
+    public function forward_fluentform_submission($entry_id, $form_data, $form)
+    {
+        $fields = [];
+        foreach ((array) $form_data as $key => $value) {
+            if (strpos($key, '_') === 0 || in_array($key, ['__fluent_form_embded_post_id', 'action', 'data'], true)) {
+                continue;
+            }
+            $fields[$key] = $value;
+        }
+        $this->forward_lead_submission($fields, [
+            'plugin'    => 'fluentforms',
+            'form_id'   => isset($form->id) ? (string) $form->id : '',
+            'form_name' => isset($form->title) ? (string) $form->title : '',
+            'page_url'  => wp_get_referer() ?: '',
+            'ip'        => isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : '',
+            'ua'        => isset($_SERVER['HTTP_USER_AGENT']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_USER_AGENT'])) : '',
+        ]);
+    }
+
+    /**
+     * Elementor Pro forms — same event Elementor's own Webhook action uses.
+     * Lets sites drop the per-form Webhook action and rely on this one URL.
+     */
+    public function forward_elementor_submission($record, $handler)
+    {
+        if (!is_object($record) || !method_exists($record, 'get')) {
+            return;
+        }
+        $fields = [];
+        foreach ((array) $record->get('fields') as $id => $field) {
+            $fields[$id] = isset($field['value']) ? $field['value'] : '';
+        }
+        $form_settings = (array) $record->get('form_settings');
+        $this->forward_lead_submission($fields, [
+            'plugin'    => 'elementor',
+            'form_id'   => isset($form_settings['id']) ? (string) $form_settings['id'] : '',
+            'form_name' => isset($form_settings['form_name']) ? (string) $form_settings['form_name'] : '',
+            'page_url'  => wp_get_referer() ?: '',
+            'ip'        => isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'])) : '',
+            'ua'        => isset($_SERVER['HTTP_USER_AGENT']) ? sanitize_text_field(wp_unslash($_SERVER['HTTP_USER_AGENT'])) : '',
+        ]);
+    }
+
+    /**
+     * Ship one submission to the configured webhook.
+     *
+     * Payload is the flat field map the builder produced, plus canonical
+     * `name` / `email` / `phone` / `message` aliases when a field name only
+     * contains the word (CF7's "your-email", Elementor's "field_a1b2"
+     * with an email-shaped value). Patrick's ingest maps on those keys,
+     * so a client renaming a field doesn't silently break the lead card.
+     * `form_name` doubles as the campaign name on Patrick's side, so each
+     * form on the site gets its own campaign bucket.
+     */
+    private function forward_lead_submission(array $fields, array $meta)
+    {
+        $url = trim((string) get_option('mehrana_lead_webhook_url'));
+        if ($url === '' || !filter_var($url, FILTER_VALIDATE_URL)) {
+            return;
+        }
+
+        $flat = [];
+        foreach ($fields as $key => $value) {
+            if (is_array($value)) {
+                $value = implode(', ', array_map('strval', array_filter($value, 'is_scalar')));
+            }
+            if (!is_scalar($value)) {
+                continue;
+            }
+            $flat[(string) $key] = is_string($value) ? trim($value) : $value;
+        }
+
+        $aliases = [
+            'email'   => ['email', 'e-mail', 'mail'],
+            'phone'   => ['phone', 'tel', 'mobile', 'cell'],
+            'name'    => ['name', 'full-name', 'fullname'],
+            'message' => ['message', 'comment', 'note', 'details', 'inquiry'],
+        ];
+        foreach ($aliases as $canonical => $needles) {
+            if (isset($flat[$canonical]) && $flat[$canonical] !== '') {
+                continue;
+            }
+            foreach ($flat as $key => $value) {
+                $lower = strtolower($key);
+                foreach ($needles as $needle) {
+                    if (strpos($lower, $needle) !== false && $value !== '') {
+                        $flat[$canonical] = $value;
+                        continue 3;
+                    }
+                }
+            }
+            if ($canonical === 'email') {
+                foreach ($flat as $value) {
+                    if (is_string($value) && is_email($value)) {
+                        $flat['email'] = $value;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!empty($meta['form_name'])) {
+            $flat['form_name'] = $meta['form_name'];
+        }
+        if (!empty($meta['form_id'])) {
+            $flat['form_id'] = $meta['form_id'];
+        }
+        if (!empty($meta['page_url'])) {
+            $flat['page_url'] = $meta['page_url'];
+        }
+        $flat['_form_plugin'] = $meta['plugin'];
+        $flat['_site']        = home_url('/');
+        $flat['_ip']          = isset($meta['ip']) ? $meta['ip'] : '';
+        $flat['_user_agent']  = isset($meta['ua']) ? $meta['ua'] : '';
+
+        /**
+         * Let a site theme add or strip fields before the payload leaves.
+         * Return an empty array to suppress forwarding for this submission.
+         */
+        $flat = apply_filters('mehrana_lead_webhook_payload', $flat, $meta);
+        if (empty($flat)) {
+            return;
+        }
+
+        $headers = ['Content-Type' => 'application/json'];
+        $secret  = trim((string) get_option('mehrana_lead_webhook_secret'));
+        if ($secret !== '') {
+            $headers['x-webhook-secret'] = $secret;
+        }
+        if (!empty($meta['ua'])) {
+            $headers['User-Agent'] = $meta['ua'];
+        }
+        if (!empty($meta['page_url'])) {
+            $headers['Referer'] = $meta['page_url'];
+        }
+
+        // Blocking on purpose: the ingest endpoint answers in well under a
+        // second (it defers its own work), and a fire-and-forget request
+        // can be killed by PHP before the socket opens. The status is kept
+        // so the settings page can show whether the last submission arrived.
+        $response = wp_remote_post($url, [
+            'timeout' => 8,
+            'headers' => $headers,
+            'body'    => wp_json_encode($flat),
+        ]);
+
+        $status = [
+            'at'     => current_time('mysql'),
+            'plugin' => $meta['plugin'],
+            'form'   => !empty($meta['form_name']) ? $meta['form_name'] : $meta['form_id'],
+        ];
+        if (is_wp_error($response)) {
+            $status['ok']    = false;
+            $status['error'] = $response->get_error_message();
+            $this->log('Lead webhook failed: ' . $response->get_error_message());
+        } else {
+            $code = (int) wp_remote_retrieve_response_code($response);
+            $status['ok']   = $code >= 200 && $code < 300;
+            $status['code'] = $code;
+            if (!$status['ok']) {
+                $status['error'] = substr((string) wp_remote_retrieve_body($response), 0, 200);
+                $this->log('Lead webhook HTTP ' . $code . ': ' . $status['error']);
+            }
+        }
+        update_option('mehrana_lead_webhook_last', $status, false);
     }
 
     /**
@@ -6654,6 +6876,48 @@ class Mehrana_App_Plugin
                             Find this in the Mehrana CRM under <strong>Lead Magnets → Install Guide → Project Token</strong>. Same token used by the project-level popup embed; safe to publish (it's a public per-project identifier, not a secret).
                         </p>
                     </div>
+                </div>
+
+                <!-- Inbound Lead Webhook -->
+                <div class="map-card">
+                    <h2>📨 Form Submissions → Patrick</h2>
+                    <p class="description" style="margin-top:0;margin-bottom:14px;">
+                        Every submission from the site's own forms (<strong>Contact Form 7</strong>, <strong>Fluent Forms</strong>, <strong>Elementor Pro</strong>) is forwarded to this URL the moment the form accepts it, so it shows up as a lead in Patrick. Each form becomes its own campaign, named after the form.
+                    </p>
+
+                    <div class="map-field-row">
+                        <label for="mehrana_lead_webhook_url">Inbound Webhook URL</label>
+                        <input type="url" name="mehrana_lead_webhook_url" id="mehrana_lead_webhook_url"
+                            value="<?php echo esc_attr(get_option('mehrana_lead_webhook_url')); ?>"
+                            placeholder="https://app.mehrana.agency/api/public/lead-ingest/…" />
+                        <p class="description">
+                            Copy it from Patrick under <strong>Leads → Routing → Inbound webhook</strong>. Leave empty to turn forwarding off.
+                        </p>
+                    </div>
+
+                    <div class="map-field-row">
+                        <label for="mehrana_lead_webhook_secret">Shared Secret <span style="font-weight:normal;color:#666;">(optional)</span></label>
+                        <input type="text" name="mehrana_lead_webhook_secret" id="mehrana_lead_webhook_secret"
+                            value="<?php echo esc_attr(get_option('mehrana_lead_webhook_secret')); ?>"
+                            placeholder="only if Patrick's LEAD_INGEST_SECRET is set" autocomplete="off" />
+                        <p class="description">Sent as the <code>x-webhook-secret</code> header.</p>
+                    </div>
+
+                    <?php $last = get_option('mehrana_lead_webhook_last'); if (is_array($last) && !empty($last['at'])): ?>
+                    <div class="map-field-row">
+                        <label>Last submission</label>
+                        <p class="description" style="margin-top:0;">
+                            <?php if (!empty($last['ok'])): ?>
+                                <span style="color:#1a7f37;">&#10003; Delivered</span>
+                            <?php else: ?>
+                                <span style="color:#b32d2e;">&#10007; Failed<?php echo isset($last['code']) ? ' (HTTP ' . (int) $last['code'] . ')' : ''; ?></span>
+                                <?php if (!empty($last['error'])): ?> — <code><?php echo esc_html($last['error']); ?></code><?php endif; ?>
+                            <?php endif; ?>
+                            &nbsp;·&nbsp; <?php echo esc_html($last['at']); ?>
+                            &nbsp;·&nbsp; <?php echo esc_html($last['plugin']); ?><?php if (!empty($last['form'])): ?> / <?php echo esc_html($last['form']); ?><?php endif; ?>
+                        </p>
+                    </div>
+                    <?php endif; ?>
                 </div>
 
                 <!-- Tracking & Analytics -->
