@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.19.1
+ * Version: 5.19.2
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.19.1';
+    private $version = '5.19.2';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -6398,14 +6398,11 @@ class Mehrana_App_Plugin
         }
         ?>
         <!-- Google Tag Manager -->
-        <script>(fun        ct            io                  n(w, d, s, l, i)                   {
-                w[l] = w[l] || []; w[l].push({
-                    'gtm.start':
-                        new Date().getTime(), event: 'gtm.js'
-                }); var f = d.getElementsByTagName(s)[0],
-                    j = d.createEle    ment(s), dl = l != 'dataLayer' ? '    &l=' + l : '     '; j.async = true; j.src =
-                        'https://www.googletagmanager.com/gtm.js?id=' + i + dl; f.parentNode.insertBefore(j, f);
-            }) (window, document, 'script', 'dataLayer', '<?php echo esc_attr($gtm_id); ?>');</script>
+        <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+        new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+        j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+        'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+        })(window,document,'script','dataLayer','<?php echo esc_js($gtm_id); ?>');</script>
         <!-- End Google Tag Manager -->
         <?php
     }
