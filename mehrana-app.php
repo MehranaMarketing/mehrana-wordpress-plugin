@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.30.2
+ * Version: 5.31.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.30.2';
+    private $version = '5.31.0';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -98,6 +98,15 @@ class Mehrana_App_Plugin
         add_action('wpcf7_submit', [$this, 'forward_cf7_submission'], 10, 2);
         add_action('fluentform/submission_inserted', [$this, 'forward_fluentform_submission'], 10, 3);
         add_action('elementor_pro/forms/new_record', [$this, 'forward_elementor_submission'], 10, 2);
+
+        // Site error journal — what SiteWatch reads once a day. A bounded
+        // ring buffer in one option (never grows past 200 rows): PHP fatals
+        // caught at shutdown, wp_mail failures, CF7 mail failures, and lead
+        // webhook failures. WP_DEBUG_LOG is off on nearly every client host,
+        // so this journal is the only record that an error happened at all.
+        register_shutdown_function([$this, 'record_fatal_error']);
+        add_action('wp_mail_failed', [$this, 'record_mail_failure']);
+        add_action('wpcf7_mail_failed', [$this, 'record_cf7_mail_failure']);
 
         // On-Page Studio: JSON-LD schema markup (stored under _mehrana_schema_markup)
         // Runs at priority 5 so it lands in the <head> early, alongside GTM/custom code.
@@ -406,6 +415,12 @@ class Mehrana_App_Plugin
         ]);
 
         // Get logs (for debugging)
+        register_rest_route($this->namespace, '/site-errors', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_site_errors'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
         register_rest_route($this->namespace, '/logs', [
             'methods' => 'GET',
             'callback' => [$this, 'get_logs'],
@@ -6665,6 +6680,7 @@ class Mehrana_App_Plugin
             $status['ok']    = false;
             $status['error'] = $response->get_error_message();
             $this->log('Lead webhook failed: ' . $response->get_error_message());
+            $this->record_site_error('lead_webhook_failed', 'Lead from "' . $status['form'] . '" (' . $meta['plugin'] . ') did not reach Patrick: ' . $response->get_error_message());
         } else {
             $code = (int) wp_remote_retrieve_response_code($response);
             $status['ok']   = $code >= 200 && $code < 300;
@@ -6672,9 +6688,168 @@ class Mehrana_App_Plugin
             if (!$status['ok']) {
                 $status['error'] = substr((string) wp_remote_retrieve_body($response), 0, 200);
                 $this->log('Lead webhook HTTP ' . $code . ': ' . $status['error']);
+                $this->record_site_error('lead_webhook_failed', 'Lead from "' . $status['form'] . '" (' . $meta['plugin'] . ') rejected by Patrick with HTTP ' . $code . ': ' . $status['error']);
             }
         }
         update_option('mehrana_lead_webhook_last', $status, false);
+    }
+
+    // ── Site error journal ──────────────────────────────────────────────
+
+    const SITE_ERRORS_OPTION = 'mehrana_site_errors';
+    const SITE_ERRORS_MAX    = 200;
+
+    /**
+     * Append one row to the journal. Rows: t (unix), kind, message, plus
+     * optional file/line/url. Identical messages within 10 minutes collapse
+     * into one row with a count, so a fatal on every page load stays one
+     * line, not 200.
+     */
+    private function record_site_error($kind, $message, array $extra = [])
+    {
+        try {
+            $message = substr((string) $message, 0, 500);
+            $rows = get_option(self::SITE_ERRORS_OPTION, []);
+            if (!is_array($rows)) {
+                $rows = [];
+            }
+            $now  = time();
+            $last = end($rows);
+            if (is_array($last) && $last['kind'] === $kind && $last['message'] === $message && ($now - (int) $last['t']) < 600) {
+                $key = key($rows);
+                $rows[$key]['count'] = (int) ($last['count'] ?? 1) + 1;
+                $rows[$key]['t']     = $now;
+            } else {
+                $row = array_merge(['t' => $now, 'kind' => $kind, 'message' => $message, 'count' => 1], $extra);
+                if (empty($row['url']) && isset($_SERVER['REQUEST_URI'])) {
+                    $row['url'] = substr((string) $_SERVER['REQUEST_URI'], 0, 200);
+                }
+                $rows[] = $row;
+            }
+            if (count($rows) > self::SITE_ERRORS_MAX) {
+                $rows = array_slice($rows, -self::SITE_ERRORS_MAX);
+            }
+            update_option(self::SITE_ERRORS_OPTION, array_values($rows), false);
+        } catch (\Throwable $e) {
+            // Never let the journal itself take a page down.
+        }
+    }
+
+    /** register_shutdown_function: catch the fatal that ended this request. */
+    public function record_fatal_error()
+    {
+        $err = error_get_last();
+        if (!$err) {
+            return;
+        }
+        $fatal = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR];
+        if (!in_array((int) $err['type'], $fatal, true)) {
+            return;
+        }
+        $file = isset($err['file']) ? str_replace(ABSPATH, '', (string) $err['file']) : '';
+        $this->record_site_error('php_fatal', $err['message'], [
+            'file' => $file,
+            'line' => isset($err['line']) ? (int) $err['line'] : null,
+        ]);
+    }
+
+    /** wp_mail_failed: the host could not send an email (any plugin, any form). */
+    public function record_mail_failure($error)
+    {
+        $message = is_wp_error($error) ? $error->get_error_message() : 'wp_mail failed';
+        $data    = is_wp_error($error) ? $error->get_error_data() : null;
+        $to      = '';
+        if (is_array($data) && !empty($data['to'])) {
+            $to = is_array($data['to']) ? implode(', ', $data['to']) : (string) $data['to'];
+        }
+        $this->record_site_error('mail_failed', 'Email could not be sent' . ($to ? ' to ' . $to : '') . ': ' . $message);
+    }
+
+    /** wpcf7_mail_failed: a Contact Form 7 submission was accepted but its notification email failed. */
+    public function record_cf7_mail_failure($contact_form)
+    {
+        $title = is_object($contact_form) && method_exists($contact_form, 'title') ? $contact_form->title() : 'Contact Form 7';
+        $this->record_site_error('form_mail_failed', 'Contact Form 7 "' . $title . '": submission received but the notification email failed to send');
+    }
+
+    /**
+     * GET /mehrana/v1/site-errors?since=<unix>
+     * Everything SiteWatch needs for its daily "server-side" section: the
+     * journal (filtered by `since`), the tail of WP_DEBUG_LOG if the host
+     * has one, and pending core/plugin updates.
+     */
+    public function get_site_errors($request)
+    {
+        $since = (int) $request->get_param('since');
+        $rows  = get_option(self::SITE_ERRORS_OPTION, []);
+        if (!is_array($rows)) {
+            $rows = [];
+        }
+        if ($since > 0) {
+            $rows = array_values(array_filter($rows, function ($r) use ($since) {
+                return isset($r['t']) && (int) $r['t'] >= $since;
+            }));
+        }
+
+        // WP_DEBUG_LOG tail: only lines that are fatals/uncaught, only the
+        // last 24h. Most hosts don't have this file; that's fine.
+        $debug_lines = [];
+        $debug_log   = false;
+        if (defined('WP_DEBUG_LOG') && WP_DEBUG_LOG) {
+            $debug_log = is_string(WP_DEBUG_LOG) ? WP_DEBUG_LOG : WP_CONTENT_DIR . '/debug.log';
+        }
+        $debug_present = $debug_log && file_exists($debug_log);
+        if ($debug_present && is_readable($debug_log)) {
+            $size = filesize($debug_log);
+            $fh   = fopen($debug_log, 'r');
+            if ($fh) {
+                if ($size > 262144) {
+                    fseek($fh, -262144, SEEK_END);
+                    fgets($fh); // drop the partial line
+                }
+                $cutoff = $since > 0 ? $since : time() - 86400;
+                while (($line = fgets($fh)) !== false) {
+                    if (stripos($line, 'PHP Fatal') === false && stripos($line, 'PHP Parse') === false && stripos($line, 'Uncaught') === false) {
+                        continue;
+                    }
+                    $t = 0;
+                    if (preg_match('/^\[([^\]]+)\]/', $line, $m)) {
+                        $t = (int) strtotime($m[1]);
+                    }
+                    if ($t && $t < $cutoff) {
+                        continue;
+                    }
+                    $debug_lines[] = ['t' => $t ?: time(), 'kind' => 'debug_log', 'message' => substr(trim($line), 0, 500), 'count' => 1];
+                    if (count($debug_lines) >= 50) {
+                        break;
+                    }
+                }
+                fclose($fh);
+            }
+        }
+
+        $updates = ['core' => 0, 'plugins' => 0, 'themes' => 0];
+        if (function_exists('wp_get_update_data')) {
+            $u = wp_get_update_data();
+            if (!empty($u['counts'])) {
+                $updates = [
+                    'core'    => (int) ($u['counts']['wordpress'] ?? 0),
+                    'plugins' => (int) ($u['counts']['plugins'] ?? 0),
+                    'themes'  => (int) ($u['counts']['themes'] ?? 0),
+                ];
+            }
+        }
+
+        return rest_ensure_response([
+            'errors'            => array_merge($rows, $debug_lines),
+            'debug_log_present' => (bool) $debug_present,
+            'updates'           => $updates,
+            'php_version'       => PHP_VERSION,
+            'wp_version'        => get_bloginfo('version'),
+            'plugin_version'    => $this->version,
+            'lead_webhook_last' => get_option('mehrana_lead_webhook_last', null),
+            'now'               => time(),
+        ]);
     }
 
     /**
