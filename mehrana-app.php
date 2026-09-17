@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.30.1
+ * Version: 5.30.2
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.30.1';
+    private $version = '5.30.2';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -6399,6 +6399,8 @@ class Mehrana_App_Plugin
         register_setting('map_settings', 'mehrana_lead_magnet_project_token');
         register_setting('map_settings', 'mehrana_lead_webhook_url', ['sanitize_callback' => 'esc_url_raw']);
         register_setting('map_settings', 'mehrana_lead_webhook_secret', ['sanitize_callback' => 'sanitize_text_field']);
+        register_setting('map_settings', 'mehrana_lead_webhook_cf_client_id', ['sanitize_callback' => 'sanitize_text_field']);
+        register_setting('map_settings', 'mehrana_lead_webhook_cf_client_secret', ['sanitize_callback' => 'sanitize_text_field']);
     }
 
     /**
@@ -6628,6 +6630,14 @@ class Mehrana_App_Plugin
         $secret  = trim((string) get_option('mehrana_lead_webhook_secret'));
         if ($secret !== '') {
             $headers['x-webhook-secret'] = $secret;
+        }
+        // Patrick's ingest path sits behind Cloudflare Access; a per-site
+        // service token is what lets this server through.
+        $cf_id     = trim((string) get_option('mehrana_lead_webhook_cf_client_id'));
+        $cf_secret = trim((string) get_option('mehrana_lead_webhook_cf_client_secret'));
+        if ($cf_id !== '' && $cf_secret !== '') {
+            $headers['CF-Access-Client-Id']     = $cf_id;
+            $headers['CF-Access-Client-Secret'] = $cf_secret;
         }
         if (!empty($meta['ua'])) {
             $headers['User-Agent'] = $meta['ua'];
@@ -6909,6 +6919,22 @@ class Mehrana_App_Plugin
                             value="<?php echo esc_attr(get_option('mehrana_lead_webhook_secret')); ?>"
                             placeholder="only if Patrick's LEAD_INGEST_SECRET is set" autocomplete="off" />
                         <p class="description">Sent as the <code>x-webhook-secret</code> header.</p>
+                    </div>
+
+                    <div class="map-field-row">
+                        <label for="mehrana_lead_webhook_cf_client_id">Cloudflare Access Client ID</label>
+                        <input type="text" name="mehrana_lead_webhook_cf_client_id" id="mehrana_lead_webhook_cf_client_id"
+                            value="<?php echo esc_attr(get_option('mehrana_lead_webhook_cf_client_id')); ?>"
+                            placeholder="xxxxxxxx.access" autocomplete="off" />
+                    </div>
+                    <div class="map-field-row">
+                        <label for="mehrana_lead_webhook_cf_client_secret">Cloudflare Access Client Secret</label>
+                        <input type="password" name="mehrana_lead_webhook_cf_client_secret" id="mehrana_lead_webhook_cf_client_secret"
+                            value="<?php echo esc_attr(get_option('mehrana_lead_webhook_cf_client_secret')); ?>"
+                            autocomplete="new-password" />
+                        <p class="description">
+                            Patrick's webhook is behind Cloudflare Access. The agency creates one <strong>service token</strong> per site (Cloudflare One → Access → Service Auth) and pastes both values here. Sent as <code>CF-Access-Client-Id</code> / <code>CF-Access-Client-Secret</code>.
+                        </p>
                     </div>
 
                     <?php $last = get_option('mehrana_lead_webhook_last'); if (is_array($last) && !empty($last['at'])): ?>
