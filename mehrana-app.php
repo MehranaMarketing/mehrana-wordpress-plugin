@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.31.0
+ * Version: 5.31.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.31.0';
+    private $version = '5.31.1';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -3159,19 +3159,8 @@ class Mehrana_App_Plugin
                 $old_ext = '.' . $old_path_info['extension'];
                 $new_ext = '.' . $new_path_info['extension'];
 
-                // Replace main URL
-                $wpdb->query($wpdb->prepare(
-                    "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
-                    $old_url,
-                    $new_url
-                ));
-
-                // Replace in postmeta (Elementor, etc.)
-                $wpdb->query($wpdb->prepare(
-                    "UPDATE {$wpdb->postmeta} SET meta_value = REPLACE(meta_value, %s, %s)",
-                    $old_url,
-                    $new_url
-                ));
+                // Replace main URL (serialized-safe: Betheme/BeBuilder, WPBakery, widgets, options)
+                $this->replace_url_everywhere($old_url, $new_url);
 
                 // Replace thumbnail URLs (e.g., image-300x200.jpg -> image-300x200.webp)
                 // We need to match pattern like: old_base-{size}.old_ext -> new_base-{size}.new_ext
@@ -3179,18 +3168,7 @@ class Mehrana_App_Plugin
                     foreach ($old_metadata['sizes'] as $size => $size_data) {
                         $old_thumb_file = $old_path_info['dirname'] . '/' . pathinfo($size_data['file'], PATHINFO_FILENAME) . $old_ext;
                         $new_thumb_file = $new_path_info['dirname'] . '/' . pathinfo($size_data['file'], PATHINFO_FILENAME) . $new_ext;
-
-                        $wpdb->query($wpdb->prepare(
-                            "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
-                            $old_thumb_file,
-                            $new_thumb_file
-                        ));
-
-                        $wpdb->query($wpdb->prepare(
-                            "UPDATE {$wpdb->postmeta} SET meta_value = REPLACE(meta_value, %s, %s)",
-                            $old_thumb_file,
-                            $new_thumb_file
-                        ));
+                        $this->replace_url_everywhere($old_thumb_file, $new_thumb_file);
                     }
                 }
             }
@@ -3215,6 +3193,109 @@ class Mehrana_App_Plugin
      * Check if a URL looks like an image asset by extension.
      * Used to reject page URLs / non-image URLs before running DB queries.
      */
+    /**
+     * Replace a URL in post_content, postmeta and options WITHOUT corrupting PHP-serialized
+     * values. A raw SQL REPLACE() on serialized data (Betheme mfn-page-items, widgets, theme
+     * mods, WPBakery grids...) changes string lengths and makes unserialize() return false,
+     * which silently blanks whole pages. Serialized rows are unserialized, walked, and
+     * re-serialized; plain rows use str_replace; JSON rows (Elementor) get the escaped form too.
+     */
+    private function replace_url_everywhere($old_url, $new_url)
+    {
+        global $wpdb;
+        if (!$old_url || !$new_url || $old_url === $new_url) {
+            return;
+        }
+
+        // post_content is never serialized — SQL REPLACE is safe and fast here.
+        $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
+            $old_url,
+            $new_url
+        ));
+        // Elementor & other JSON stores keep URLs with escaped slashes.
+        $old_json = str_replace('/', '\\/', $old_url);
+        $new_json = str_replace('/', '\\/', $new_url);
+        if ($old_json !== $old_url) {
+            $wpdb->query($wpdb->prepare(
+                "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
+                $old_json,
+                $new_json
+            ));
+        }
+
+        $like = '%' . $wpdb->esc_like($old_url) . '%';
+        $like_json = '%' . $wpdb->esc_like($old_json) . '%';
+
+        // postmeta
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT meta_id, meta_value FROM {$wpdb->postmeta} WHERE meta_value LIKE %s OR meta_value LIKE %s",
+            $like,
+            $like_json
+        ));
+        foreach ($rows as $row) {
+            $updated = $this->replace_url_in_value($row->meta_value, $old_url, $new_url, $old_json, $new_json);
+            if ($updated !== null && $updated !== $row->meta_value) {
+                $wpdb->update($wpdb->postmeta, ['meta_value' => $updated], ['meta_id' => $row->meta_id]);
+            }
+        }
+
+        // options (theme mods, widgets, Betheme header/footer builders, customizer)
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT option_id, option_name, option_value FROM {$wpdb->options} WHERE (option_value LIKE %s OR option_value LIKE %s) AND option_name NOT LIKE %s",
+            $like,
+            $like_json,
+            '_transient%'
+        ));
+        foreach ($rows as $row) {
+            $updated = $this->replace_url_in_value($row->option_value, $old_url, $new_url, $old_json, $new_json);
+            if ($updated !== null && $updated !== $row->option_value) {
+                $wpdb->update($wpdb->options, ['option_value' => $updated], ['option_id' => $row->option_id]);
+                wp_cache_delete($row->option_name, 'options');
+            }
+        }
+        wp_cache_flush();
+    }
+
+    /** Returns the updated raw DB value, or null if it could not be processed safely. */
+    private function replace_url_in_value($raw, $old_url, $new_url, $old_json, $new_json)
+    {
+        if (!is_string($raw) || $raw === '') {
+            return null;
+        }
+        if (is_serialized($raw)) {
+            $data = @unserialize($raw);
+            if ($data === false && $raw !== 'b:0;') {
+                // Already-corrupt serialized value: leave it alone rather than make it worse.
+                $this->log("[REPLACE_MEDIA] Skipping unreadable serialized value while replacing $old_url");
+                return null;
+            }
+            $data = $this->replace_url_recursive($data, $old_url, $new_url, $old_json, $new_json);
+            return serialize($data);
+        }
+        return str_replace([$old_url, $old_json], [$new_url, $new_json], $raw);
+    }
+
+    private function replace_url_recursive($data, $old_url, $new_url, $old_json, $new_json)
+    {
+        if (is_string($data)) {
+            return str_replace([$old_url, $old_json], [$new_url, $new_json], $data);
+        }
+        if (is_array($data)) {
+            foreach ($data as $k => $v) {
+                $data[$k] = $this->replace_url_recursive($v, $old_url, $new_url, $old_json, $new_json);
+            }
+            return $data;
+        }
+        if (is_object($data)) {
+            foreach (get_object_vars($data) as $k => $v) {
+                $data->$k = $this->replace_url_recursive($v, $old_url, $new_url, $old_json, $new_json);
+            }
+            return $data;
+        }
+        return $data;
+    }
+
     private function is_image_url($url)
     {
         $path = parse_url(strtok($url, '?'), PHP_URL_PATH);
