@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.31.1
+ * Version: 5.33.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.31.1';
+    private $version = '5.33.0';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -2911,6 +2911,122 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * Replace a URL inside postmeta WITHOUT corrupting serialized values.
+     *
+     * The obvious `UPDATE ... SET meta_value = REPLACE(meta_value, old, new)`
+     * rewrites the bytes of a serialized string but leaves its length prefix
+     * (`s:9:`) describing the OLD length. PHP then refuses to unserialize the
+     * row, and a page builder that keeps its layout there silently renders an
+     * empty page — no warning, no fatal, just a blank body and a hosting bill
+     * for a site nobody can read.
+     *
+     * That is exactly how BeBuilder pages went blank after a WebP conversion:
+     * `.jpg` -> `.webp` is one byte longer, so every layout referencing that
+     * image became unreadable. Elementor survived because it stores JSON,
+     * which carries no length prefix — which is why the original raw REPLACE
+     * (commented "Elementor, etc.") looked correct for years.
+     *
+     * So: read only the rows that actually mention the URL, unserialize the
+     * ones that are serialized, walk the structure, and write them back
+     * through serialize() so the prefixes are recomputed.
+     *
+     * A row that is ALREADY corrupt — serialized-looking but unreadable — is
+     * left untouched. Rewriting it would overwrite the only copy a database
+     * restore could still recover.
+     *
+     * @param string $old URL (or path fragment) to find.
+     * @param string $new Replacement.
+     * @return int Number of rows changed.
+     */
+    private function replace_url_in_postmeta($old, $new)
+    {
+        global $wpdb;
+
+        if ($old === '' || $old === $new) {
+            return 0;
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT meta_id, post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_value LIKE %s",
+            '%' . $wpdb->esc_like($old) . '%'
+        ));
+
+        if (empty($rows)) {
+            return 0;
+        }
+
+        $changed = 0;
+        $skipped = 0;
+
+        foreach ($rows as $row) {
+            if (is_serialized($row->meta_value)) {
+                $data = @unserialize($row->meta_value);
+
+                // unserialize() returns false for the literal `b:0;` and for
+                // garbage alike. Anything else that fails is already broken.
+                if ($data === false && $row->meta_value !== 'b:0;') {
+                    $skipped++;
+                    continue;
+                }
+
+                $value = serialize($this->deep_str_replace($data, $old, $new));
+
+                // Belt and braces: never write back something we cannot read
+                // again. This is the guard the raw SQL REPLACE never had.
+                if (@unserialize($value) === false && $value !== 'b:0;') {
+                    $skipped++;
+                    continue;
+                }
+            } else {
+                $value = str_replace($old, $new, $row->meta_value);
+            }
+
+            if ($value === $row->meta_value) {
+                continue;
+            }
+
+            $wpdb->update(
+                $wpdb->postmeta,
+                ['meta_value' => $value],
+                ['meta_id' => $row->meta_id]
+            );
+            wp_cache_delete($row->post_id, 'post_meta');
+            $changed++;
+        }
+
+        $this->log("[REPLACE_MEDIA] postmeta swap '{$old}' -> '{$new}': {$changed} updated, {$skipped} skipped as already-corrupt");
+
+        return $changed;
+    }
+
+    /**
+     * str_replace that walks arrays and objects instead of stopping at the top
+     * level. Keys are left alone — page builders key by id, not by URL.
+     */
+    private function deep_str_replace($data, $old, $new)
+    {
+        if (is_string($data)) {
+            return str_replace($old, $new, $data);
+        }
+
+        if (is_array($data)) {
+            foreach ($data as $key => $value) {
+                $data[$key] = $this->deep_str_replace($value, $old, $new);
+            }
+            return $data;
+        }
+
+        if (is_object($data)) {
+            foreach (get_object_vars($data) as $key => $value) {
+                $data->$key = $this->deep_str_replace($value, $old, $new);
+            }
+            return $data;
+        }
+
+        return $data;
+    }
+
+    /**
      * Replace media with optimized version (creates backup first)
      * Expects: base64 encoded image data
      * Supports S3 offloaded files via WP Offload Media
@@ -3159,8 +3275,17 @@ class Mehrana_App_Plugin
                 $old_ext = '.' . $old_path_info['extension'];
                 $new_ext = '.' . $new_path_info['extension'];
 
-                // Replace main URL (serialized-safe: Betheme/BeBuilder, WPBakery, widgets, options)
-                $this->replace_url_everywhere($old_url, $new_url);
+                // Replace main URL
+                $wpdb->query($wpdb->prepare(
+                    "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
+                    $old_url,
+                    $new_url
+                ));
+
+                // Replace in postmeta. NOT a raw SQL REPLACE: serialized
+                // layouts (BeBuilder's mfn-page-items and friends) carry byte
+                // lengths that a blind swap would invalidate, blanking the page.
+                $this->replace_url_in_postmeta($old_url, $new_url);
 
                 // Replace thumbnail URLs (e.g., image-300x200.jpg -> image-300x200.webp)
                 // We need to match pattern like: old_base-{size}.old_ext -> new_base-{size}.new_ext
@@ -3168,7 +3293,14 @@ class Mehrana_App_Plugin
                     foreach ($old_metadata['sizes'] as $size => $size_data) {
                         $old_thumb_file = $old_path_info['dirname'] . '/' . pathinfo($size_data['file'], PATHINFO_FILENAME) . $old_ext;
                         $new_thumb_file = $new_path_info['dirname'] . '/' . pathinfo($size_data['file'], PATHINFO_FILENAME) . $new_ext;
-                        $this->replace_url_everywhere($old_thumb_file, $new_thumb_file);
+
+                        $wpdb->query($wpdb->prepare(
+                            "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
+                            $old_thumb_file,
+                            $new_thumb_file
+                        ));
+
+                        $this->replace_url_in_postmeta($old_thumb_file, $new_thumb_file);
                     }
                 }
             }
@@ -3193,109 +3325,6 @@ class Mehrana_App_Plugin
      * Check if a URL looks like an image asset by extension.
      * Used to reject page URLs / non-image URLs before running DB queries.
      */
-    /**
-     * Replace a URL in post_content, postmeta and options WITHOUT corrupting PHP-serialized
-     * values. A raw SQL REPLACE() on serialized data (Betheme mfn-page-items, widgets, theme
-     * mods, WPBakery grids...) changes string lengths and makes unserialize() return false,
-     * which silently blanks whole pages. Serialized rows are unserialized, walked, and
-     * re-serialized; plain rows use str_replace; JSON rows (Elementor) get the escaped form too.
-     */
-    private function replace_url_everywhere($old_url, $new_url)
-    {
-        global $wpdb;
-        if (!$old_url || !$new_url || $old_url === $new_url) {
-            return;
-        }
-
-        // post_content is never serialized — SQL REPLACE is safe and fast here.
-        $wpdb->query($wpdb->prepare(
-            "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
-            $old_url,
-            $new_url
-        ));
-        // Elementor & other JSON stores keep URLs with escaped slashes.
-        $old_json = str_replace('/', '\\/', $old_url);
-        $new_json = str_replace('/', '\\/', $new_url);
-        if ($old_json !== $old_url) {
-            $wpdb->query($wpdb->prepare(
-                "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
-                $old_json,
-                $new_json
-            ));
-        }
-
-        $like = '%' . $wpdb->esc_like($old_url) . '%';
-        $like_json = '%' . $wpdb->esc_like($old_json) . '%';
-
-        // postmeta
-        $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT meta_id, meta_value FROM {$wpdb->postmeta} WHERE meta_value LIKE %s OR meta_value LIKE %s",
-            $like,
-            $like_json
-        ));
-        foreach ($rows as $row) {
-            $updated = $this->replace_url_in_value($row->meta_value, $old_url, $new_url, $old_json, $new_json);
-            if ($updated !== null && $updated !== $row->meta_value) {
-                $wpdb->update($wpdb->postmeta, ['meta_value' => $updated], ['meta_id' => $row->meta_id]);
-            }
-        }
-
-        // options (theme mods, widgets, Betheme header/footer builders, customizer)
-        $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT option_id, option_name, option_value FROM {$wpdb->options} WHERE (option_value LIKE %s OR option_value LIKE %s) AND option_name NOT LIKE %s",
-            $like,
-            $like_json,
-            '_transient%'
-        ));
-        foreach ($rows as $row) {
-            $updated = $this->replace_url_in_value($row->option_value, $old_url, $new_url, $old_json, $new_json);
-            if ($updated !== null && $updated !== $row->option_value) {
-                $wpdb->update($wpdb->options, ['option_value' => $updated], ['option_id' => $row->option_id]);
-                wp_cache_delete($row->option_name, 'options');
-            }
-        }
-        wp_cache_flush();
-    }
-
-    /** Returns the updated raw DB value, or null if it could not be processed safely. */
-    private function replace_url_in_value($raw, $old_url, $new_url, $old_json, $new_json)
-    {
-        if (!is_string($raw) || $raw === '') {
-            return null;
-        }
-        if (is_serialized($raw)) {
-            $data = @unserialize($raw);
-            if ($data === false && $raw !== 'b:0;') {
-                // Already-corrupt serialized value: leave it alone rather than make it worse.
-                $this->log("[REPLACE_MEDIA] Skipping unreadable serialized value while replacing $old_url");
-                return null;
-            }
-            $data = $this->replace_url_recursive($data, $old_url, $new_url, $old_json, $new_json);
-            return serialize($data);
-        }
-        return str_replace([$old_url, $old_json], [$new_url, $new_json], $raw);
-    }
-
-    private function replace_url_recursive($data, $old_url, $new_url, $old_json, $new_json)
-    {
-        if (is_string($data)) {
-            return str_replace([$old_url, $old_json], [$new_url, $new_json], $data);
-        }
-        if (is_array($data)) {
-            foreach ($data as $k => $v) {
-                $data[$k] = $this->replace_url_recursive($v, $old_url, $new_url, $old_json, $new_json);
-            }
-            return $data;
-        }
-        if (is_object($data)) {
-            foreach (get_object_vars($data) as $k => $v) {
-                $data->$k = $this->replace_url_recursive($v, $old_url, $new_url, $old_json, $new_json);
-            }
-            return $data;
-        }
-        return $data;
-    }
-
     private function is_image_url($url)
     {
         $path = parse_url(strtok($url, '?'), PHP_URL_PATH);
@@ -3392,6 +3421,11 @@ class Mehrana_App_Plugin
      *   as3cf_obj      — matched via $as3cf global
      *   posts_guid     — matched wp_posts guid/post_name
      *   not-an-image   — URL has no image extension (page URL, etc.)
+     *   other-wp-install — same host, but the file lives under a DIFFERENT
+     *                    WordPress install's uploads dir (e.g. a /ch/ or /fr/
+     *                    sub-install). We are not that install's plugin, so we
+     *                    must not guess at a local attachment: see the scope
+     *                    guard below.
      *   not-in-library — exhausted all strategies, attachment doesn't exist
      */
     private function resolve_attachment_id($url)
@@ -3408,12 +3442,41 @@ class Mehrana_App_Plugin
 
         global $wpdb;
 
+        $upload_dir_info = wp_upload_dir();
+        $upload_base_url = isset($upload_dir_info['baseurl']) ? $upload_dir_info['baseurl'] : '';
+
         $url_variants = $this->build_url_variants($url);
 
         // Strategy 1: WP core on each URL variant (authoritative when it works)
         foreach ($url_variants as $v) {
             $id = attachment_url_to_postid($v);
             if ($id) return ['id' => intval($id), 'reason' => 'wp_core'];
+        }
+
+        // Scope guard — must sit between the authoritative lookup above and
+        // the filename fallbacks below.
+        //
+        // Patrick's crawler is scoped by HOST, but this plugin can only write
+        // to ONE WordPress install. A site that carries a second install in a
+        // subdirectory (morsunkitchencabinets.com/ch — its own wp-config, its
+        // own media library) therefore hands us URLs we can never resolve.
+        // Without this guard the filename fallbacks would "find" a local
+        // attachment that merely ends in the same characters and we'd happily
+        // compress or re-alt a completely unrelated image, then report success.
+        // Same host + an uploads path that isn't OURS = not ours. Say so.
+        $req_parts = @parse_url(strtok($url, '?'));
+        $req_path  = isset($req_parts['path']) ? $req_parts['path'] : '';
+        if ($req_path && stripos($req_path, '/wp-content/uploads/') !== false) {
+            $strip_www = function ($h) { return preg_replace('/^www\./i', '', strtolower((string) $h)); };
+            $req_host  = isset($req_parts['host']) ? $strip_www($req_parts['host']) : '';
+            $site_host = $strip_www(parse_url(home_url(), PHP_URL_HOST));
+            $our_uploads = rtrim((string) parse_url($upload_base_url, PHP_URL_PATH), '/');
+            // Only same-host URLs: a different host is a CDN/offload rewrite,
+            // which strategies 3 and 4 below are there to resolve.
+            if ($req_host && $req_host === $site_host && $our_uploads
+                && strpos($req_path, $our_uploads . '/') !== 0) {
+                return ['id' => null, 'reason' => 'other-wp-install'];
+            }
         }
 
         // Derive filename variants for LIKE matches
@@ -3425,13 +3488,21 @@ class Mehrana_App_Plugin
         $name_variants = $this->build_filename_variants($filename);
 
         // Strategy 2: _wp_attached_file (the most authoritative column in core)
+        //
+        // The match is anchored on a path separator, NOT a bare suffix. A bare
+        // '%44.jpg' also matches '2023/09/444.jpg' and
+        // '2024/01/White-L-Shape-PLCC19021-44.jpg' — short numeric filenames
+        // match almost anything, and the caller then edits that stranger's
+        // image. Values are either 'YYYY/MM/name.ext' or, when "organize by
+        // date" is off, a bare 'name.ext' — so allow both forms explicitly.
         foreach ($name_variants as $n) {
             $id = $wpdb->get_var($wpdb->prepare(
                 "SELECT post_id FROM {$wpdb->postmeta}
                  WHERE meta_key = '_wp_attached_file'
-                 AND meta_value LIKE %s
+                 AND (meta_value = %s OR meta_value LIKE %s)
                  LIMIT 1",
-                '%' . $wpdb->esc_like($n)
+                $n,
+                '%/' . $wpdb->esc_like($n)
             ));
             if ($id) return ['id' => intval($id), 'reason' => 'postmeta'];
         }
@@ -3442,10 +3513,13 @@ class Mehrana_App_Plugin
             foreach ($name_variants as $n) {
                 $id = $wpdb->get_var($wpdb->prepare(
                     "SELECT source_id FROM $as3cf_table
-                     WHERE path LIKE %s OR source_path LIKE %s
+                     WHERE path = %s OR source_path = %s
+                        OR path LIKE %s OR source_path LIKE %s
                      LIMIT 1",
-                    '%' . $wpdb->esc_like($n),
-                    '%' . $wpdb->esc_like($n)
+                    $n,
+                    $n,
+                    '%/' . $wpdb->esc_like($n),
+                    '%/' . $wpdb->esc_like($n)
                 ));
                 if ($id) return ['id' => intval($id), 'reason' => 'as3cf'];
             }
@@ -3468,7 +3542,7 @@ class Mehrana_App_Plugin
                  WHERE post_type = 'attachment'
                  AND (guid LIKE %s OR post_name = %s)
                  LIMIT 1",
-                '%' . $wpdb->esc_like($n) . '%',
+                '%/' . $wpdb->esc_like($n),
                 $basename
             ));
             if ($id) return ['id' => intval($id), 'reason' => 'posts_guid'];
