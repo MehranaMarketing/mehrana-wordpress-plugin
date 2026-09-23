@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.33.0
+ * Version: 5.34.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.33.0';
+    private $version = '5.34.0';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -432,6 +432,26 @@ class Mehrana_App_Plugin
             'methods' => 'POST',
             'callback' => [$this, 'replace_media'],
             'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // Rename an attachment's file (SEO filename), moving every size and
+        // the pre-`-scaled` original, then rewriting the embedded paths.
+        register_rest_route($this->namespace, '/media/(?P<id>\d+)/rename', [
+            'methods' => 'POST',
+            'callback' => [$this, 'rename_media'],
+            'permission_callback' => [$this, 'check_permission'],
+            'args' => [
+                'id' => [
+                    'required' => true,
+                    'validate_callback' => function ($param) {
+                        return is_numeric($param);
+                    }
+                ],
+                'filename' => [
+                    'required' => true,
+                    'sanitize_callback' => 'sanitize_text_field'
+                ],
+            ],
         ]);
 
         // Stream raw attachment bytes from disk — bypasses Cloudflare Polish
@@ -3319,6 +3339,382 @@ class Mehrana_App_Plugin
             $this->log("[REPLACE_MEDIA] CRITICAL ERROR: " . $e->getMessage() . "\n" . $e->getTraceAsString());
             return new WP_Error('fatal_error', 'Server Error: ' . $e->getMessage(), ['status' => 500]);
         }
+    }
+
+    /**
+     * Rename an attachment's file — the SEO name that shows up in the URL.
+     *
+     * On WordPress a filename is a physical file, not a label, so this moves
+     * the master, every generated size and the pre-`-scaled` original, then
+     * repoints the attachment and rewrites the old paths wherever they were
+     * embedded.
+     *
+     * Three deliberate refusals:
+     *
+     *  - It never trusts the URL the caller resolved the attachment from.
+     *    Patrick's image list is a crawl snapshot and goes stale the moment
+     *    anyone compresses an image — a `.jpg` in Patrick is a `.webp` on
+     *    disk an hour later, and resolve_attachment_id() still answers with
+     *    an id. Every path and the extension come from get_attached_file().
+     *  - It never regenerates thumbnails. No pixel changes here, and a
+     *    regenerate on a large upload would mint a second `-scaled` copy
+     *    beside the one we just moved.
+     *  - It never leaves the old URL dead. A 301 goes in by default, so
+     *    Google Images, a newsletter or a scraped copy keeps resolving.
+     *    Uploads that no longer exist fall through to index.php, which is
+     *    what lets a redirect on a static path work at all.
+     */
+    public function rename_media($request)
+    {
+        $id = intval($request['id']);
+        $requested = $request->get_param('filename');
+        $want_redirect = $request->get_param('redirect');
+        $want_redirect = ($want_redirect === null) ? true : filter_var($want_redirect, FILTER_VALIDATE_BOOLEAN);
+
+        if (!is_string($requested) || trim($requested) === '') {
+            return new WP_Error('missing_filename', 'filename is required', ['status' => 400]);
+        }
+
+        $attachment = get_post($id);
+        if (!$attachment || $attachment->post_type !== 'attachment') {
+            return new WP_Error('invalid_attachment', 'Attachment not found', ['status' => 404]);
+        }
+
+        try {
+        $current_file = get_attached_file($id);
+        if (!$current_file || !file_exists($current_file)) {
+            // The caller is working from a stale list. Say exactly what is
+            // missing instead of renaming whatever is nearest — the silent
+            // near-miss is how an unrelated image got edited once already.
+            return new WP_Error('file_missing', sprintf(
+                'The attachment exists (ID %d) but its file is not on disk: %s. The image list is out of date — re-scan before renaming.',
+                $id,
+                $current_file ? basename($current_file) : '(no path recorded)'
+            ), ['status' => 409]);
+        }
+
+        $dir      = dirname($current_file);
+        $old_base = basename($current_file);
+        $ext      = strtolower(pathinfo($current_file, PATHINFO_EXTENSION));
+        if ($ext === '') {
+            return new WP_Error('no_extension', 'The stored file has no extension; refusing to rename.', ['status' => 409]);
+        }
+
+        // WordPress keeps the pre-resize master beside a big upload and serves
+        // the `-scaled` copy. Renaming has to preserve that suffix or WP stops
+        // recognising which file it is looking at.
+        $is_scaled = (bool) preg_match('/-scaled$/i', pathinfo($old_base, PATHINFO_FILENAME));
+
+        $slug = $this->slugify_media_name($requested);
+        if ($slug === null) {
+            return new WP_Error('bad_filename', 'That name has no usable characters — use letters and numbers.', ['status' => 400]);
+        }
+
+        $target_stem = $is_scaled ? $slug . '-scaled' : $slug;
+        if ($target_stem . '.' . $ext === $old_base) {
+            return rest_ensure_response([
+                'success'   => true,
+                'unchanged' => true,
+                'filename'  => $old_base,
+                'url'       => wp_get_attachment_url($id),
+            ]);
+        }
+
+        // Never clobber a neighbour. Suffix until the whole family is free.
+        $metadata  = wp_get_attachment_metadata($id);
+        $orig_name = get_post_meta($id, '_wp_original_image', true);
+        $suffix    = 0;
+        $base_slug = $slug;
+        $stem      = $target_stem;
+        while ($this->media_name_taken($dir, $stem, $ext, $metadata, $is_scaled, $base_slug)) {
+            $suffix++;
+            if ($suffix > 50) {
+                return new WP_Error('name_taken', 'Too many files already use that name.', ['status' => 409]);
+            }
+            // Match WordPress's own shape: `name-2-scaled`, not `name-scaled-2`.
+            $base_slug = $slug . '-' . ($suffix + 1);
+            $stem      = $is_scaled ? $base_slug . '-scaled' : $base_slug;
+        }
+        $new_base    = $stem . '.' . $ext;
+        $new_file    = $dir . '/' . $new_base;
+
+        $old_url      = wp_get_attachment_url($id);
+        $old_meta     = $metadata;
+        $upload_dir   = wp_upload_dir();
+        $uploads_path = rtrim((string) @parse_url($upload_dir['baseurl'], PHP_URL_PATH), '/');
+        $sub_dir      = trim(str_replace($upload_dir['basedir'], '', $dir), '/');
+        $path_prefix  = $uploads_path . '/' . ($sub_dir === '' ? '' : $sub_dir . '/');
+
+        // Every move we make, so a failure half-way can be walked back.
+        $moved = [];
+        $move = function ($from_base, $to_base) use ($dir, &$moved) {
+            $from = $dir . '/' . $from_base;
+            $to   = $dir . '/' . $to_base;
+            if (!file_exists($from)) {
+                return false;
+            }
+            if (!@rename($from, $to)) {
+                return null; // distinct from "wasn't there"
+            }
+            $moved[] = [$to_base, $from_base];
+            return true;
+        };
+        $rollback = function () use ($move, &$moved, $dir) {
+            foreach (array_reverse($moved) as $pair) {
+                @rename($dir . '/' . $pair[0], $dir . '/' . $pair[1]);
+            }
+        };
+
+        if ($move($old_base, $new_base) !== true) {
+            $rollback();
+            return new WP_Error('rename_failed', 'Could not move the main file — check folder permissions.', ['status' => 500]);
+        }
+
+        // Generated sizes: `old-stem-300x200.jpg` -> `new-stem-300x200.jpg`.
+        $size_renames = [];
+        if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
+            foreach ($metadata['sizes'] as $size_key => $size_data) {
+                if (empty($size_data['file'])) continue;
+                $size_file = $size_data['file'];
+                $size_ext  = pathinfo($size_file, PATHINFO_EXTENSION);
+                $size_stem = pathinfo($size_file, PATHINFO_FILENAME);
+                $old_stem  = pathinfo($old_base, PATHINFO_FILENAME);
+                // Only the leading stem is ours; the `-WxH` tail stays put.
+                if (strpos($size_stem, $old_stem) !== 0) continue;
+                $tail          = substr($size_stem, strlen($old_stem));
+                $new_size_file = $stem . $tail . '.' . $size_ext;
+                if ($move($size_file, $new_size_file) === null) {
+                    $rollback();
+                    return new WP_Error('rename_failed', "Could not move the {$size_key} size — nothing was changed.", ['status' => 500]);
+                }
+                $size_renames[$size_key] = [$size_file, $new_size_file];
+                $metadata['sizes'][$size_key]['file'] = $new_size_file;
+            }
+        }
+
+        // The untouched original that sits behind a `-scaled` master.
+        $new_orig_name = null;
+        // `$orig_name === $old_base` would mean the master *is* the original;
+        // it has already been moved above and must not be recorded twice.
+        if ($orig_name && $orig_name !== $old_base) {
+            $orig_ext      = pathinfo($orig_name, PATHINFO_EXTENSION);
+            $new_orig_name = $base_slug . '.' . $orig_ext;
+            $moved_original = $move($orig_name, $new_orig_name);
+            if ($moved_original === null) {
+                $rollback();
+                return new WP_Error('rename_failed', 'Could not move the original file — nothing was changed.', ['status' => 500]);
+            }
+            if ($moved_original === false) {
+                // Recorded in meta but absent from disk. Leave the stale meta
+                // alone rather than pointing it at a file we never created.
+                $new_orig_name = null;
+            }
+        }
+
+        // Files are in place; now repoint WordPress at them.
+        update_attached_file($id, $new_file);
+        if (is_array($metadata)) {
+            if (!empty($metadata['file'])) {
+                $metadata['file'] = ltrim(($sub_dir === '' ? '' : $sub_dir . '/') . $new_base, '/');
+            }
+            wp_update_attachment_metadata($id, $metadata);
+        }
+        if ($new_orig_name) {
+            update_post_meta($id, '_wp_original_image', $new_orig_name);
+        }
+
+        $new_url = wp_get_attachment_url($id);
+
+        // Rewrite the embedded paths. We swap the uploads-relative path, not
+        // the bare filename: that single string covers both the absolute URL
+        // and the root-relative form, and cannot collide with unrelated text
+        // the way a bare `IMG_8045-1.jpg` could.
+        global $wpdb;
+        $rewrites = [[$path_prefix . $old_base, $path_prefix . $new_base]];
+        foreach ($size_renames as $pair) {
+            $rewrites[] = [$path_prefix . $pair[0], $path_prefix . $pair[1]];
+        }
+
+        $content_rows = 0;
+        $meta_rows    = 0;
+        foreach ($rewrites as $pair) {
+            $content_rows += (int) $wpdb->query($wpdb->prepare(
+                "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)
+                 WHERE post_content LIKE %s",
+                $pair[0],
+                $pair[1],
+                '%' . $wpdb->esc_like($pair[0]) . '%'
+            ));
+            // Serialized-safe: page builders store byte lengths, and a blind
+            // SQL REPLACE on those blanks the page.
+            $meta_rows += (int) $this->replace_url_in_postmeta($pair[0], $pair[1]);
+        }
+
+        $redirect = null;
+        if ($want_redirect && $old_url && $new_url && $old_url !== $new_url) {
+            $redirect = $this->register_media_redirect($old_url, $new_url);
+        }
+
+        // WP Offload Media sites keep the bytes in S3; push the new keys.
+        if (is_array($metadata)) {
+            $this->trigger_s3_reupload($id, $new_file, $metadata);
+        }
+
+        $this->log(sprintf(
+            '[RENAME_MEDIA] #%d %s -> %s | sizes:%d content:%d meta:%d redirect:%s',
+            $id,
+            $old_base,
+            $new_base,
+            count($size_renames),
+            $content_rows,
+            $meta_rows,
+            $redirect ? $redirect : 'no'
+        ));
+
+        return rest_ensure_response([
+            'success'            => true,
+            'id'                 => $id,
+            'filename'           => $new_base,
+            'previous_filename'  => $old_base,
+            'url'                => $new_url,
+            'previous_url'       => $old_url,
+            'sizes_renamed'      => count($size_renames),
+            'original_renamed'   => $new_orig_name,
+            'content_rows'       => $content_rows,
+            'postmeta_rows'      => $meta_rows,
+            'redirect'           => $redirect,
+            'renamed_to_unique'  => $suffix > 0 ? $new_base : null,
+        ]);
+
+        } catch (\Throwable $e) {
+            // Put every file back before reporting. A half-moved attachment
+            // is worse than a failed rename: the page loses the image and
+            // nothing in WordPress knows why.
+            if (isset($rollback) && is_callable($rollback)) {
+                $rollback();
+            }
+            $this->log('[RENAME_MEDIA] CRITICAL: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+            return new WP_Error('fatal_error', 'Server Error: ' . $e->getMessage(), ['status' => 500]);
+        }
+    }
+
+    /** `My Photo (2).JPG` -> `my-photo-2`. Extension is dropped: the real one
+     *  always comes from the file on disk, never from what the caller typed. */
+    private function slugify_media_name($input)
+    {
+        $trimmed = trim((string) $input);
+        if ($trimmed === '') return null;
+
+        $last_dot = strrpos($trimmed, '.');
+        $stem = ($last_dot !== false && $last_dot > 0) ? substr($trimmed, 0, $last_dot) : $trimmed;
+
+        // A caller echoing back the current name would otherwise bake the
+        // suffix in twice: `foo-scaled` -> `foo-scaled-scaled`.
+        $stem = preg_replace('/-scaled$/i', '', $stem);
+
+        $stem = remove_accents($stem);
+        $stem = strtolower($stem);
+        $stem = preg_replace('/[^a-z0-9]+/', '-', $stem);
+        $stem = trim($stem, '-');
+        $stem = substr($stem, 0, 80);
+        $stem = rtrim($stem, '-');
+
+        return strlen($stem) >= 2 ? $stem : null;
+    }
+
+    /** True when any file in the rename family would land on an existing file. */
+    private function media_name_taken($dir, $stem, $ext, $metadata, $is_scaled, $base_slug)
+    {
+        if (file_exists($dir . '/' . $stem . '.' . $ext)) {
+            return true;
+        }
+        // The pre-`-scaled` original sits under the plain slug beside it.
+        if ($is_scaled && file_exists($dir . '/' . $base_slug . '.' . $ext)) {
+            return true;
+        }
+        if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
+            foreach ($metadata['sizes'] as $size_data) {
+                if (empty($size_data['file'])) continue;
+                $size_ext = pathinfo($size_data['file'], PATHINFO_EXTENSION);
+                $tail = preg_replace('/^.*?(-\d+x\d+)$/', '$1', pathinfo($size_data['file'], PATHINFO_FILENAME));
+                if ($tail && $tail !== pathinfo($size_data['file'], PATHINFO_FILENAME)
+                    && file_exists($dir . '/' . $stem . $tail . '.' . $size_ext)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 301 the old image path to the new one. Reuses whatever redirect engine
+     * the site already runs, so the rule shows up in the same list the team
+     * edits by hand. Returns the engine name, or null when none is available.
+     */
+    private function register_media_redirect($old_url, $new_url)
+    {
+        $site_url  = home_url();
+        $from_path = str_replace($site_url, '', $old_url);
+        if (strpos($from_path, '/') !== 0) {
+            $from_path = '/' . $from_path;
+        }
+
+        global $wpdb;
+
+        // Rank Math Redirections — stores patterns slash-trimmed.
+        $rm_table = $wpdb->prefix . 'rank_math_redirections';
+        if ($wpdb->get_var("SHOW TABLES LIKE '$rm_table'") === $rm_table) {
+            $pattern = trim($from_path, '/');
+            $needle  = serialize([['pattern' => $pattern, 'comparison' => 'exact']]);
+            $exists  = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM $rm_table WHERE sources = %s AND status != 'trashed'",
+                $needle
+            ));
+            if ($exists) {
+                $wpdb->update($rm_table, [
+                    'url_to'  => $new_url,
+                    'updated' => current_time('mysql'),
+                ], ['id' => $exists]);
+                return 'rank_math';
+            }
+            $wpdb->insert($rm_table, [
+                'sources'     => $needle,
+                'url_to'      => $new_url,
+                'header_code' => 301,
+                'status'      => 'active',
+                'created'     => current_time('mysql'),
+                'updated'     => current_time('mysql'),
+            ]);
+            return $wpdb->insert_id ? 'rank_math' : null;
+        }
+
+        // Yoast Premium / Redirection plugin table.
+        $rp_table = $wpdb->prefix . 'redirection_items';
+        if ($wpdb->get_var("SHOW TABLES LIKE '$rp_table'") === $rp_table) {
+            $exists = $wpdb->get_var($wpdb->prepare(
+                "SELECT id FROM $rp_table WHERE url = %s",
+                $from_path
+            ));
+            if ($exists) {
+                return 'redirection';
+            }
+            $wpdb->insert($rp_table, [
+                'url'         => $from_path,
+                'match_url'   => $from_path,
+                'action_data' => maybe_serialize(['url' => $new_url]),
+                'action_type' => 'url',
+                'action_code' => 301,
+                'match_type'  => 'url',
+                'status'      => 'enabled',
+                'position'    => 0,
+                'regex'       => 0,
+                'group_id'    => 1,
+            ]);
+            return $wpdb->insert_id ? 'redirection' : null;
+        }
+
+        $this->log("[RENAME_MEDIA] No redirect engine found; old path $from_path will 404.");
+        return null;
     }
 
     /**
