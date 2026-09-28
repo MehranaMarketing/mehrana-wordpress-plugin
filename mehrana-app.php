@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.35.0
+ * Version: 5.36.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.35.0';
+    private $version = '5.36.0';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -35,6 +35,11 @@ class Mehrana_App_Plugin
     private $rate_limit_key = 'map_rate_limit';
     private $max_requests_per_minute = 200;
 
+    /** True once a request authenticated as Patrick; see guard_builder_layout_update(). */
+    private $patrick_request = false;
+    /** Set around our own meta-API writes of a layout (a clone's new post). */
+    private $allow_layout_meta_write = false;
+
     // GitHub Updater Config
     private $github_username = 'MehranaMarketing';
     private $github_repo = 'mehrana-wordpress-plugin';
@@ -45,6 +50,12 @@ class Mehrana_App_Plugin
         add_action('rest_api_init', [$this, 'register_routes']);
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
+
+        // BeBuilder layouts may only change through our guarded writer while a
+        // Patrick request runs (v5.36). See guard_builder_layout_update().
+        add_filter('update_post_metadata', [$this, 'guard_builder_layout_update'], 1, 5);
+        add_filter('add_post_metadata', [$this, 'guard_builder_layout_add'], 1, 5);
+        add_filter('delete_post_metadata', [$this, 'guard_builder_layout_delete'], 1, 5);
 
         // GitHub Auto-Update Hooks
         add_filter('pre_set_site_transient_update_plugins', [$this, 'check_for_github_update']);
@@ -356,6 +367,24 @@ class Mehrana_App_Plugin
             'methods' => 'POST',
             'callback' => [$this, 'bebuilder_restore'],
             'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // What a page's body is made of, whatever builder stores it (v5.36).
+        // GET: builder + every text/markup/image/link string and item heading
+        // with its key path, and the body rebuilt as HTML. POST: several
+        // guarded edits across the page's layout and the templates it
+        // renders, all-or-nothing. See the "Builder content layer" section.
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/builder', [
+            [
+                'methods' => 'GET',
+                'callback' => [$this, 'get_page_builder'],
+                'permission_callback' => [$this, 'check_permission'],
+            ],
+            [
+                'methods' => 'POST',
+                'callback' => [$this, 'update_page_builder'],
+                'permission_callback' => [$this, 'check_permission'],
+            ],
         ]);
 
         // List WordPress authors (users who have authored at least one
@@ -1819,7 +1848,9 @@ class Mehrana_App_Plugin
     private function content_html_for_parsing($post)
     {
         if (!$post || !is_string($post->post_content)) return '';
-        $html = preg_replace('/\[\/?[^\]\[]{1,200}\]/', ' ', $post->post_content);
+        // A BeBuilder page's copy is its layout, not post_content (v5.36).
+        $body = trim($post->post_content) === '' ? $this->page_body_html($post) : $post->post_content;
+        $html = preg_replace('/\[\/?[^\]\[]{1,200}\]/', ' ', $body);
         return is_string($html) ? $html : '';
     }
 
@@ -1934,7 +1965,7 @@ class Mehrana_App_Plugin
             $ex = has_excerpt($post_id) ? get_the_excerpt($post_id) : '';
         }
         if ($ex === '') {
-            $raw = $post->post_content;
+            $raw = trim($post->post_content) === '' ? $this->page_body_html($post) : $post->post_content;
             if (function_exists('excerpt_remove_blocks')) {
                 $raw = excerpt_remove_blocks($raw);
             }
@@ -2406,6 +2437,27 @@ class Mehrana_App_Plugin
             }
         }
 
+        if ($post && $this->bebuilder_is_page($page_id)) {
+            $results['builder'] = 'bebuilder';
+            $doc = $this->bebuilder_document($page_id);
+            if (!is_wp_error($doc)) {
+                foreach ($doc['sources'] as $source) {
+                    foreach ($source['nodes'] as $node) {
+                        $pos = mb_stripos(wp_strip_all_tags($node['value']), $keyword, 0, 'UTF-8');
+                        if ($pos !== false && in_array($node['role'], ['html', 'text', 'heading'], true)) {
+                            $results['found_in'][] = [
+                                'location' => 'bebuilder',
+                                'source' => $source['kind'] . ':' . $source['post_id'],
+                                'item' => ($node['item_type'] ?? 'item') . '.' . $node['field'],
+                                'path' => $node['path'],
+                                'sample' => mb_substr(wp_strip_all_tags($node['value']), max(0, $pos - 50), 150, 'UTF-8'),
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+
         $results['total_found'] = count($results['found_in']);
 
         return rest_ensure_response($results);
@@ -2487,6 +2539,7 @@ class Mehrana_App_Plugin
         if (!empty($api_key) && !empty($request_key) && hash_equals($api_key, $request_key)) {
             // API Key is valid - allow access
             $this->log('Authenticated via API Key');
+            $this->patrick_request = true;
             return true;
         }
 
@@ -2524,6 +2577,7 @@ class Mehrana_App_Plugin
             }
         }
 
+        $this->patrick_request = true;
         return true;
     }
 
@@ -2651,9 +2705,19 @@ class Mehrana_App_Plugin
      */
     private function trigger_s3_reupload($attachment_id, $local_file_path, $metadata)
     {
-        $this->log("[S3_REUPLOAD] Starting for attachment ID: $attachment_id, file: $local_file_path");
-
         global $wpdb;
+
+        // Only for sites that actually offload media. Without WP Offload Media
+        // this used to query a table that doesn't exist (a DB error on every
+        // image replace) and re-fire add_attachment for every other plugin.
+        $offload_table = $wpdb->prefix . 'as3cf_items';
+        $has_offload = isset($GLOBALS['as3cf']) || class_exists('Amazon_S3_And_CloudFront')
+            || $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $offload_table)) === $offload_table;
+        if (!$has_offload) {
+            return;
+        }
+
+        $this->log("[S3_REUPLOAD] Starting for attachment ID: $attachment_id, file: $local_file_path");
 
         // CRITICAL FIX: WP Offload Media checks current_user_can('upload_files')
         // REST API requests via API Key run as user ID 0 (Guest), so we must switch to an admin
@@ -2982,7 +3046,7 @@ class Mehrana_App_Plugin
      * @param string $new Replacement.
      * @return int Number of rows changed.
      */
-    private function replace_url_in_postmeta($old, $new)
+    private function replace_url_in_postmeta($old, $new, array &$post_ids = [])
     {
         global $wpdb;
 
@@ -2990,8 +3054,10 @@ class Mehrana_App_Plugin
             return 0;
         }
 
+        // Our own layout backups stay byte-exact: they are what a restore
+        // puts back, and their after_md5 guard must keep matching.
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT meta_id, post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_value LIKE %s",
+            "SELECT meta_id, post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_value LIKE %s AND meta_key <> '_mehrana_mfn_backup'",
             '%' . $wpdb->esc_like($old) . '%'
         ));
 
@@ -3035,6 +3101,7 @@ class Mehrana_App_Plugin
                 ['meta_id' => $row->meta_id]
             );
             wp_cache_delete($row->post_id, 'post_meta');
+            $post_ids[] = (int) $row->post_id;
             $changed++;
         }
 
@@ -3044,12 +3111,216 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * Point every reference to an image file at its new name, wherever the
+     * site stores it (v5.36). One function for all three moves Image Factory
+     * makes — WebP conversion, Undo/restore, rename — so they can't drift
+     * apart again:
+     *
+     *  - post_content, rewritten in PHP per row (a serialized post_content,
+     *    e.g. an ACF field group, is skipped rather than blanked);
+     *  - postmeta, serialized-safe, including BeBuilder layouts stored base64
+     *    ("encoded" builder storage — invisible to a LIKE search) and JSON
+     *    stores that escape slashes (Elementor: `\/wp-content\/uploads\/…`);
+     *  - options (theme options — a BeTheme logo, widgets), serialized-safe;
+     *  - BeTheme's generated per-post CSS (uploads/betheme/css/*.css), which
+     *    is where section background images are actually served from.
+     *
+     * Pass URL paths (`/wp-content/uploads/2024/08/a.jpg`), not full URLs,
+     * where possible: one string then covers absolute, protocol-relative and
+     * root-relative references alike.
+     *
+     * @return array ['content','meta','options','css_files','post_ids']
+     */
+    private function swap_media_reference($old, $new)
+    {
+        global $wpdb;
+
+        $counts = ['content' => 0, 'meta' => 0, 'options' => 0, 'css_files' => 0, 'post_ids' => []];
+        if (!is_string($old) || $old === '' || $old === $new) {
+            return $counts;
+        }
+
+        // post_content
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT ID, post_content FROM {$wpdb->posts} WHERE post_content LIKE %s",
+            '%' . $wpdb->esc_like($old) . '%'
+        ));
+        foreach ((array) $rows as $row) {
+            if (is_serialized($row->post_content)) {
+                continue;
+            }
+            $value = str_replace($old, $new, $row->post_content);
+            if ($value !== $row->post_content) {
+                $wpdb->update($wpdb->posts, ['post_content' => $value], ['ID' => $row->ID]);
+                clean_post_cache($row->ID);
+                $counts['content']++;
+                $counts['post_ids'][] = (int) $row->ID;
+            }
+        }
+
+        // postmeta: plain form, JSON-escaped form, and encoded builder layouts.
+        $escaped_old = str_replace('/', '\\/', $old);
+        $escaped_new = str_replace('/', '\\/', $new);
+        $counts['meta'] += $this->replace_url_in_postmeta($old, $new, $counts['post_ids']);
+        if ($escaped_old !== $old) {
+            $counts['meta'] += $this->replace_url_in_postmeta($escaped_old, $escaped_new, $counts['post_ids']);
+        }
+        $counts['meta'] += $this->replace_url_in_encoded_layouts($old, $new, $counts['post_ids']);
+
+        // options
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT option_id, option_name, option_value FROM {$wpdb->options}
+             WHERE option_value LIKE %s
+               AND option_name NOT LIKE %s AND option_name NOT LIKE %s
+               AND option_name NOT LIKE %s",
+            '%' . $wpdb->esc_like($old) . '%',
+            $wpdb->esc_like('_transient_') . '%',
+            $wpdb->esc_like('_site_transient_') . '%',
+            $wpdb->esc_like('mehrana_') . '%'
+        ));
+        foreach ((array) $rows as $row) {
+            $value = $this->replace_in_stored_value($row->option_value, $old, $new);
+            if ($value === null || $value === $row->option_value) {
+                continue;
+            }
+            $wpdb->update($wpdb->options, ['option_value' => $value], ['option_id' => $row->option_id]);
+            wp_cache_delete($row->option_name, 'options');
+            wp_cache_delete('alloptions', 'options');
+            wp_cache_delete('notoptions', 'options');
+            $counts['options']++;
+        }
+
+        // BeTheme's generated CSS (background images).
+        $upload = wp_upload_dir();
+        $css_dir = trailingslashit($upload['basedir']) . 'betheme/css';
+        if (is_dir($css_dir)) {
+            foreach ((array) glob($css_dir . '/*.css') as $css_file) {
+                $css = @file_get_contents($css_file);
+                if (!is_string($css) || strpos($css, $old) === false) {
+                    continue;
+                }
+                if (@file_put_contents($css_file, str_replace($old, $new, $css)) !== false) {
+                    $counts['css_files']++;
+                    if (preg_match('/post-(\d+)\.css$/', $css_file, $m)) {
+                        $counts['post_ids'][] = (int) $m[1];
+                    }
+                }
+            }
+        }
+
+        $counts['post_ids'] = array_values(array_unique($counts['post_ids']));
+        return $counts;
+    }
+
+    /**
+     * Replace inside one stored value without breaking it: serialized values
+     * are unserialized, walked and re-serialized (so length prefixes are
+     * recomputed); anything else is a plain string replace. Returns null for
+     * a value that is already corrupt or would not read back — those are
+     * never written, because overwriting them destroys what a restore could
+     * still recover.
+     */
+    private function replace_in_stored_value($stored, $old, $new)
+    {
+        if (!is_serialized($stored)) {
+            return str_replace($old, $new, $stored);
+        }
+        $data = @unserialize($stored);
+        if ($data === false && $stored !== 'b:0;') {
+            return null;
+        }
+        $value = serialize($this->deep_str_replace($data, $old, $new));
+        if (@unserialize($value) === false && $value !== 'b:0;') {
+            return null;
+        }
+        return $value;
+    }
+
+    /**
+     * BeBuilder layouts kept base64-encoded (Theme Options → Builder → Storage
+     * "encode") hide every URL from a LIKE search, so they are decoded here
+     * and rewritten through the same walk-and-reserialize as plain ones.
+     */
+    private function replace_url_in_encoded_layouts($old, $new, array &$post_ids = [])
+    {
+        global $wpdb;
+
+        $rows = $wpdb->get_results(
+            "SELECT meta_id, post_id, meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = 'mfn-page-items' AND meta_value NOT LIKE 'a:%'"
+        );
+        $changed = 0;
+        foreach ((array) $rows as $row) {
+            $payload = base64_decode((string) $row->meta_value, true);
+            if ($payload === false || !is_serialized($payload) || strpos($payload, $old) === false) {
+                continue;
+            }
+            $value = $this->replace_in_stored_value($payload, $old, $new);
+            if ($value === null || $value === $payload) {
+                continue;
+            }
+            $wpdb->update($wpdb->postmeta, ['meta_value' => base64_encode($value)], ['meta_id' => $row->meta_id]);
+            wp_cache_delete($row->post_id, 'post_meta');
+            $post_ids[] = (int) $row->post_id;
+            $changed++;
+        }
+        return $changed;
+    }
+
+    /** The path part of a URL (`/wp-content/uploads/…`), or the input when it has none. */
+    private function url_path($url)
+    {
+        $path = @parse_url((string) $url, PHP_URL_PATH);
+        return is_string($path) && $path !== '' ? $path : (string) $url;
+    }
+
+    /**
+     * Swap one attachment's files — the master and every generated size —
+     * from their old URLs to their new ones, by path and then by full URL
+     * (offloaded media can live on another host), and purge what changed.
+     *
+     * @param array $pairs [[old_url, new_url], ...]
+     */
+    private function swap_media_urls(array $pairs)
+    {
+        $total = ['content' => 0, 'meta' => 0, 'options' => 0, 'css_files' => 0, 'post_ids' => []];
+        foreach ($pairs as $pair) {
+            list($old, $new) = $pair;
+            if (!$old || !$new || $old === $new) {
+                continue;
+            }
+            foreach ([[$this->url_path($old), $this->url_path($new)], [$old, $new]] as $candidate) {
+                $r = $this->swap_media_reference($candidate[0], $candidate[1]);
+                foreach (['content', 'meta', 'options', 'css_files'] as $k) {
+                    $total[$k] += $r[$k];
+                }
+                $total['post_ids'] = array_merge($total['post_ids'], $r['post_ids']);
+            }
+        }
+        $total['post_ids'] = array_values(array_unique($total['post_ids']));
+        foreach (array_slice($total['post_ids'], 0, 50) as $pid) {
+            $this->purge_site_caches($pid);
+        }
+        return $total;
+    }
+
+    /**
      * str_replace that walks arrays and objects instead of stopping at the top
      * level. Keys are left alone — page builders key by id, not by URL.
      */
     private function deep_str_replace($data, $old, $new)
     {
         if (is_string($data)) {
+            if (strpos($data, $old) === false) {
+                return $data;
+            }
+            // Serialized data stored inside serialized data (some plugins
+            // double-encode): rewrite the inner layer properly too, or its
+            // length prefixes break while the outer layer still reads fine.
+            if (is_serialized($data)) {
+                $inner = $this->replace_in_stored_value($data, $old, $new);
+                return $inner === null ? $data : $inner;
+            }
             return str_replace($old, $new, $data);
         }
 
@@ -3175,7 +3446,11 @@ class Mehrana_App_Plugin
             // Determine the new file path
             if ($current_file) {
                 $path_info = pathinfo($current_file);
-                if ($new_extension && $path_info['extension'] !== $new_extension) {
+                // `.JPG` / `.jpeg` re-encoded as JPEG is still the same file —
+                // renaming it would move every reference for nothing.
+                $current_ext = strtolower($path_info['extension'] ?? '');
+                $same_format = $current_ext === $new_extension || ($new_extension === 'jpg' && $current_ext === 'jpeg');
+                if ($new_extension && !$same_format) {
                     $new_file = $path_info['dirname'] . '/' . $path_info['filename'] . '.' . $new_extension;
                 } else {
                     $new_file = $current_file;
@@ -3307,52 +3582,38 @@ class Mehrana_App_Plugin
             $new_url = wp_get_attachment_url($id);
             $new_metadata = wp_get_attachment_metadata($id);
 
-            // If extension changed, update URLs in post content
+            // If the extension changed, every reference to the old file (and
+            // each of its sizes) must follow it — the old files are gone.
+            $references = null;
             if ($new_file !== $current_file && $old_url) {
-                global $wpdb;
-
-                // Get old filename base (without extension)
                 $old_path_info = pathinfo($old_url);
                 $new_path_info = pathinfo($new_url);
-                $old_base = $old_path_info['dirname'] . '/' . $old_path_info['filename'];
-                $new_base = $new_path_info['dirname'] . '/' . $new_path_info['filename'];
                 $old_ext = '.' . $old_path_info['extension'];
                 $new_ext = '.' . $new_path_info['extension'];
-
-                // Replace main URL
-                $wpdb->query($wpdb->prepare(
-                    "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
-                    $old_url,
-                    $new_url
-                ));
-
-                // Replace in postmeta. NOT a raw SQL REPLACE: serialized
-                // layouts (BeBuilder's mfn-page-items and friends) carry byte
-                // lengths that a blind swap would invalidate, blanking the page.
-                $this->replace_url_in_postmeta($old_url, $new_url);
-
-                // Replace thumbnail URLs (e.g., image-300x200.jpg -> image-300x200.webp)
-                // We need to match pattern like: old_base-{size}.old_ext -> new_base-{size}.new_ext
+                $pairs = [[$old_url, $new_url]];
                 if (!empty($old_metadata['sizes'])) {
                     foreach ($old_metadata['sizes'] as $size => $size_data) {
-                        $old_thumb_file = $old_path_info['dirname'] . '/' . pathinfo($size_data['file'], PATHINFO_FILENAME) . $old_ext;
-                        $new_thumb_file = $new_path_info['dirname'] . '/' . pathinfo($size_data['file'], PATHINFO_FILENAME) . $new_ext;
-
-                        $wpdb->query($wpdb->prepare(
-                            "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)",
-                            $old_thumb_file,
-                            $new_thumb_file
-                        ));
-
-                        $this->replace_url_in_postmeta($old_thumb_file, $new_thumb_file);
+                        $stem = pathinfo($size_data['file'], PATHINFO_FILENAME);
+                        $new_size_file = !empty($new_metadata['sizes'][$size]['file'])
+                            ? $new_metadata['sizes'][$size]['file']
+                            : $stem . $new_ext;
+                        $pairs[] = [
+                            $old_path_info['dirname'] . '/' . $stem . $old_ext,
+                            $new_path_info['dirname'] . '/' . $new_size_file,
+                        ];
                     }
                 }
+                $references = $this->swap_media_urls($pairs);
+                $this->log('[REPLACE_MEDIA] references moved: ' . wp_json_encode(array_diff_key($references, ['post_ids' => 1])));
             }
 
             return rest_ensure_response([
                 'success' => true,
                 'backup_url' => $backup_url,
                 'backup_path' => $backup_path,
+                // Where the old file was still referenced and now points at
+                // the new one (null when the file name didn't change).
+                'references' => $references,
                 'new_url' => $new_url,
                 'new_size' => filesize($new_file),
                 'new_width' => $new_metadata['width'] ?? 0,
@@ -3559,19 +3820,24 @@ class Mehrana_App_Plugin
             $rewrites[] = [$path_prefix . $pair[0], $path_prefix . $pair[1]];
         }
 
+        // Same reference swap as WebP conversion and restore: post_content,
+        // serialized-safe postmeta (incl. encoded BeBuilder layouts and
+        // escaped JSON), theme options, BeTheme's generated CSS.
         $content_rows = 0;
         $meta_rows    = 0;
+        $option_rows  = 0;
+        $css_files    = 0;
+        $touched      = [];
         foreach ($rewrites as $pair) {
-            $content_rows += (int) $wpdb->query($wpdb->prepare(
-                "UPDATE {$wpdb->posts} SET post_content = REPLACE(post_content, %s, %s)
-                 WHERE post_content LIKE %s",
-                $pair[0],
-                $pair[1],
-                '%' . $wpdb->esc_like($pair[0]) . '%'
-            ));
-            // Serialized-safe: page builders store byte lengths, and a blind
-            // SQL REPLACE on those blanks the page.
-            $meta_rows += (int) $this->replace_url_in_postmeta($pair[0], $pair[1]);
+            $r = $this->swap_media_reference($pair[0], $pair[1]);
+            $content_rows += $r['content'];
+            $meta_rows    += $r['meta'];
+            $option_rows  += $r['options'];
+            $css_files    += $r['css_files'];
+            $touched       = array_merge($touched, $r['post_ids']);
+        }
+        foreach (array_slice(array_values(array_unique($touched)), 0, 50) as $pid) {
+            $this->purge_site_caches($pid);
         }
 
         $redirect = null;
@@ -3606,6 +3872,8 @@ class Mehrana_App_Plugin
             'original_renamed'   => $new_orig_name,
             'content_rows'       => $content_rows,
             'postmeta_rows'      => $meta_rows,
+            'option_rows'        => $option_rows,
+            'css_files'          => $css_files,
             'redirect'           => $redirect,
             'renamed_to_unique'  => $suffix > 0 ? $new_base : null,
         ]);
@@ -4162,6 +4430,17 @@ class Mehrana_App_Plugin
             }
         }
 
+        // ── Pass 2b: BeBuilder layouts (v5.36) ──────────────────────────
+        // A BeBuilder Image item carries its own `alt`, and the render-time
+        // enforcer rightly never overrides an alt someone typed — so without
+        // this pass the library changed, the page kept the old alt, and the
+        // next crawl reported the fix as not applied.
+        $bebuilder = $this->bebuilder_update_alt($id, $image_urls, $sanitized_alt);
+        $bebuilder_updated = $bebuilder['layouts'];
+        foreach ($bebuilder['post_ids'] as $pid) {
+            $touched_post_ids[] = (int) $pid;
+        }
+
         // ── Pass 3: featured-image usages (no write needed) ─────────────
         // Themes that render via the_post_thumbnail() already read alt from
         // _wp_attachment_image_alt, so the media-library update above is
@@ -4186,8 +4465,8 @@ class Mehrana_App_Plugin
         $purge_urls = $request->get_param('purge_urls');
         $purged = $this->purge_caches_for_alt_change($touched_post_ids, is_array($purge_urls) ? $purge_urls : []);
 
-        $posts_updated = $inline_updated + $elementor_updated;
-        $this->log("[update_media_alt] Done. inline=$inline_updated elementor=$elementor_updated featured_for=$featured_for purged=$purged");
+        $posts_updated = $inline_updated + $elementor_updated + $bebuilder_updated;
+        $this->log("[update_media_alt] Done. inline=$inline_updated elementor=$elementor_updated bebuilder=$bebuilder_updated featured_for=$featured_for purged=$purged");
 
         return rest_ensure_response([
             'success' => true,
@@ -4199,6 +4478,11 @@ class Mehrana_App_Plugin
             // visibly change a page (e.g. uses a builder we don't support).
             'inline_updated' => $inline_updated,
             'elementor_updated' => $elementor_updated,
+            'bebuilder_updated' => $bebuilder_updated,
+            // Layouts that reference the image but Patrick would not rewrite
+            // (not byte-for-byte re-savable, or edited mid-write) — the alt
+            // there has to be changed in BeBuilder.
+            'bebuilder_failed' => $bebuilder['failed'],
             'featured_for' => $featured_for,
             'caches_purged' => $purged,
             'media_alt_updated' => true
@@ -4827,7 +5111,7 @@ class Mehrana_App_Plugin
             $escaped_url = preg_quote($url, '/');
 
             // src=…alt=…
-            $pattern = '/(<img[^>]*src=["\']' . $escaped_url . '["\'][^>]*alt=["\'])([^"\']*)(["\']/i';
+            $pattern = '/(<img[^>]*src=["\']' . $escaped_url . '["\'][^>]*alt=["\'])([^"\']*)(["\'])/i';
             if (preg_match($pattern, $content)) {
                 $content = preg_replace($pattern, '$1' . esc_attr($sanitized_alt) . '$3', $content);
                 $updated = true;
@@ -4847,7 +5131,7 @@ class Mehrana_App_Plugin
         }
 
         // Gutenberg / theme: match by wp-image-ID class
-        $pattern3 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*alt=["\'])([^"\']*)(["\']/i';
+        $pattern3 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*alt=["\'])([^"\']*)(["\'])/i';
         if (preg_match($pattern3, $content)) {
             $content = preg_replace($pattern3, '$1' . esc_attr($sanitized_alt) . '$3', $content);
             $updated = true;
@@ -4950,10 +5234,15 @@ class Mehrana_App_Plugin
             return new WP_Error('missing_path', 'Backup path or filename is required', ['status' => 400]);
         }
 
-        // Validate backup exists
-        if (!file_exists($backup_path)) {
-            return new WP_Error('backup_not_found', 'Backup file not found: ' . $backup_path, ['status' => 404]);
+        // Validate backup exists — and that it IS one of our backups: this
+        // endpoint copies the file over an attachment and then deletes it, so
+        // an arbitrary path must never get through.
+        $backup_root = realpath(wp_upload_dir()['basedir'] . '/mehrana-backups');
+        $backup_real = file_exists($backup_path) ? realpath($backup_path) : false;
+        if (!$backup_real || !$backup_root || strpos($backup_real, $backup_root . DIRECTORY_SEPARATOR) !== 0) {
+            return new WP_Error('backup_not_found', 'Backup file not found: ' . basename((string) $backup_path), ['status' => 404]);
         }
+        $backup_path = $backup_real;
 
         // Get attachment
         $attachment = get_post($id);
@@ -4961,8 +5250,12 @@ class Mehrana_App_Plugin
             return new WP_Error('invalid_id', 'Invalid attachment ID', ['status' => 404]);
         }
 
-        // Get current file path
+        // Get current file path — and the URLs pages reference it by, so they
+        // can follow the file back (a WebP swap renamed .jpg → .webp; restoring
+        // renames it back and deletes the .webp).
         $current_file = get_attached_file($id);
+        $current_url = wp_get_attachment_url($id);
+        $current_metadata = wp_get_attachment_metadata($id);
 
         // Get original extension from backup
         $backup_info = pathinfo($backup_path);
@@ -5015,11 +5308,39 @@ class Mehrana_App_Plugin
         $new_url = wp_get_attachment_url($id);
         $metadata = wp_get_attachment_metadata($id);
 
+        // The file name changed (e.g. .webp back to .jpg): point every
+        // reference at the restored file and drop the old format's sizes.
+        // Before 5.36 this step was missing, so Undo deleted the .webp that
+        // every page still pointed at and the image broke.
+        $references = null;
+        if ($current_url && $new_url && $current_url !== $new_url) {
+            $pairs = [[$current_url, $new_url]];
+            $cur_dir_url = dirname($current_url);
+            $new_dir_url = dirname($new_url);
+            $cur_dir = $current_file ? dirname($current_file) : null;
+            $kept = [];
+            foreach ((array) ($metadata['sizes'] ?? []) as $size_data) {
+                $kept[$size_data['file']] = true;
+            }
+            foreach ((array) ($current_metadata['sizes'] ?? []) as $size => $size_data) {
+                if (!empty($metadata['sizes'][$size]['file'])) {
+                    $pairs[] = [$cur_dir_url . '/' . $size_data['file'], $new_dir_url . '/' . $metadata['sizes'][$size]['file']];
+                }
+                if ($cur_dir && !isset($kept[$size_data['file']]) && file_exists($cur_dir . '/' . $size_data['file'])) {
+                    @unlink($cur_dir . '/' . $size_data['file']);
+                }
+            }
+            $references = $this->swap_media_urls($pairs);
+            $this->log('[RESTORE_MEDIA] references moved back: ' . wp_json_encode(array_diff_key($references, ['post_ids' => 1])));
+        }
+
         $this->log("[RESTORE_MEDIA] SUCCESS! Restored $restore_path from backup, size: " . filesize($restore_path));
 
         return rest_ensure_response([
             'success' => true,
             'restored_url' => $new_url,
+            'previous_url' => $current_url,
+            'references' => $references,
             'size' => filesize($restore_path),
             'width' => $metadata['width'] ?? 0,
             'height' => $metadata['height'] ?? 0
@@ -5038,10 +5359,11 @@ class Mehrana_App_Plugin
             return new WP_Error('missing_data', 'Backup filename is required', ['status' => 400]);
         }
 
-        // Build backup path
+        // Build backup path. basename(): a filename, never a path out of the
+        // backups folder.
         $upload_dir = wp_upload_dir();
         $backup_dir = $upload_dir['basedir'] . '/mehrana-backups';
-        $backup_path = $backup_dir . '/' . $backup_filename;
+        $backup_path = $backup_dir . '/' . basename((string) $backup_filename);
 
         // Check if backup exists
         if (!file_exists($backup_path)) {
@@ -5097,6 +5419,19 @@ class Mehrana_App_Plugin
             $elementor_data = get_post_meta($post->ID, '_elementor_data', true);
             if ($elementor_data) {
                 $content .= ' ' . $elementor_data;
+            }
+
+            // 2b. BeBuilder: the layout (and the global sections it pulls
+            // in) is where this page's images are — post_content is empty.
+            if ($this->bebuilder_is_page($post->ID)) {
+                foreach ($this->bebuilder_image_urls($post->ID) as $bb_url) {
+                    if (strpos($bb_url, '//') === 0) {
+                        $bb_url = set_url_scheme($bb_url);
+                    } elseif (strpos($bb_url, '/') === 0) {
+                        $bb_url = home_url($bb_url);
+                    }
+                    $content .= ' src="' . esc_url($bb_url) . '"';
+                }
             }
 
             // 3. Get featured image
@@ -5414,6 +5749,9 @@ class Mehrana_App_Plugin
             // Lite mode: id/slug/title/url/post_type only — no get_post_meta,
             // no thumbnail resolution, no SEO meta fallback chain, no schema
             // decode. This is the path Patrick uses to map URLs → IDs.
+            // One query tells which of them are BeBuilder pages, so a deploy
+            // knows before it fetches anything heavy.
+            $bebuilder_ids = $this->bebuilder_layout_post_ids($pages);
             foreach ($pages as $page_id) {
                 $p = get_post($page_id);
                 if (!$p) continue;
@@ -5433,6 +5771,7 @@ class Mehrana_App_Plugin
                     // than inferring it from rendered text.
                     'date' => mysql_to_rfc3339($p->post_date_gmt),
                     'modified' => mysql_to_rfc3339($p->post_modified_gmt),
+                    'has_bebuilder' => isset($bebuilder_ids[(int) $p->ID]),
                 ];
             }
             return rest_ensure_response([
@@ -5471,8 +5810,20 @@ class Mehrana_App_Plugin
             update_meta_cache('post', array_keys($thumb_ids));
         }
 
+        $bebuilder_ids = $this->bebuilder_layout_post_ids(wp_list_pluck($pages, 'ID'));
+
         foreach ($pages as $page) {
             $elementor_data = get_post_meta($page->ID, '_elementor_data', true);
+
+            // BeBuilder pages keep post_content empty; `builder_html` is their
+            // body rebuilt from the layout, for readers (sync, migration, word
+            // counts). Never written back.
+            $is_bebuilder = isset($bebuilder_ids[(int) $page->ID]) && $this->bebuilder_is_page($page->ID);
+            $builder_html = null;
+            if ($is_bebuilder) {
+                $doc = $this->bebuilder_document($page->ID);
+                $builder_html = is_wp_error($doc) ? null : $doc['html'];
+            }
 
             // Determine page type
             $type = 'page';
@@ -5549,6 +5900,9 @@ class Mehrana_App_Plugin
                 'modified' => mysql_to_rfc3339($page->post_modified_gmt),
                 'post_author_id' => intval($page->post_author),
                 'has_elementor' => !empty($elementor_data),
+                'has_bebuilder' => $is_bebuilder,
+                'builder' => $is_bebuilder ? 'bebuilder' : (!empty($elementor_data) ? 'elementor' : 'wp'),
+                'builder_html' => $builder_html,
                 'has_redirect' => $redirect_info['has_redirect'],
                 'redirect_url' => $redirect_info['redirect_url'],
                 'elementor_data' => $elementor_data,
@@ -5600,6 +5954,15 @@ class Mehrana_App_Plugin
         }
 
         $elementor_data = get_post_meta($page->ID, '_elementor_data', true);
+
+        // A BeBuilder page's body is its layout; the rebuilt HTML is what
+        // callers read for copy (never written back).
+        $is_bebuilder = $this->bebuilder_is_page($page->ID);
+        $builder_html = null;
+        if ($is_bebuilder) {
+            $doc = $this->bebuilder_document($page->ID);
+            $builder_html = is_wp_error($doc) ? null : $doc['html'];
+        }
 
         $type = 'page';
         if ($page->post_type === 'post') {
@@ -5662,7 +6025,9 @@ class Mehrana_App_Plugin
                 'modified' => mysql_to_rfc3339($page->post_modified_gmt),
                 'post_author_id' => intval($page->post_author),
                 'has_elementor' => !empty($elementor_data),
-                'has_bebuilder' => metadata_exists('post', $page->ID, 'mfn-page-items'),
+                'has_bebuilder' => $is_bebuilder,
+                'builder' => $is_bebuilder ? 'bebuilder' : (!empty($elementor_data) ? 'elementor' : 'wp'),
+                'builder_html' => $builder_html,
                 'has_redirect' => $redirect_info['has_redirect'],
                 'redirect_url' => $redirect_info['redirect_url'],
                 'elementor_data' => $elementor_data,
@@ -5778,6 +6143,12 @@ class Mehrana_App_Plugin
             }
         }
 
+        // $depth 1 = a top-level section of the page. A hidden one renders
+        // nothing, so nothing nested in it is shown either.
+        if ($depth === 1 && $this->bebuilder_section_hidden($node)) {
+            return $refs;
+        }
+
         foreach ($node as $child) {
             if (!is_array($child)) {
                 continue;
@@ -5791,6 +6162,27 @@ class Mehrana_App_Plugin
         return $refs;
     }
 
+    /**
+     * A section BeTheme skips on the front end: the builder's "Hide" toggle
+     * (`attr.hide`, Mfn_Builder_Front::show). Its content stays in the layout
+     * but is never rendered, so a link in it is not the link visitors see —
+     * alphachildtherapy.com's Home keeps an old hidden copy of the course
+     * cards next to the live Global Section. For a global section the flag
+     * that counts is the template's own (the page copy's attr is replaced).
+     */
+    private function bebuilder_section_hidden($section)
+    {
+        return is_array($section) && isset($section['attr']) && is_array($section['attr'])
+            && !empty($section['attr']['hide']);
+    }
+
+    /** Non-empty `attr.conditions`: BeTheme conditional logic — shown only to some visitors. */
+    private function bebuilder_is_conditional($node)
+    {
+        return is_array($node) && isset($node['attr']) && is_array($node['attr'])
+            && !empty($node['attr']['conditions']);
+    }
+
     /** A string that can carry a link: HTML with an href, or a bare URL/path (button and image link fields). */
     private function bebuilder_is_link_value($value)
     {
@@ -5798,6 +6190,11 @@ class Mehrana_App_Plugin
             return false;
         }
         if (stripos($value, 'href') !== false) {
+            return true;
+        }
+        // Shortcode links: BeTheme's [button link="…"], WPBakery's
+        // link="url:…" — a Visual/Column item can hold either.
+        if (preg_match('/\[[a-z_]+[^\]]*\blink\s*=\s*["\']/i', $value) || stripos($value, 'url:') !== false) {
             return true;
         }
         $trimmed = trim($value);
@@ -5814,11 +6211,12 @@ class Mehrana_App_Plugin
      * same URL apart). Subtrees that are another template's global
      * section/wrap are skipped: they are not what renders.
      */
-    private function bebuilder_collect_links($node, array $path, array &$out, $owner_id, &$non_utf8 = 0, $depth = 0)
+    private function bebuilder_collect_links($node, array $path, array &$out, $owner_id, &$non_utf8 = 0, $conditional = false, $depth = 0)
     {
         if (!is_array($node) || $depth > 64) {
             return;
         }
+        $conditional = $conditional || $this->bebuilder_is_conditional($node);
 
         $sid = $node['mfn_global_section_id'] ?? null;
         if (!empty($sid) && is_numeric($sid) && (int) $sid !== (int) $owner_id) {
@@ -5855,9 +6253,16 @@ class Mehrana_App_Plugin
                         break;
                     }
                 }
-                $out[] = ['path' => $child_path, 'value' => $value, 'siblings' => (object) $siblings];
+                $out[] = [
+                    'path' => $child_path,
+                    'value' => $value,
+                    'siblings' => (object) $siblings,
+                    // Inside a section/wrap/item with conditional logic: shown
+                    // to some visitors only, so not necessarily what a crawl saw.
+                    'conditional' => $conditional,
+                ];
             } elseif (is_array($value)) {
-                $this->bebuilder_collect_links($value, $child_path, $out, $owner_id, $non_utf8, $depth + 1);
+                $this->bebuilder_collect_links($value, $child_path, $out, $owner_id, $non_utf8, $conditional, $depth + 1);
             }
         }
     }
@@ -5934,7 +6339,18 @@ class Mehrana_App_Plugin
 
         $links = [];
         $non_utf8 = 0;
-        $this->bebuilder_collect_links($layout['items'], [], $links, $page_id, $non_utf8);
+        $hidden_sections = 0;
+        foreach ($layout['items'] as $index => $section) {
+            if (!is_array($section)) {
+                continue;
+            }
+            $sid = $section['mfn_global_section_id'] ?? null;
+            if ((empty($sid) || !is_numeric($sid)) && $this->bebuilder_section_hidden($section)) {
+                $hidden_sections++;
+                continue;
+            }
+            $this->bebuilder_collect_links($section, [$index], $links, $page_id, $non_utf8);
+        }
         $sources = [[
             'post_id' => $page_id,
             'kind' => 'page',
@@ -5943,6 +6359,7 @@ class Mehrana_App_Plugin
             'writable' => $layout['round_trips'],
             'links' => $links,
             'skipped_non_utf8' => $non_utf8,
+            'hidden_sections' => $hidden_sections,
         ]];
 
         foreach ($this->bebuilder_global_refs($layout['items']) as $tid => $kind) {
@@ -5971,7 +6388,16 @@ class Mehrana_App_Plugin
                     : ($template['items'][0]['wraps'] ?? null);
                 $template_links = [];
                 $template_non_utf8 = 0;
-                $this->bebuilder_collect_links($node, $root, $template_links, $tid, $template_non_utf8);
+                $first = $template['items'][0] ?? null;
+                if ($kind === 'global_section' && $this->bebuilder_section_hidden($first)) {
+                    // The template's own Hide toggle: rendered nowhere.
+                    $source['hidden'] = true;
+                    $node = null;
+                }
+                $this->bebuilder_collect_links(
+                    $node, $root, $template_links, $tid, $template_non_utf8,
+                    $kind === 'global_section' && $this->bebuilder_is_conditional($first)
+                );
                 $source['storage'] = $template['storage'];
                 $source['writable'] = $template['round_trips'];
                 $source['links'] = $template_links;
@@ -6071,115 +6497,27 @@ class Mehrana_App_Plugin
             return $kind;
         }
 
-        $layout = $this->bebuilder_read_layout($target_id);
-        if (is_wp_error($layout)) {
-            return $layout;
-        }
-        if (!$layout['round_trips']) {
-            return new WP_Error('layout_not_round_trippable', "Post {$target_id}'s BeBuilder layout would not re-save byte-for-byte, so Patrick won't rewrite it. Edit this link in BeBuilder.", ['status' => 409]);
-        }
-
-        $items = $layout['items'];
-        $node = &$items;
-        foreach ($path as $key) {
-            if (!is_array($node)) {
-                unset($node);
-                return new WP_Error('path_not_found', 'That value is no longer in the layout — reload and try again', ['status' => 409]);
-            }
-            if (!array_key_exists($key, $node)) {
-                if (is_string($key) && ctype_digit($key) && array_key_exists((int) $key, $node)) {
-                    $key = (int) $key;
-                } else {
-                    unset($node);
-                    return new WP_Error('path_not_found', 'That value is no longer in the layout — reload and try again', ['status' => 409]);
-                }
-            }
-            $node = &$node[$key];
-        }
-        if (!is_string($node) || $node !== $expected) {
-            unset($node);
-            return new WP_Error('stale', 'The layout changed since Patrick read it (someone saved it in BeBuilder?) — reload and try again', ['status' => 409]);
-        }
-        $node = $value;
-        unset($node);
-
-        $payload = serialize($items);
-        $new_raw = $layout['storage'] === 'encoded' ? base64_encode($payload) : $payload;
-
-        // Rollback copy first. Keep the previous one to put back if this
-        // attempt ends up writing nothing.
-        $previous_backup = get_post_meta($target_id, '_mehrana_mfn_backup', true);
-        $restore_previous_backup = function () use ($target_id, $previous_backup) {
-            if (is_array($previous_backup) && isset($previous_backup['raw'])) {
-                update_post_meta($target_id, '_mehrana_mfn_backup', wp_slash($previous_backup));
-            } else {
-                delete_post_meta($target_id, '_mehrana_mfn_backup');
-            }
-        };
-        update_post_meta($target_id, '_mehrana_mfn_backup', wp_slash([
-            'saved_at' => time(),
-            'storage' => $layout['storage'],
-            'raw' => $layout['raw'],
-            'after_md5' => md5($new_raw),
-        ]));
-        $saved = get_post_meta($target_id, '_mehrana_mfn_backup', true);
-        if (!is_array($saved) || !isset($saved['raw']) || $saved['raw'] !== $layout['raw']) {
-            $restore_previous_backup();
-            return new WP_Error('backup_failed', 'Could not save a backup of the layout, so nothing was changed.', ['status' => 500]);
-        }
-
-        $updated = $wpdb->query($wpdb->prepare(
-            "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
-            $new_raw,
-            $layout['meta_id'],
-            md5($layout['raw'])
-        ));
-        wp_cache_delete($target_id, 'post_meta');
-
-        if ($updated === false) {
-            $restore_previous_backup();
-            return new WP_Error('db_error', 'Database update failed: ' . $wpdb->last_error, ['status' => 500]);
-        }
-        if ($updated === 0) {
-            $restore_previous_backup();
-            return new WP_Error('stale', 'The layout changed while Patrick was writing (someone saved it in BeBuilder?) — reload and try again', ['status' => 409]);
-        }
-
-        $check = $this->bebuilder_read_layout($target_id);
-        if (is_wp_error($check) || $check['raw'] !== $new_raw) {
-            $now = (string) $wpdb->get_var($wpdb->prepare(
-                "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_id = %d",
-                $layout['meta_id']
-            ));
-            $rolled_back = $wpdb->query($wpdb->prepare(
-                "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
-                $layout['raw'],
-                $layout['meta_id'],
-                md5($now)
-            ));
-            wp_cache_delete($target_id, 'post_meta');
-            $this->purge_site_caches($page_id);
-            if ($rolled_back) {
-                $restore_previous_backup();
-                $this->log("[BEBUILDER] Write to post {$target_id} did not read back as written — previous layout put back");
-                return new WP_Error('write_not_verified', 'The database did not keep the change exactly as written, so the previous layout was put back.', ['status' => 500]);
-            }
-            $this->log("[BEBUILDER] Write to post {$target_id} did not read back as written, and the row changed again before rollback — left as is");
-            return new WP_Error('write_not_verified', 'The database did not keep the change exactly as written, and the layout changed again before Patrick could put it back — check this page in BeBuilder. The previous layout is kept in the Patrick backup.', ['status' => 500]);
+        $written = $this->bebuilder_write_edits($target_id, [[
+            'path' => $path,
+            'expected' => $expected,
+            'value' => $value,
+        ]]);
+        if (is_wp_error($written)) {
+            return $written;
         }
 
         $used_by = $this->bebuilder_purge($page_id, $target_id, $kind);
 
-        $this->log("[BEBUILDER] Page {$page_id}: rewrote one value in {$kind} {$target_id} (" . strlen($layout['raw']) . ' → ' . strlen($new_raw) . ' bytes, ' . count($used_by) . ' page(s) share it)');
+        $this->log("[BEBUILDER] Page {$page_id}: rewrote one value in {$kind} {$target_id} (" . $written['bytes_before'] . ' → ' . $written['bytes_after'] . ' bytes, ' . count($used_by) . ' page(s) share it)');
 
         return rest_ensure_response([
             'success' => true,
             'page_id' => $page_id,
             'target_id' => $target_id,
             'kind' => $kind,
-            'storage' => $layout['storage'],
-            'bytes_before' => strlen($layout['raw']),
-            'bytes_after' => strlen($new_raw),
+            'storage' => $written['storage'],
+            'bytes_before' => $written['bytes_before'],
+            'bytes_after' => $written['bytes_after'],
             'used_by' => $used_by,
         ]);
     }
@@ -6258,6 +6596,1303 @@ class Mehrana_App_Plugin
         $this->log("[BEBUILDER] Restored post {$target_id} from the backup taken " . gmdate('c', (int) ($backup['saved_at'] ?? 0)));
 
         return rest_ensure_response(['success' => true, 'target_id' => $target_id, 'restored_bytes' => strlen($backup['raw'])]);
+    }
+
+    // ============================================================
+    // Builder content layer (v5.36.0)
+    // ============================================================
+    //
+    // One place that knows where a page's visible content is stored, so every
+    // Patrick app — LinkLab, Link Building, Image Factory, On-Page Studio,
+    // Content Factory, page cloning, the native-site migration — reads and
+    // writes it the same way. Until 5.36 each of those carried its own
+    // "post_content or Elementor" assumption, which is why one new builder
+    // (BeTheme's BeBuilder on alphachildtherapy.com) surfaced as a separate
+    // bug in every app.
+    //
+    // A BeBuilder page keeps post_content empty. Its copy lives in the
+    // serialized `mfn-page-items` meta — sections → wraps → items, each item's
+    // fields under `attr` (`fields` on older BeTheme) — plus the Global
+    // Sections / Global Wraps it pulls in from template posts. Everything
+    // below reads that tree through bebuilder_read_layout() and writes it
+    // through bebuilder_write_edits(), never with a string replace on the
+    // stored bytes.
+
+    /** BeTheme (or a child theme of it) is active, so BeBuilder layouts are what renders. */
+    private function bebuilder_theme_active()
+    {
+        return get_template() === 'betheme' || defined('MFN_THEME_VERSION') || class_exists('Mfn_Builder_Front');
+    }
+
+    /**
+     * Whether $post_id renders a BeBuilder layout: BeTheme is active and the
+     * post has a layout with at least one section. BeTheme can leave an empty
+     * `mfn-page-items` row behind on posts that never used the builder, so
+     * the row existing is not enough. An unreadable (corrupt) layout still
+     * counts — the page IS a BeBuilder page, just a broken one, and callers
+     * must never fall back to writing post_content over it.
+     */
+    private function bebuilder_is_page($post_id)
+    {
+        if (!$this->bebuilder_theme_active()) {
+            return false;
+        }
+        $layout = $this->bebuilder_read_layout((int) $post_id);
+        if (is_wp_error($layout)) {
+            return in_array($layout->get_error_code(), ['unreadable_layout', 'ambiguous_layout'], true);
+        }
+        foreach ($layout['items'] as $section) {
+            if (is_array($section)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Which store renders this post's body: 'bebuilder', 'elementor', or 'wp'
+     * (post_content — Gutenberg, classic, WPBakery shortcodes).
+     */
+    private function page_builder($post_id)
+    {
+        if ($this->bebuilder_is_page($post_id)) {
+            return 'bebuilder';
+        }
+        $elementor = get_post_meta($post_id, '_elementor_data', true);
+        return !empty($elementor) ? 'elementor' : 'wp';
+    }
+
+    /**
+     * The subset of $ids that carry a non-empty BeBuilder layout, in one query
+     * per 500 ids — for listings, where reading every layout would cost the
+     * listing the speed it exists for. ('a:0:{}' and its base64 are shorter
+     * than 13 bytes.)
+     *
+     * @return array<int,bool>
+     */
+    private function bebuilder_layout_post_ids(array $ids)
+    {
+        global $wpdb;
+
+        if (empty($ids) || !$this->bebuilder_theme_active()) {
+            return [];
+        }
+        $found = [];
+        foreach (array_chunk(array_map('intval', $ids), 500) as $chunk) {
+            $in = implode(',', $chunk);
+            $rows = $wpdb->get_col(
+                "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = 'mfn-page-items' AND post_id IN ({$in}) AND LENGTH(meta_value) > 12"
+            );
+            foreach ((array) $rows as $pid) {
+                $found[(int) $pid] = true;
+            }
+        }
+        return $found;
+    }
+
+    /**
+     * Every layout page $page_id renders, in render order: the page's own
+     * layout, then each published Global Section / Global Wrap it pulls in.
+     * `node` is the part that renders (the page's sections; a template's
+     * first section, or that section's wraps) and `root` the key path to it.
+     *
+     * @return array|WP_Error
+     */
+    private function bebuilder_sources($page_id, $with_used_by = false)
+    {
+        $layout = $this->bebuilder_read_layout($page_id);
+        if (is_wp_error($layout)) {
+            return $layout;
+        }
+
+        $sources = [[
+            'post_id' => (int) $page_id,
+            'kind' => 'page',
+            'title' => get_the_title($page_id),
+            'layout' => $layout,
+            'node' => $layout['items'],
+            'root' => [],
+            'hidden' => false,
+            'conditional' => false,
+        ]];
+
+        foreach ($this->bebuilder_global_refs($layout['items']) as $tid => $kind) {
+            // BeTheme skips a global section/wrap whose template isn't published.
+            if (get_post_status($tid) !== 'publish') {
+                continue;
+            }
+            $source = [
+                'post_id' => (int) $tid,
+                'kind' => $kind,
+                'title' => get_the_title($tid),
+                'layout' => null,
+                'node' => null,
+                'root' => $kind === 'global_section' ? [0] : [0, 'wraps'],
+                'hidden' => false,
+                'conditional' => false,
+            ];
+            if ($with_used_by) {
+                $source['used_by'] = $this->bebuilder_template_users($tid);
+            }
+            $template = $this->bebuilder_read_layout($tid);
+            if (is_wp_error($template)) {
+                $source['error'] = $template->get_error_message();
+                $sources[] = $source;
+                continue;
+            }
+            $source['layout'] = $template;
+            $first = $template['items'][0] ?? null;
+            if ($kind === 'global_section') {
+                $source['conditional'] = $this->bebuilder_is_conditional($first);
+                if ($this->bebuilder_section_hidden($first)) {
+                    // The template's own Hide toggle: rendered nowhere.
+                    $source['hidden'] = true;
+                } else {
+                    $source['node'] = $first;
+                }
+            } else {
+                $source['node'] = $first['wraps'] ?? null;
+            }
+            $sources[] = $source;
+        }
+
+        return $sources;
+    }
+
+    /**
+     * Walk the part of a layout that renders, depth-first in render order.
+     * $on_item($item, $path, $conditional) fires on every builder item (a node
+     * with a string `type` and an `attr`/`fields` array); $on_string($key,
+     * $value, $path, $parent, $item, $conditional) on every string leaf. A
+     * subtree that is another template's global section/wrap is skipped —
+     * what renders there is that template, listed as its own source.
+     */
+    private function bebuilder_walk($node, array $path, $owner_id, $on_string, $on_item = null, $conditional = false, $item = null, $depth = 0)
+    {
+        if (!is_array($node) || $depth > 64) {
+            return;
+        }
+        $conditional = $conditional || $this->bebuilder_is_conditional($node);
+
+        $sid = $node['mfn_global_section_id'] ?? null;
+        if (!empty($sid) && is_numeric($sid) && (int) $sid !== (int) $owner_id) {
+            return;
+        }
+        if (isset($node['attr']) && is_array($node['attr'])) {
+            $wid = $node['attr']['global_wraps_select'] ?? null;
+            if (!empty($wid) && intval($wid) && (int) $wid !== (int) $owner_id) {
+                return;
+            }
+        }
+
+        if (isset($node['type']) && is_string($node['type'])
+            && ((isset($node['attr']) && is_array($node['attr'])) || (isset($node['fields']) && is_array($node['fields'])))) {
+            $item = [
+                'type' => $node['type'],
+                'uid' => isset($node['uid']) && is_scalar($node['uid']) ? (string) $node['uid'] : null,
+                'path' => $path,
+            ];
+            if ($on_item) {
+                call_user_func($on_item, $node, $path, $conditional);
+            }
+        }
+
+        foreach ($node as $key => $value) {
+            $child = $path;
+            $child[] = $key;
+            if (is_string($value)) {
+                call_user_func($on_string, $key, $value, $child, $node, $item, $conditional);
+            } elseif (is_array($value)) {
+                $this->bebuilder_walk($value, $child, $owner_id, $on_string, $on_item, $conditional, $item, $depth + 1);
+            }
+        }
+    }
+
+    /** Walk one source's rendered part, skipping the page's hidden top-level sections. Returns how many were skipped. */
+    private function bebuilder_walk_source(array $source, $on_string, $on_item = null)
+    {
+        if ($source['node'] === null) {
+            return 0;
+        }
+        if ($source['kind'] !== 'page') {
+            $this->bebuilder_walk($source['node'], $source['root'], $source['post_id'], $on_string, $on_item, $source['conditional']);
+            return 0;
+        }
+        $hidden = 0;
+        foreach ($source['node'] as $index => $section) {
+            if (!is_array($section)) {
+                continue;
+            }
+            $sid = $section['mfn_global_section_id'] ?? null;
+            if ((empty($sid) || !is_numeric($sid)) && $this->bebuilder_section_hidden($section)) {
+                $hidden++;
+                continue;
+            }
+            $this->bebuilder_walk($section, [$index], $source['post_id'], $on_string, $on_item);
+        }
+        return $hidden;
+    }
+
+    /**
+     * Keys that hold a setting, never copy a visitor reads: ids, styles,
+     * sizes, colors, icons, links/media (listed under their own roles), tags.
+     * Numeric keys are list entries (FAQ tabs, list rows) and never settings.
+     */
+    private function bebuilder_setting_key($key)
+    {
+        if (!is_string($key)) {
+            return false;
+        }
+        $k = strtolower($key);
+        if (strpos($k, 'style:') === 0 || strpos($k, 'css') !== false || strpos($k, 'class') !== false) {
+            return true;
+        }
+        return (bool) preg_match(
+            '/^(uid|type|size|[a-z]+_size|custom_id|id|ids|animate|animation|conditions|used_fonts|icon|.*_icon|icon_.*|.*align.*|.*color.*|.*font.*|target|rel|.*link.*|href|.*url.*|.*src.*|.*image.*|.*video.*|.*poster.*|mp4|webm|ogv|.*tag|style|.*_style|layout|.*_layout|bg.*|.*background.*|hover.*|.*_hover|width|height|.*_width|.*_height|border.*|.*margin.*|.*padding.*|opacity|z_index|visibility|hide.*|.*_hide|template|.*_template|popup.*|.*lightbox.*|greyscale|stretch|parallax|autoplay|loop|mute|controls|speed|.*delay.*|duration|easing|query_.*|post_type|taxonomy|category|.*_category|orderby|order|limit|offset|columns|count)$/',
+            $k
+        );
+    }
+
+    /**
+     * What a layout string is to a visitor: 'image' (an image URL — src,
+     * background), 'link' (a bare URL/path — button or image link), 'alt'
+     * (an image item's own alt text), 'html' (rich text: markup or
+     * shortcodes), 'text' (plain visible copy), or null
+     * (a setting). Invalid UTF-8 is null too: JSON can't carry it
+     * byte-for-byte, so Patrick could never write it back.
+     */
+    private function bebuilder_classify($key, $value)
+    {
+        if ($value === '' || preg_match('//u', $value) !== 1) {
+            return null;
+        }
+        $trim = trim($value);
+        if ($trim === '') {
+            return null;
+        }
+        if (!preg_match('/\s/', $trim) && preg_match('#^((https?:)?//|/)#i', $trim)) {
+            if (preg_match('#\.(jpe?g|png|gif|webp|svg|avif|bmp)(\?\S*)?$#i', $trim) || strpos($trim, '/wp-content/uploads/') !== false) {
+                return 'image';
+            }
+            return 'link';
+        }
+        if (is_string($key) && preg_match('/(^|_)alt$/i', $key)) {
+            return 'alt';
+        }
+        if ($this->bebuilder_setting_key($key)) {
+            return null;
+        }
+        if (preg_match('/<[a-z][a-z0-9]*[\s>\/]/i', $value) || preg_match('/^\[[a-z_]+[\s\]]/i', $trim)) {
+            return 'html';
+        }
+        // Needs words, not a token: two letters in any script, and not a
+        // lowercase slug ("full-width", "h2", "left"), a color or a size.
+        if (!preg_match('/\p{L}.*\p{L}/su', $trim)) {
+            return null;
+        }
+        if (preg_match('/^[a-z0-9_\-]+$/', $trim)) {
+            return null;
+        }
+        if (preg_match('/^(#[0-9a-f]{3,8}|rgba?\([^)]*\)|hsla?\([^)]*\)|-?\d+(\.\d+)?(px|em|rem|%|vh|vw|s|ms)?)$/i', $trim)) {
+            return null;
+        }
+        return 'text';
+    }
+
+    /**
+     * The heading an item prints, if it prints one: its `title` and the tag
+     * it is printed in (`header_tag` on a Heading item, `title_tag` on icon
+     * boxes and friends). A Heading item that never had its tag changed has
+     * no `header_tag` key; it prints BeBuilder's default H2 — `tag_present`
+     * false tells a writer the key has to be added rather than changed.
+     */
+    private function bebuilder_item_heading(array $item, array $item_path)
+    {
+        $fkey = (isset($item['attr']) && is_array($item['attr'])) ? 'attr' : ((isset($item['fields']) && is_array($item['fields'])) ? 'fields' : null);
+        if ($fkey === null) {
+            return null;
+        }
+        $fields = $item[$fkey];
+        $title = (isset($fields['title']) && is_string($fields['title'])) ? $fields['title'] : null;
+        if ($title === null || trim(wp_strip_all_tags($title)) === '' || preg_match('//u', $title) !== 1) {
+            return null;
+        }
+        $tag_key = null;
+        $tag = null;
+        foreach (['header_tag', 'title_tag', 'heading_tag', 'tag'] as $k) {
+            if (isset($fields[$k]) && is_string($fields[$k]) && preg_match('/^(h[1-6]|p|div|span)$/i', trim($fields[$k]))) {
+                $tag_key = $k;
+                $tag = strtolower(trim($fields[$k]));
+                break;
+            }
+        }
+        $present = $tag_key !== null;
+        if (!$present) {
+            if ($item['type'] !== 'heading') {
+                return null;
+            }
+            $tag_key = 'header_tag';
+            $tag = 'h2';
+        }
+        return [
+            'item_type' => (string) $item['type'],
+            'item_uid' => isset($item['uid']) && is_scalar($item['uid']) ? (string) $item['uid'] : null,
+            'text' => $title,
+            'text_path' => array_merge($item_path, [$fkey, 'title']),
+            'tag' => $tag,
+            'tag_path' => array_merge($item_path, [$fkey, $tag_key]),
+            'tag_present' => $present,
+            // The stored string, byte-exact — what a writer must pass as
+            // `expected` (it may be "H1" or carry spaces; `tag` is normalized).
+            'tag_value' => $present ? $fields[$tag_key] : null,
+        ];
+    }
+
+    /**
+     * Everything a BeBuilder page renders, per source: every copy/markup/
+     * image/link string with the key path that reaches it, and every heading
+     * an item prints. Plus `html`: the page body rebuilt from those pieces in
+     * render order — not BeTheme's exact markup, but the same copy, headings,
+     * images and links, which is what analysis, word counts, internal-link
+     * scans and the native migration need.
+     *
+     * @return array|WP_Error
+     */
+    private function bebuilder_document($page_id, $with_used_by = false)
+    {
+        $sources = $this->bebuilder_sources($page_id, $with_used_by);
+        if (is_wp_error($sources)) {
+            return $sources;
+        }
+
+        $out = [];
+        // HTML fragments per source post, per top-level section of that
+        // source, so a Global Section/Wrap's copy lands where it renders.
+        $fragments = [];
+        foreach ($sources as $source) {
+            $entry = [
+                'post_id' => $source['post_id'],
+                'kind' => $source['kind'],
+                'title' => $source['title'],
+                'storage' => $source['layout'] ? $source['layout']['storage'] : null,
+                'writable' => $source['layout'] ? $source['layout']['round_trips'] : false,
+                'hidden' => $source['hidden'],
+                'conditional' => $source['conditional'],
+                'nodes' => [],
+                'headings' => [],
+                'hidden_sections' => 0,
+                'skipped_non_utf8' => 0,
+            ];
+            if (isset($source['used_by'])) {
+                $entry['used_by'] = $source['used_by'];
+            }
+            if (isset($source['error'])) {
+                $entry['error'] = $source['error'];
+            }
+
+            $pid = $source['post_id'];
+            $is_page = $source['kind'] === 'page';
+            $heading_paths = [];
+            $on_item = function ($item, $path, $conditional) use (&$entry, &$heading_paths) {
+                $heading = $this->bebuilder_item_heading($item, $path);
+                if ($heading) {
+                    $heading['conditional'] = $conditional;
+                    $entry['headings'][] = $heading;
+                    $heading_paths[wp_json_encode($heading['text_path'])] = $heading['tag'];
+                }
+            };
+            $on_string = function ($key, $value, $path, $parent, $item, $conditional) use (&$entry, &$heading_paths, &$fragments, $pid, $is_page) {
+                if (preg_match('//u', $value) !== 1) {
+                    if ($value !== '') {
+                        $entry['skipped_non_utf8']++;
+                    }
+                    return;
+                }
+                $pkey = wp_json_encode($path);
+                $is_heading = isset($heading_paths[$pkey]);
+                $role = $is_heading ? 'heading' : $this->bebuilder_classify($key, $value);
+                if ($role === null) {
+                    return;
+                }
+                $node = [
+                    'path' => $path,
+                    'value' => $value,
+                    'role' => $role,
+                    'field' => (string) $key,
+                    'item_type' => $item ? $item['type'] : null,
+                    'item_uid' => $item ? $item['uid'] : null,
+                    'conditional' => $conditional,
+                ];
+                if ($role === 'image' && isset($parent['alt']) && is_string($parent['alt'])) {
+                    $node['alt'] = $parent['alt'];
+                }
+                $entry['nodes'][] = $node;
+
+                // Conditional content shows to some visitors only: listed,
+                // but kept out of the body everyone reads.
+                if ($conditional) {
+                    return;
+                }
+                $section = $is_page ? $path[0] : 0;
+                if ($role === 'heading') {
+                    $tag = $heading_paths[$pkey];
+                    $fragments[$pid][$section][] = '<' . $tag . '>' . $value . '</' . $tag . '>';
+                } elseif ($role === 'html') {
+                    $fragments[$pid][$section][] = $value;
+                } elseif ($role === 'text') {
+                    $fragments[$pid][$section][] = '<p>' . $value . '</p>';
+                } elseif ($role === 'image' && is_string($key) && strpos($key, 'style:') !== 0 && preg_match('/src|image/i', $key)) {
+                    $fragments[$pid][$section][] = '<img src="' . esc_url($value) . '" alt="' . esc_attr($node['alt'] ?? '') . '">';
+                }
+            };
+
+            if (!$entry['hidden']) {
+                $entry['hidden_sections'] = $this->bebuilder_walk_source($source, $on_string, $on_item);
+            }
+            $out[] = $entry;
+        }
+
+        // Compose in render order: the page's sections, with each global
+        // section/wrap's copy where the page pulls it in.
+        $html = [];
+        $template_html = function ($tid) use (&$fragments) {
+            $parts = [];
+            foreach ($fragments[$tid] ?? [] as $list) {
+                $parts[] = implode("\n", $list);
+            }
+            return implode("\n", $parts);
+        };
+        $layout_items = $sources[0]['node'];
+        $renders_at = [];
+        foreach ((array) $layout_items as $index => $section) {
+            if (!is_array($section)) {
+                continue;
+            }
+            $sid = $section['mfn_global_section_id'] ?? null;
+            if (!empty($sid) && is_numeric($sid)) {
+                $renders_at[(int) $sid] = $renders_at[(int) $sid] ?? $index;
+                $html[] = $template_html((int) $sid);
+                continue;
+            }
+            if (!empty($fragments[$page_id][$index])) {
+                $html[] = implode("\n", $fragments[$page_id][$index]);
+            }
+            if (!$this->bebuilder_section_hidden($section)) {
+                foreach (array_keys($this->bebuilder_global_refs($section, 1)) as $tid) {
+                    $renders_at[(int) $tid] = $renders_at[(int) $tid] ?? $index;
+                    $html[] = $template_html($tid);
+                }
+            }
+        }
+        // Where each template renders on the page (index of the page section
+        // that pulls it in), so callers can order headings the way a visitor
+        // reads them.
+        foreach ($out as &$entry) {
+            if ($entry['kind'] !== 'page') {
+                $entry['renders_at_section'] = $renders_at[(int) $entry['post_id']] ?? null;
+            }
+        }
+        unset($entry);
+
+        $body = implode("\n", array_filter($html, 'strlen'));
+        $text = $this->html_to_text($body);
+        return [
+            'sources' => $out,
+            'html' => $body,
+            'text' => $text,
+            'word_count' => $text === '' ? 0 : count(preg_split('/\s+/u', $text)),
+        ];
+    }
+
+    /** Visible text of an HTML fragment: tags become spaces, so "services.</p><h3>Why" doesn't glue into one word. */
+    private function html_to_text($html)
+    {
+        $html = strip_shortcodes((string) $html);
+        $html = preg_replace('#<(script|style)\b[^>]*>.*?</\1>#is', ' ', $html);
+        $html = preg_replace('#<(/?(p|div|h[1-6]|li|ul|ol|br|img|section|article|tr|td|th|table|blockquote|figure|figcaption|dt|dd)\b[^>]*)>#i', ' <$1> ', $html);
+        $text = html_entity_decode(wp_strip_all_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        return trim(preg_replace('/\s+/u', ' ', $text));
+    }
+
+    /**
+     * The HTML a page's body is made of, whatever stores it: the BeBuilder
+     * layout rebuilt in render order, else post_content. For readers that
+     * need copy (keyword scans, word counts, schema tokens), never for
+     * writing back.
+     */
+    private function page_body_html($post)
+    {
+        if ($this->bebuilder_is_page($post->ID)) {
+            $doc = $this->bebuilder_document($post->ID);
+            if (!is_wp_error($doc)) {
+                return $doc['html'];
+            }
+        }
+        return (string) $post->post_content;
+    }
+
+    /**
+     * Apply $edits to ONE layout ($target_id — a page, or a Global Section /
+     * Wrap template) in a single guarded write. Each edit:
+     *   ['path' => keys, 'expected' => string|null, 'value' => string|null]
+     *   expected null → the key must not exist yet; it is added (a Heading
+     *                   item still on the default tag has no `header_tag`);
+     *   value null    → the key is removed (it must still hold `expected`).
+     * Undo is the same edits with expected/value swapped.
+     *
+     * Guards, in order: the layout re-serializes to its exact stored bytes
+     * (so only the edited strings and their length prefixes change); every
+     * edit still finds what Patrick read; the stored bytes are kept in
+     * `_mehrana_mfn_backup` first (no copy, no write); the UPDATE applies only
+     * if the row still holds what was read; the row is read back and must be
+     * exactly what was meant, else the previous bytes go back.
+     *
+     * @return array|WP_Error
+     */
+    private function bebuilder_write_edits($target_id, array $edits)
+    {
+        global $wpdb;
+
+        $layout = $this->bebuilder_read_layout($target_id);
+        if (is_wp_error($layout)) {
+            return $layout;
+        }
+        if (!$layout['round_trips']) {
+            return new WP_Error('layout_not_round_trippable', "Post {$target_id}'s BeBuilder layout would not re-save byte-for-byte, so Patrick won't rewrite it. Make this change in BeBuilder.", ['status' => 409]);
+        }
+
+        $items = $layout['items'];
+        foreach ($edits as $i => $edit) {
+            $path = $edit['path'] ?? null;
+            $expected = array_key_exists('expected', $edit) ? $edit['expected'] : null;
+            $value = array_key_exists('value', $edit) ? $edit['value'] : null;
+            if (!is_array($path) || empty($path)
+                || ($expected !== null && !is_string($expected))
+                || ($value !== null && !is_string($value))
+                || ($expected === null && $value === null)) {
+                return new WP_Error('invalid_request', "Edit #{$i}: path, and expected and/or value (strings), are required", ['status' => 400]);
+            }
+            if ($value !== null && preg_match('//u', $value) !== 1) {
+                return new WP_Error('invalid_request', "Edit #{$i}: value is not valid UTF-8", ['status' => 400]);
+            }
+
+            $last = array_pop($path);
+            $node = &$items;
+            foreach ($path as $key) {
+                if (!is_array($node)) {
+                    unset($node);
+                    return new WP_Error('path_not_found', 'That value is no longer in the layout — reload and try again', ['status' => 409]);
+                }
+                if (!array_key_exists($key, $node)) {
+                    if (is_string($key) && ctype_digit($key) && array_key_exists((int) $key, $node)) {
+                        $key = (int) $key;
+                    } else {
+                        unset($node);
+                        return new WP_Error('path_not_found', 'That value is no longer in the layout — reload and try again', ['status' => 409]);
+                    }
+                }
+                $node = &$node[$key];
+            }
+            if (!is_array($node)) {
+                unset($node);
+                return new WP_Error('path_not_found', 'That value is no longer in the layout — reload and try again', ['status' => 409]);
+            }
+            if (!array_key_exists($last, $node) && is_string($last) && ctype_digit($last) && array_key_exists((int) $last, $node)) {
+                $last = (int) $last;
+            }
+            $exists = array_key_exists($last, $node);
+
+            if ($expected === null) {
+                if ($exists) {
+                    unset($node);
+                    return new WP_Error('stale', 'The layout changed since Patrick read it (someone saved it in BeBuilder?) — reload and try again', ['status' => 409]);
+                }
+                $node[$last] = $value;
+            } else {
+                if (!$exists || !is_string($node[$last]) || $node[$last] !== $expected) {
+                    unset($node);
+                    return new WP_Error('stale', 'The layout changed since Patrick read it (someone saved it in BeBuilder?) — reload and try again', ['status' => 409]);
+                }
+                if ($value === null) {
+                    unset($node[$last]);
+                } else {
+                    $node[$last] = $value;
+                }
+            }
+            unset($node);
+        }
+
+        $payload = serialize($items);
+        $new_raw = $layout['storage'] === 'encoded' ? base64_encode($payload) : $payload;
+        if ($new_raw === $layout['raw']) {
+            return new WP_Error('no_change', 'The edits leave the layout exactly as it is', ['status' => 400]);
+        }
+        // Never write back something we could not read again.
+        if (@unserialize($payload, ['allowed_classes' => false]) === false) {
+            return new WP_Error('write_not_verified', 'The edited layout would not unserialize, so nothing was changed.', ['status' => 500]);
+        }
+
+        // Rollback copy first. Keep the previous one to put back if this
+        // attempt ends up writing nothing.
+        $previous_backup = get_post_meta($target_id, '_mehrana_mfn_backup', true);
+        $restore_previous_backup = function () use ($target_id, $previous_backup) {
+            if (is_array($previous_backup) && isset($previous_backup['raw'])) {
+                update_post_meta($target_id, '_mehrana_mfn_backup', wp_slash($previous_backup));
+            } else {
+                delete_post_meta($target_id, '_mehrana_mfn_backup');
+            }
+        };
+        update_post_meta($target_id, '_mehrana_mfn_backup', wp_slash([
+            'saved_at' => time(),
+            'storage' => $layout['storage'],
+            'raw' => $layout['raw'],
+            'after_md5' => md5($new_raw),
+        ]));
+        $saved = get_post_meta($target_id, '_mehrana_mfn_backup', true);
+        if (!is_array($saved) || !isset($saved['raw']) || $saved['raw'] !== $layout['raw']) {
+            $restore_previous_backup();
+            return new WP_Error('backup_failed', 'Could not save a backup of the layout, so nothing was changed.', ['status' => 500]);
+        }
+
+        $updated = $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
+            $new_raw,
+            $layout['meta_id'],
+            md5($layout['raw'])
+        ));
+        wp_cache_delete($target_id, 'post_meta');
+
+        if ($updated === false) {
+            $restore_previous_backup();
+            return new WP_Error('db_error', 'Database update failed: ' . $wpdb->last_error, ['status' => 500]);
+        }
+        if ($updated === 0) {
+            $restore_previous_backup();
+            return new WP_Error('stale', 'The layout changed while Patrick was writing (someone saved it in BeBuilder?) — reload and try again', ['status' => 409]);
+        }
+
+        $check = $this->bebuilder_read_layout($target_id);
+        if (is_wp_error($check) || $check['raw'] !== $new_raw) {
+            $now = (string) $wpdb->get_var($wpdb->prepare(
+                "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_id = %d",
+                $layout['meta_id']
+            ));
+            $rolled_back = $wpdb->query($wpdb->prepare(
+                "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
+                $layout['raw'],
+                $layout['meta_id'],
+                md5($now)
+            ));
+            wp_cache_delete($target_id, 'post_meta');
+            if ($rolled_back) {
+                $restore_previous_backup();
+                $this->log("[BEBUILDER] Write to post {$target_id} did not read back as written — previous layout put back");
+                return new WP_Error('write_not_verified', 'The database did not keep the change exactly as written, so the previous layout was put back.', ['status' => 500]);
+            }
+            $this->log("[BEBUILDER] Write to post {$target_id} did not read back as written, and the row changed again before rollback — left as is");
+            return new WP_Error('write_not_verified', 'The database did not keep the change exactly as written, and the layout changed again before Patrick could put it back — check this page in BeBuilder. The previous layout is kept in the Patrick backup.', ['status' => 500]);
+        }
+
+        return [
+            'target_id' => (int) $target_id,
+            'meta_id' => $layout['meta_id'],
+            'storage' => $layout['storage'],
+            'raw_before' => $layout['raw'],
+            'raw_after' => $new_raw,
+            'bytes_before' => strlen($layout['raw']),
+            'bytes_after' => strlen($new_raw),
+            'edits' => count($edits),
+        ];
+    }
+
+    /**
+     * Put a layout back to the bytes it had before a write in this same
+     * request — only if it still holds exactly what that write left, so a
+     * save that landed since is never undone. Used to keep a multi-layout
+     * request all-or-nothing.
+     */
+    private function bebuilder_revert_write(array $write)
+    {
+        global $wpdb;
+        $reverted = $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
+            $write['raw_before'],
+            $write['meta_id'],
+            md5($write['raw_after'])
+        ));
+        wp_cache_delete($write['target_id'], 'post_meta');
+        return (bool) $reverted;
+    }
+
+    /**
+     * Apply edits spread over the page's layout and the templates it
+     * renders, all-or-nothing: every target is checked first, then written;
+     * if one write fails, the ones before it are reverted. Returns the
+     * written targets (with kind and the pages that share each template).
+     *
+     * @param array $edits [['target_id' => int, 'path' => [...], 'expected' => ?, 'value' => ?], ...]
+     * @return array|WP_Error
+     */
+    private function bebuilder_apply_edits($page_id, array $edits)
+    {
+        $groups = [];
+        foreach ($edits as $i => $edit) {
+            if (!is_array($edit)) {
+                return new WP_Error('invalid_request', "Edit #{$i} is not an object", ['status' => 400]);
+            }
+            $target_id = (int) ($edit['target_id'] ?? $page_id);
+            $groups[$target_id][] = $edit;
+        }
+        if (empty($groups)) {
+            return new WP_Error('invalid_request', 'No edits', ['status' => 400]);
+        }
+
+        $kinds = [];
+        foreach (array_keys($groups) as $target_id) {
+            $kind = $this->bebuilder_target_kind($page_id, $target_id);
+            if (is_wp_error($kind)) {
+                return $kind;
+            }
+            $kinds[$target_id] = $kind;
+        }
+
+        $written = [];
+        foreach ($groups as $target_id => $list) {
+            $result = $this->bebuilder_write_edits($target_id, $list);
+            if (is_wp_error($result)) {
+                $reverted = [];
+                foreach (array_reverse($written) as $done) {
+                    if ($this->bebuilder_revert_write($done)) {
+                        $reverted[] = $done['target_id'];
+                    }
+                }
+                if (!empty($written)) {
+                    $this->purge_site_caches($page_id);
+                    $data = (array) $result->get_error_data();
+                    $data['reverted_targets'] = $reverted;
+                    $result->add_data($data);
+                }
+                return $result;
+            }
+            $result['kind'] = $kinds[$target_id];
+            $written[] = $result;
+        }
+
+        foreach ($written as &$done) {
+            $done['used_by'] = $this->bebuilder_purge($page_id, $done['target_id'], $done['kind']);
+            unset($done['raw_before'], $done['raw_after'], $done['meta_id']);
+        }
+        unset($done);
+
+        return $written;
+    }
+
+    /**
+     * GET /pages/{id}/builder — what the page's body is made of.
+     *
+     * `builder`: 'bebuilder' | 'elementor' | 'wp'. For BeBuilder pages also
+     * `sources` (see bebuilder_document: every text/markup/image/link string
+     * and every item heading, with key paths and the pages sharing each
+     * template), `html` (the body rebuilt in render order), `text` and
+     * `word_count`. Elementor and post_content pages are read through their
+     * existing endpoints; they get `html`/`text` from post_content here so a
+     * caller never has to branch just to count words.
+     */
+    public function get_page_builder($request)
+    {
+        $page_id = (int) $request['id'];
+        $page = get_post($page_id);
+        if (!$page) {
+            return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+
+        $builder = $this->page_builder($page_id);
+        $response = [
+            'page_id' => $page_id,
+            'url' => get_permalink($page_id),
+            'post_type' => $page->post_type,
+            'builder' => $builder,
+            'sources' => [],
+        ];
+
+        if ($builder === 'bebuilder') {
+            $doc = $this->bebuilder_document($page_id, true);
+            if (is_wp_error($doc)) {
+                return $doc;
+            }
+            return rest_ensure_response(array_merge($response, $doc));
+        }
+
+        $text = $this->html_to_text($page->post_content);
+        return rest_ensure_response(array_merge($response, [
+            'html' => (string) $page->post_content,
+            'text' => $text,
+            'word_count' => $text === '' ? 0 : count(preg_split('/\s+/u', $text)),
+        ]));
+    }
+
+    /**
+     * POST /pages/{id}/builder — rewrite strings in the BeBuilder layouts the
+     * page renders. Body: { edits: [{ target_id, path, expected, value }] }
+     * (target_id defaults to the page; see bebuilder_write_edits for
+     * add/remove-a-key edits). All-or-nothing across layouts. Response lists
+     * each written layout with `used_by` — the pages that share it.
+     */
+    public function update_page_builder($request)
+    {
+        $page_id = (int) $request['id'];
+        if (!get_post($page_id)) {
+            return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+        if (!$this->bebuilder_is_page($page_id)) {
+            return new WP_Error('not_bebuilder', "Page {$page_id} is not a BeBuilder page", ['status' => 409]);
+        }
+        $body = $request->get_json_params();
+        $edits = $body['edits'] ?? null;
+        if (!is_array($edits) || empty($edits)) {
+            return new WP_Error('invalid_request', 'edits (a non-empty list) is required', ['status' => 400]);
+        }
+
+        $written = $this->bebuilder_apply_edits($page_id, $edits);
+        if (is_wp_error($written)) {
+            return $written;
+        }
+
+        $this->log("[BEBUILDER] Page {$page_id}: " . count($edits) . ' edit(s) across ' . count($written) . ' layout(s)');
+
+        return rest_ensure_response([
+            'success' => true,
+            'page_id' => $page_id,
+            'targets' => $written,
+        ]);
+    }
+
+    // ------------------------------------------------------------
+    // Image Factory on BeBuilder pages
+    // ------------------------------------------------------------
+
+    /**
+     * Posts whose BeBuilder layout mentions $needle — plain serialized rows
+     * by LIKE, base64-encoded rows by decoding (they can't be searched).
+     *
+     * @return int[]
+     */
+    private function bebuilder_posts_mentioning($needle)
+    {
+        global $wpdb;
+        if (!$this->bebuilder_theme_active() || $needle === '') {
+            return [];
+        }
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = 'mfn-page-items' AND (meta_value LIKE %s OR meta_value NOT LIKE 'a:%%')",
+            '%' . $wpdb->esc_like($needle) . '%'
+        ));
+        $ids = [];
+        foreach ((array) $rows as $row) {
+            $raw = (string) $row->meta_value;
+            if (!is_serialized($raw)) {
+                $raw = (string) base64_decode($raw, true);
+            }
+            if (strpos($raw, $needle) !== false) {
+                $ids[] = (int) $row->post_id;
+            }
+        }
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * Set the alt of one attachment everywhere a BeBuilder layout shows it:
+     * the `alt` beside an Image item's `src` (added when the item has none),
+     * and `<img>` tags inside rich-text values. Matched by URL path, so an
+     * absolute, protocol-relative or root-relative src all count. Each layout
+     * is written through the guarded writer; a Global Section counts once
+     * and purges every page that shows it.
+     *
+     * @return array ['layouts' => int, 'failed' => [...], 'post_ids' => int[]]
+     */
+    private function bebuilder_update_alt($attachment_id, array $image_urls, $alt)
+    {
+        $result = ['layouts' => 0, 'failed' => [], 'post_ids' => []];
+        $paths = [];
+        foreach ($image_urls as $url) {
+            $paths[$this->url_path($url)] = true;
+        }
+        $main = reset($image_urls);
+        if (!$main) {
+            return $result;
+        }
+        $stem = pathinfo(basename($main), PATHINFO_FILENAME);
+
+        foreach ($this->bebuilder_posts_mentioning($stem) as $post_id) {
+            $layout = $this->bebuilder_read_layout($post_id);
+            if (is_wp_error($layout)) {
+                $result['failed'][] = ['post_id' => $post_id, 'error' => $layout->get_error_message()];
+                continue;
+            }
+            $edits = [];
+            $seen_alt_paths = [];
+            $on_string = function ($key, $value, $path, $parent, $item) use (&$edits, &$seen_alt_paths, $paths, $alt) {
+                if (!is_string($value) || $value === '') {
+                    return;
+                }
+                if ($this->bebuilder_classify($key, $value) === 'image' && isset($paths[$this->url_path(trim($value))])
+                    && is_string($key) && strpos($key, 'style:') !== 0) {
+                    $alt_path = array_slice($path, 0, -1);
+                    $alt_path[] = 'alt';
+                    $akey = wp_json_encode($alt_path);
+                    if (isset($seen_alt_paths[$akey])) {
+                        return;
+                    }
+                    $seen_alt_paths[$akey] = true;
+                    if (!array_key_exists('alt', $parent)) {
+                        // Only an Image item's own src gets an alt added;
+                        // other items don't print one.
+                        if ($item && $item['type'] === 'image' && $key === 'src') {
+                            $edits[] = ['path' => $alt_path, 'expected' => null, 'value' => $alt];
+                        }
+                    } elseif (is_string($parent['alt']) && $parent['alt'] !== $alt) {
+                        $edits[] = ['path' => $alt_path, 'expected' => $parent['alt'], 'value' => $alt];
+                    }
+                    return;
+                }
+                if (stripos($value, '<img') === false || preg_match('//u', $value) !== 1) {
+                    return;
+                }
+                $new = preg_replace_callback('/<img\b[^>]*>/i', function ($m) use ($paths, $alt) {
+                    if (!preg_match('/\ssrc=["\']([^"\']+)["\']/i', $m[0], $src) || !isset($paths[$this->url_path($src[1])])) {
+                        return $m[0];
+                    }
+                    if (preg_match('/\salt=(["\'])[^"\']*\1/i', $m[0])) {
+                        return preg_replace('/\salt=(["\'])[^"\']*\1/i', ' alt="' . esc_attr($alt) . '"', $m[0], 1);
+                    }
+                    return preg_replace('/\s*(\/?>)$/', ' alt="' . esc_attr($alt) . '"$1', $m[0], 1);
+                }, $value);
+                if ($new !== $value) {
+                    $edits[] = ['path' => $path, 'expected' => $value, 'value' => $new];
+                }
+            };
+            $this->bebuilder_walk($layout['items'], [], $post_id, $on_string);
+            if (empty($edits)) {
+                continue;
+            }
+            $written = $this->bebuilder_write_edits($post_id, $edits);
+            if (is_wp_error($written)) {
+                $result['failed'][] = ['post_id' => $post_id, 'error' => $written->get_error_message()];
+                continue;
+            }
+            $result['layouts']++;
+            $result['post_ids'][] = $post_id;
+            if (get_post_type($post_id) === 'template') {
+                foreach ($this->bebuilder_template_users($post_id) as $user) {
+                    $result['post_ids'][] = (int) $user['id'];
+                }
+            }
+            $this->log("[update_media_alt] BeBuilder: set alt on " . count($edits) . " value(s) in post {$post_id}");
+        }
+        $result['post_ids'] = array_values(array_unique($result['post_ids']));
+        return $result;
+    }
+
+    /**
+     * Every image URL a BeBuilder page renders: Image items, backgrounds,
+     * `<img>` inside rich text, and Image Gallery attachment ids — across the
+     * page's own layout and the global sections/wraps it pulls in.
+     *
+     * @return string[]
+     */
+    private function bebuilder_image_urls($page_id)
+    {
+        $sources = $this->bebuilder_sources($page_id);
+        if (is_wp_error($sources)) {
+            return [];
+        }
+        $urls = [];
+        $on_string = function ($key, $value, $path, $parent, $item) use (&$urls) {
+            if ($value === '' || !is_string($value)) {
+                return;
+            }
+            $role = $this->bebuilder_classify($key, $value);
+            if ($role === 'image') {
+                $urls[] = trim($value);
+            } elseif ($role === 'html' && stripos($value, '<img') !== false) {
+                preg_match_all('/<img\b[^>]*\ssrc=["\']([^"\']+)["\']/i', $value, $m);
+                foreach ($m[1] as $src) {
+                    $urls[] = $src;
+                }
+            } elseif ($key === 'ids' && $item && preg_match('/^\d+(\s*,\s*\d+)*$/', trim($value))) {
+                foreach (explode(',', $value) as $aid) {
+                    $u = wp_get_attachment_url((int) $aid);
+                    if ($u) {
+                        $urls[] = $u;
+                    }
+                }
+            }
+        };
+        foreach ($sources as $source) {
+            if (!$source['hidden']) {
+                $this->bebuilder_walk_source($source, $on_string);
+            }
+        }
+        return array_values(array_unique($urls));
+    }
+
+    // ------------------------------------------------------------
+    // Link Building on BeBuilder pages
+    // ------------------------------------------------------------
+
+    /**
+     * The strings a keyword link may go into on a BeBuilder page: rich-text
+     * (`html`) values of the page's OWN layout that every visitor sees. Not a
+     * shared Global Section/Wrap — a link placed there would appear on every
+     * page that renders it — and never a heading, button or title.
+     *
+     * @return array|WP_Error ['writable' => bool, 'nodes' => [...]]
+     */
+    private function bebuilder_linkable_nodes($page_id)
+    {
+        $doc = $this->bebuilder_document($page_id);
+        if (is_wp_error($doc)) {
+            return $doc;
+        }
+        $page_source = $doc['sources'][0];
+        $nodes = [];
+        foreach ($page_source['nodes'] as $node) {
+            if ($node['role'] === 'html' && !$node['conditional']) {
+                $nodes[] = $node;
+            }
+        }
+        return ['writable' => $page_source['writable'], 'nodes' => $nodes, 'doc' => $doc];
+    }
+
+    /** scan_page for a BeBuilder page: same response shape, counted over the linkable values. */
+    private function bebuilder_scan_keywords($page_id, array $keywords)
+    {
+        $linkable = $this->bebuilder_linkable_nodes($page_id);
+        if (is_wp_error($linkable)) {
+            return $linkable;
+        }
+        $results = [];
+        foreach ($keywords as $kw_data) {
+            $keyword = is_array($kw_data) ? ($kw_data['keyword'] ?? '') : $kw_data;
+            if (!is_string($keyword) || $keyword === '') {
+                continue;
+            }
+            $count = 0;
+            $linked = 0;
+            foreach ($linkable['nodes'] as $node) {
+                $scan = $this->replace_keyword($node['value'], $keyword, '', '', true, true);
+                $count += $scan['count'];
+                $linked += $scan['linked_count'] ?? 0;
+                if ($count + $linked > 0) {
+                    break;
+                }
+            }
+            if ($count > 0 || $linked > 0) {
+                $results[] = ['keyword' => $keyword, 'count' => $count, 'linked_count' => $linked];
+            }
+        }
+        return rest_ensure_response([
+            'success' => true,
+            'page_id' => (int) $page_id,
+            'builder' => 'bebuilder',
+            'candidates' => $results,
+            'debug' => [
+                'content_length' => strlen($linkable['doc']['html']),
+                'linkable_values' => count($linkable['nodes']),
+                'keywords_checked' => count($keywords),
+            ],
+        ]);
+    }
+
+    /**
+     * apply_links for a BeBuilder page: link each keyword inside the page's
+     * own rich-text values, then write every changed value in one guarded
+     * edit. Never wp_update_post — post_content is not what renders here.
+     */
+    private function bebuilder_apply_links($page_id, array $keywords)
+    {
+        $linkable = $this->bebuilder_linkable_nodes($page_id);
+        if (is_wp_error($linkable)) {
+            return $linkable;
+        }
+        if (!$linkable['writable']) {
+            return new WP_Error('layout_not_round_trippable', "This BeBuilder page's layout would not re-save byte-for-byte, so Patrick won't insert links into it. Add the links in BeBuilder.", ['status' => 409]);
+        }
+
+        $current = [];
+        foreach ($linkable['nodes'] as $i => $node) {
+            $current[$i] = $node['value'];
+        }
+
+        $results = [];
+        $skipped = [];
+        foreach ($keywords as $kw) {
+            $keyword = sanitize_text_field($kw['keyword'] ?? '');
+            $target_url = esc_url_raw($kw['target_url'] ?? '');
+            $anchor_id = sanitize_html_class($kw['anchor_id'] ?? '');
+            $only_first = isset($kw['only_first']) ? (bool) $kw['only_first'] : true;
+            if ($keyword === '' || $target_url === '') {
+                continue;
+            }
+
+            $count = 0;
+            $linked = 0;
+            foreach ($linkable['nodes'] as $i => $node) {
+                if ($only_first && ($count + $linked) > 0) {
+                    break;
+                }
+                $r = $this->replace_keyword($current[$i], $keyword, $target_url, $anchor_id, $only_first);
+                $linked += $r['linked_count'] ?? 0;
+                if ($r['count'] > 0) {
+                    $current[$i] = $r['text'];
+                    $count += $r['count'];
+                }
+                foreach ((array) ($r['skipped'] ?? []) as $skip) {
+                    $skip['keyword'] = $keyword;
+                    $skip['location'] = 'bebuilder:' . ($node['item_type'] ?? 'item') . '.' . $node['field'];
+                    $skipped[] = $skip;
+                }
+            }
+            $results[] = ['keyword' => $keyword, 'count' => $count, 'linked_count' => $linked];
+        }
+
+        $edits = [];
+        foreach ($linkable['nodes'] as $i => $node) {
+            if ($current[$i] !== $node['value']) {
+                $edits[] = ['target_id' => (int) $page_id, 'path' => $node['path'], 'expected' => $node['value'], 'value' => $current[$i]];
+            }
+        }
+        $targets = [];
+        if (!empty($edits)) {
+            $targets = $this->bebuilder_apply_edits($page_id, $edits);
+            if (is_wp_error($targets)) {
+                return $targets;
+            }
+        }
+
+        $this->log("[BEBUILDER] Applied links to page {$page_id}: " . wp_json_encode($results));
+
+        return rest_ensure_response([
+            'success' => true,
+            'page_id' => (int) $page_id,
+            'builder' => 'bebuilder',
+            'results' => $results,
+            'skipped' => $skipped,
+            'values_changed' => count($edits),
+        ]);
+    }
+
+    /** Every `<a>` in an HTML string: [url, anchor text, full tag]. */
+    private function html_links($html)
+    {
+        preg_match_all('/<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)<\/a>/is', (string) $html, $matches, PREG_SET_ORDER);
+        return $matches;
+    }
+
+    /**
+     * remove_link for a BeBuilder page. An `lb-` id (a link Patrick inserted)
+     * is unwrapped wherever it sits in the page's own layout; any other id is
+     * resolved exactly like get_page_links numbers links (over the rebuilt
+     * body) and the first matching <a> in the page's own layout is unwrapped.
+     * Links inside shared Global Sections are left alone.
+     */
+    private function bebuilder_remove_link($page_id, $link_id)
+    {
+        $linkable = $this->bebuilder_linkable_nodes($page_id);
+        if (is_wp_error($linkable)) {
+            return $linkable;
+        }
+
+        $target_url = null;
+        $target_anchor = null;
+        if (strpos($link_id, 'lb-') !== 0) {
+            $site_url = home_url();
+            foreach ($this->html_links($linkable['doc']['html']) as $index => $match) {
+                $url = $match[1];
+                $anchor = strip_tags($match[2]);
+                if ((strpos($url, $site_url) === 0 || strpos($url, '/') === 0)
+                    && 'link_' . $index . '_' . md5($url . $anchor) === $link_id) {
+                    $target_url = $url;
+                    $target_anchor = $anchor;
+                    break;
+                }
+            }
+            if ($target_url === null) {
+                return new WP_Error('not_found', 'Link not found', ['status' => 404]);
+            }
+        }
+
+        // An `lb-` id is ours: every link carrying it goes (only_first=false
+        // inserts can repeat one id), like the post_content path. Any other
+        // id names one link — the first match only.
+        $by_id = $target_url === null;
+        $done = false;
+        $edits = [];
+        foreach ($linkable['nodes'] as $node) {
+            if ($done && !$by_id) {
+                break;
+            }
+            $new = preg_replace_callback('/<a\s+[^>]*>(.*?)<\/a>/is', function ($m) use ($link_id, $target_url, $target_anchor, $by_id, &$done) {
+                if ($done && !$by_id) {
+                    return $m[0];
+                }
+                if ($target_url === null) {
+                    if (!preg_match('/\bid=["\']' . preg_quote($link_id, '/') . '["\']/i', $m[0])) {
+                        return $m[0];
+                    }
+                } else {
+                    if (!preg_match('/href=["\']([^"\']+)["\']/i', $m[0], $h) || $h[1] !== $target_url || strip_tags($m[1]) !== $target_anchor) {
+                        return $m[0];
+                    }
+                }
+                $done = true;
+                return $m[1];
+            }, $node['value']);
+            if ($new !== $node['value']) {
+                $edits[] = ['target_id' => (int) $page_id, 'path' => $node['path'], 'expected' => $node['value'], 'value' => $new];
+            }
+        }
+
+        if (empty($edits)) {
+            return new WP_Error('not_found', 'Link not found in this page\'s own BeBuilder content (links inside a shared Global Section are not removed from here)', ['status' => 404]);
+        }
+        if (!$linkable['writable']) {
+            return new WP_Error('layout_not_round_trippable', "This BeBuilder page's layout would not re-save byte-for-byte, so Patrick won't change it. Remove the link in BeBuilder.", ['status' => 409]);
+        }
+        $written = $this->bebuilder_apply_edits($page_id, $edits);
+        if (is_wp_error($written)) {
+            return $written;
+        }
+        return rest_ensure_response(['success' => true, 'builder' => 'bebuilder', 'message' => 'Link removed successfully']);
+    }
+
+    /**
+     * Keep BeBuilder layouts out of reach of anything but our guarded writer
+     * while a Patrick request runs. Several endpoints still end in
+     * wp_update_post() (title changes, the post_content path of old callers),
+     * and that fires the theme's own save_post handlers — a builder save path
+     * running without the editor's form data is exactly how page-builder
+     * content goes missing. During a Patrick request, a meta-API write to
+     * `mfn-page-items` that we didn't start is refused and logged.
+     */
+    public function guard_builder_layout_update($check, $object_id, $meta_key, $meta_value, $prev_value = '')
+    {
+        if ($meta_key !== 'mfn-page-items' || !$this->patrick_request || $this->allow_layout_meta_write) {
+            return $check;
+        }
+        $this->log("[BEBUILDER] Blocked a meta-API write to post {$object_id}'s layout during a Patrick request");
+        return true;
+    }
+
+    public function guard_builder_layout_add($check, $object_id, $meta_key, $meta_value, $unique = false)
+    {
+        return $this->guard_builder_layout_update($check, $object_id, $meta_key, $meta_value);
+    }
+
+    public function guard_builder_layout_delete($check, $object_id, $meta_key, $meta_value = '', $delete_all = false)
+    {
+        return $this->guard_builder_layout_update($check, $object_id, $meta_key, $meta_value);
     }
 
     /**
@@ -6378,6 +8013,11 @@ class Mehrana_App_Plugin
         }
 
         $this->log("Applying links to page {$page_id}. Keywords count: " . count($keywords));
+
+        // BeBuilder renders from its layout, not post_content (v5.36).
+        if ($this->bebuilder_is_page($page_id)) {
+            return $this->bebuilder_apply_links($page_id, $keywords);
+        }
 
         // Get Elementor data
         $elementor_data = get_post_meta($page_id, '_elementor_data', true);
@@ -6516,9 +8156,10 @@ class Mehrana_App_Plugin
                 ];
             }
 
-            // Save Standard Content
-            // Save Standard Content
-            $update_result = wp_update_post([
+            // Save Standard Content — only when a link actually went in. A
+            // no-op wp_update_post still fires every save_post handler and
+            // bumps post_modified for nothing.
+            $update_result = $content === $page->post_content ? 0 : wp_update_post([
                 'ID' => $page_id,
                 'post_content' => $content
             ]);
@@ -6839,6 +8480,10 @@ class Mehrana_App_Plugin
             return new WP_Error('not_found', 'Page not found', ['status' => 404]);
         }
 
+        if ($this->bebuilder_is_page($page->ID)) {
+            return $this->bebuilder_scan_keywords($page->ID, $keywords);
+        }
+
         $content = $page->post_content;
         $results = [];
 
@@ -6891,8 +8536,11 @@ class Mehrana_App_Plugin
         $links = [];
         $site_url = home_url();
 
-        // Get rendered content to find all visible links
-        $content = apply_filters('the_content', $post->post_content);
+        // Get rendered content to find all visible links. A BeBuilder page's
+        // body is its layout (page + global sections), not post_content.
+        $content = $this->bebuilder_is_page($page_id)
+            ? $this->page_body_html($post)
+            : apply_filters('the_content', $post->post_content);
 
         // Also check Elementor data (raw JSON contains link markup)
         $elementor_data = get_post_meta($page_id, '_elementor_data', true);
@@ -6941,6 +8589,10 @@ class Mehrana_App_Plugin
         $post = get_post($page_id);
         if (!$post) {
             return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+
+        if ($this->bebuilder_is_page($page_id)) {
+            return $this->bebuilder_remove_link($page_id, (string) $link_id);
         }
 
         $site_url = home_url();
@@ -7465,6 +9117,12 @@ class Mehrana_App_Plugin
             'status' => 'ok',
             'version' => $this->version,
             'elementor_active' => class_exists('\Elementor\Plugin'),
+            'theme' => get_template(),
+            // Page builders this plugin reads and writes natively (v5.36).
+            'builders' => [
+                'elementor' => class_exists('\Elementor\Plugin'),
+                'bebuilder' => $this->bebuilder_theme_active(),
+            ],
             'timestamp' => current_time('mysql')
         ]);
     }
@@ -8739,6 +10397,61 @@ class Mehrana_App_Plugin
             $this->log("[CLONE_PAGE] Copied Elementor data and template settings");
         }
 
+        // BeBuilder (v5.36): the page IS its layout — without this the clone
+        // was an empty draft. The replacements go into the layout's strings,
+        // never into its serialized bytes (that blanks the page), and BeTheme's
+        // per-page options and generated CSS come along byte-for-byte.
+        $bebuilder_cloned = false;
+        if ($this->bebuilder_is_page($template_id)) {
+            global $wpdb;
+            $layout = $this->bebuilder_read_layout($template_id);
+            if (is_wp_error($layout)) {
+                wp_delete_post($new_post_id, true);
+                return new WP_Error('template_layout_unreadable', 'The template page is built with BeBuilder, but its layout could not be read (' . $layout->get_error_message() . '), so nothing was cloned.', ['status' => 422]);
+            }
+            $items = $layout['items'];
+            if (!empty($replacements) && is_array($replacements)) {
+                foreach ($replacements as $search => $replace) {
+                    if ((string) $search !== '') {
+                        $items = $this->deep_str_replace($items, (string) $search, (string) $replace);
+                    }
+                }
+            }
+            $payload = serialize($items);
+            if (@unserialize($payload, ['allowed_classes' => false]) === false) {
+                wp_delete_post($new_post_id, true);
+                return new WP_Error('clone_failed', 'The cloned BeBuilder layout would not read back, so nothing was created.', ['status' => 500]);
+            }
+            $wpdb->insert($wpdb->postmeta, [
+                'post_id' => $new_post_id,
+                'meta_key' => 'mfn-page-items',
+                'meta_value' => $layout['storage'] === 'encoded' ? base64_encode($payload) : $payload,
+            ]);
+            $page_options = $wpdb->get_results($wpdb->prepare(
+                "SELECT meta_key, meta_value FROM {$wpdb->postmeta}
+                 WHERE post_id = %d AND meta_key LIKE %s AND meta_key <> 'mfn-page-items' AND meta_key NOT LIKE %s",
+                $template_id,
+                $wpdb->esc_like('mfn-') . '%',
+                $wpdb->esc_like('mfn-builder-revision') . '%'
+            ));
+            foreach ((array) $page_options as $opt) {
+                $wpdb->insert($wpdb->postmeta, ['post_id' => $new_post_id, 'meta_key' => $opt->meta_key, 'meta_value' => $opt->meta_value]);
+            }
+            wp_cache_delete($new_post_id, 'post_meta');
+            $css_dir = trailingslashit(wp_upload_dir()['basedir']) . 'betheme/css';
+            if (file_exists("{$css_dir}/post-{$template_id}.css")) {
+                @copy("{$css_dir}/post-{$template_id}.css", "{$css_dir}/post-{$new_post_id}.css");
+            }
+            $bebuilder_cloned = true;
+            $this->log("[CLONE_PAGE] Copied BeBuilder layout (" . strlen($payload) . " bytes) and " . count((array) $page_options) . " BeTheme page option(s)");
+        }
+
+        // Page template, whatever the builder.
+        $page_template = get_post_meta($template_id, '_wp_page_template', true);
+        if (!empty($page_template) && !get_post_meta($new_post_id, '_wp_page_template', true)) {
+            update_post_meta($new_post_id, '_wp_page_template', $page_template);
+        }
+
         // Copy SEO meta if present (with replacements)
         $seo_meta_keys = [
             'rank_math_title',
@@ -8772,6 +10485,7 @@ class Mehrana_App_Plugin
             'title' => $new_title,
             'slug' => $new_slug,
             'status' => $status,
+            'builder' => $bebuilder_cloned ? 'bebuilder' : (!empty($elementor_data) ? 'elementor' : 'wp'),
             'message' => "Page created successfully from template #{$template_id}"
         ]);
     }
@@ -9157,10 +10871,22 @@ class Mehrana_App_Plugin
             'post_type' => $post->post_type,
             'post_status' => $post->post_status,
             'title' => $post->post_title,
+            // Which store renders the body (v5.36): 'bebuilder' | 'elementor' | 'wp'.
+            'builder' => $this->page_builder($page_id),
         ];
 
         if (!empty($elementor_data)) {
             $result['elementor_data'] = $elementor_data;
+        }
+
+        if ($result['builder'] === 'bebuilder') {
+            $result['has_bebuilder'] = true;
+            $doc = $this->bebuilder_document($page_id);
+            if (!is_wp_error($doc)) {
+                $result['builder_html'] = $doc['html'];
+                $result['builder_text'] = $doc['text'];
+                $result['word_count'] = $doc['word_count'];
+            }
         }
 
         $this->log("[GET_PAGE_CONTENT] Returned content for page ID: {$page_id}, length: " . strlen($post->post_content));
@@ -9215,6 +10941,18 @@ class Mehrana_App_Plugin
         $post = get_post($page_id);
         if (!$post) {
             return new WP_Error('post_not_found', 'Post not found', ['status' => 404]);
+        }
+
+        // A BeBuilder page renders its layout, not post_content: a body
+        // written there never shows up (or shows up above the design), while
+        // Patrick would report it deployed. Refuse and point at the layout
+        // writer; `allow_post_content` is the explicit opt-out.
+        if (isset($body['content']) && empty($body['allow_post_content']) && $this->bebuilder_is_page($page_id)) {
+            return new WP_Error(
+                'bebuilder_page',
+                'This page is built with BeBuilder: what visitors see is its BeBuilder layout, not the WordPress editor content, so writing post_content would not change the page. Edit the layout instead (POST /pages/{id}/builder).',
+                ['status' => 409, 'builder' => 'bebuilder']
+            );
         }
 
         $this->log("[UPDATE_PAGE] Updating page ID: {$page_id}");
@@ -11649,6 +13387,8 @@ class Mehrana_App_Plugin
             'themeEdit' => true,
             'sitemapExclude' => $has_rank_math,
             'robotsTxt' => true,
+            // BeBuilder layouts are read and written natively (v5.36).
+            'bebuilder' => $this->bebuilder_theme_active(),
             'seoPlugin' => $has_rank_math ? 'rank_math' : ($has_yoast ? 'yoast' : 'none'),
             'redirectPlugin' => $has_rm_redirects ? 'rank_math' : ($has_redirection ? 'redirection' : 'custom'),
             'pluginVersion' => $this->version,
