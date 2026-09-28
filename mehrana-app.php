@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.34.0
+ * Version: 5.35.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.34.0';
+    private $version = '5.35.0';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -331,6 +331,30 @@ class Mehrana_App_Plugin
         register_rest_route($this->namespace, '/pages/(?P<id>\d+)/full', [
             'methods' => 'GET',
             'callback' => [$this, 'get_page_full'],
+            'permission_callback' => [$this, 'check_permission'],
+        ]);
+
+        // BeBuilder (BeTheme) layouts. A BeBuilder page keeps nothing in
+        // post_content — its links live in the serialized `mfn-page-items`
+        // meta, and shared blocks (Global Sections / Global Wraps) live in
+        // their own template post. GET lists every link-bearing value the
+        // page actually renders, with where it is stored; POST rewrites ONE
+        // of those values in place. See bebuilder_update_value().
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/bebuilder', [
+            [
+                'methods' => 'GET',
+                'callback' => [$this, 'bebuilder_links'],
+                'permission_callback' => [$this, 'check_permission'],
+            ],
+            [
+                'methods' => 'POST',
+                'callback' => [$this, 'bebuilder_update_value'],
+                'permission_callback' => [$this, 'check_permission'],
+            ],
+        ]);
+        register_rest_route($this->namespace, '/pages/(?P<id>\d+)/bebuilder/restore', [
+            'methods' => 'POST',
+            'callback' => [$this, 'bebuilder_restore'],
             'permission_callback' => [$this, 'check_permission'],
         ]);
 
@@ -5638,6 +5662,7 @@ class Mehrana_App_Plugin
                 'modified' => mysql_to_rfc3339($page->post_modified_gmt),
                 'post_author_id' => intval($page->post_author),
                 'has_elementor' => !empty($elementor_data),
+                'has_bebuilder' => metadata_exists('post', $page->ID, 'mfn-page-items'),
                 'has_redirect' => $redirect_info['has_redirect'],
                 'redirect_url' => $redirect_info['redirect_url'],
                 'elementor_data' => $elementor_data,
@@ -5646,6 +5671,593 @@ class Mehrana_App_Plugin
                 'schema_types' => $schema_types,
             ],
         ]);
+    }
+
+    // ============================================================
+    // BeBuilder (BeTheme) layouts
+    // ============================================================
+
+    /**
+     * Read one post's BeBuilder layout exactly as it sits in the database.
+     *
+     * BeTheme keeps a page's whole layout in the `mfn-page-items` meta as a
+     * serialized PHP array — or, with Theme Options → Builder → Storage set
+     * to "encode", as base64 of that serialization. Every string in it
+     * carries its byte length (`s:26:"…"`), which is why a blind text edit
+     * blanks the page: the lengths stop matching, unserialize() fails and
+     * the theme silently renders nothing.
+     *
+     * The row is read with $wpdb, not get_post_meta(), so a writer knows the
+     * exact bytes it is replacing and which row they came from.
+     *
+     * `round_trips` is the write guard. Re-serializing what we read must
+     * give back the stored bytes exactly; then changing one string and
+     * serializing again changes that string and its length prefix and
+     * nothing else. When it doesn't (a float stored at another precision, a
+     * stored object, a hand-edited row), a rewrite would touch bytes nobody
+     * asked us to touch, so writers refuse.
+     *
+     * @return array|WP_Error
+     */
+    private function bebuilder_read_layout($post_id)
+    {
+        global $wpdb;
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT meta_id, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s",
+            $post_id,
+            'mfn-page-items'
+        ));
+
+        if (empty($rows)) {
+            return new WP_Error('no_bebuilder', "Post {$post_id} has no BeBuilder layout", ['status' => 404]);
+        }
+        if (count($rows) !== 1) {
+            return new WP_Error('ambiguous_layout', "Post {$post_id} has " . count($rows) . " BeBuilder layout rows; refusing to guess which one the theme renders", ['status' => 409]);
+        }
+
+        $raw = (string) $rows[0]->meta_value;
+        if (is_serialized($raw)) {
+            $storage = 'serialized';
+            $payload = $raw;
+        } else {
+            $storage = 'encoded';
+            $payload = base64_decode($raw, true);
+            if ($payload === false || !is_serialized($payload)) {
+                return new WP_Error('unreadable_layout', "Post {$post_id}'s BeBuilder layout is neither serialized nor base64-encoded", ['status' => 422]);
+            }
+        }
+
+        $items = @unserialize($payload, ['allowed_classes' => false]);
+        if (!is_array($items)) {
+            return new WP_Error('unreadable_layout', "Post {$post_id}'s BeBuilder layout does not unserialize — the page is most likely rendering blank already. Restore it in BeBuilder before editing.", ['status' => 422]);
+        }
+
+        $reencoded = serialize($items);
+        if ($storage === 'encoded') {
+            $reencoded = base64_encode($reencoded);
+        }
+
+        return [
+            'post_id' => (int) $post_id,
+            'meta_id' => (int) $rows[0]->meta_id,
+            'raw' => $raw,
+            'storage' => $storage,
+            'items' => $items,
+            'round_trips' => $reencoded === $raw,
+        ];
+    }
+
+    /**
+     * Global Sections and Global Wraps a layout pulls in, as
+     * [template_id => 'global_section'|'global_wrap'].
+     *
+     * BeTheme renders these from the template post's own layout, not from
+     * the copy the page keeps (Mfn_Builder_Front: a section with
+     * `mfn_global_section_id`, a wrap — top-level or nested inside a wrap as
+     * an `item_is_wrap` item — with `attr.global_wraps_select`). The page's
+     * copy is dead data; the template is the only place an edit shows up —
+     * once, on every page that uses it. A global node's own subtree is not
+     * searched further: it is not what renders.
+     */
+    private function bebuilder_global_refs($node, $depth = 0)
+    {
+        $refs = [];
+        if (!is_array($node) || $depth > 64) {
+            return $refs;
+        }
+
+        $sid = $node['mfn_global_section_id'] ?? null;
+        if (!empty($sid) && is_numeric($sid)) {
+            return [(int) $sid => 'global_section'];
+        }
+        if (isset($node['attr']) && is_array($node['attr'])) {
+            $wid = $node['attr']['global_wraps_select'] ?? null;
+            if (!empty($wid) && intval($wid)) {
+                return [(int) $wid => 'global_wrap'];
+            }
+        }
+
+        foreach ($node as $child) {
+            if (!is_array($child)) {
+                continue;
+            }
+            foreach ($this->bebuilder_global_refs($child, $depth + 1) as $id => $kind) {
+                if (!isset($refs[$id])) {
+                    $refs[$id] = $kind;
+                }
+            }
+        }
+        return $refs;
+    }
+
+    /** A string that can carry a link: HTML with an href, or a bare URL/path (button and image link fields). */
+    private function bebuilder_is_link_value($value)
+    {
+        if ($value === '') {
+            return false;
+        }
+        if (stripos($value, 'href') !== false) {
+            return true;
+        }
+        $trimmed = trim($value);
+        if ($trimmed === '' || preg_match('/\s/', $trimmed)) {
+            return false;
+        }
+        return (bool) preg_match('#^(https?:)?//|^/#i', $trimmed);
+    }
+
+    /**
+     * Collect every link-bearing string under $node with the key path that
+     * reaches it, plus the short strings beside it (a button's `title` sits
+     * next to its `link` — that is how the caller tells two links to the
+     * same URL apart). Subtrees that are another template's global
+     * section/wrap are skipped: they are not what renders.
+     */
+    private function bebuilder_collect_links($node, array $path, array &$out, $owner_id, &$non_utf8 = 0, $depth = 0)
+    {
+        if (!is_array($node) || $depth > 64) {
+            return;
+        }
+
+        $sid = $node['mfn_global_section_id'] ?? null;
+        if (!empty($sid) && is_numeric($sid) && (int) $sid !== (int) $owner_id) {
+            return;
+        }
+        if (isset($node['attr']) && is_array($node['attr'])) {
+            $wid = $node['attr']['global_wraps_select'] ?? null;
+            if (!empty($wid) && intval($wid) && (int) $wid !== (int) $owner_id) {
+                return;
+            }
+        }
+
+        foreach ($node as $key => $value) {
+            $child_path = $path;
+            $child_path[] = $key;
+            if (is_string($value)) {
+                if (!$this->bebuilder_is_link_value($value)) {
+                    continue;
+                }
+                // JSON can't carry invalid UTF-8 byte-for-byte: the copy
+                // Patrick got back would never equal the stored value, so
+                // every write would fail as "stale". Leave it out and say so.
+                if (preg_match('//u', $value) !== 1) {
+                    $non_utf8++;
+                    continue;
+                }
+                $siblings = [];
+                foreach ($node as $k => $v) {
+                    if ($k === $key || !is_string($v) || $v === '' || strlen($v) > 300 || preg_match('//u', $v) !== 1) {
+                        continue;
+                    }
+                    $siblings[(string) $k] = $v;
+                    if (count($siblings) >= 12) {
+                        break;
+                    }
+                }
+                $out[] = ['path' => $child_path, 'value' => $value, 'siblings' => (object) $siblings];
+            } elseif (is_array($value)) {
+                $this->bebuilder_collect_links($value, $child_path, $out, $owner_id, $non_utf8, $depth + 1);
+            }
+        }
+    }
+
+    /**
+     * Published posts whose layout renders template $template_id, as
+     * [['id','url','title']]. One scan per request, shared by every
+     * template asked about.
+     */
+    private function bebuilder_template_users($template_id)
+    {
+        global $wpdb;
+        static $users_by_template = null;
+
+        if ($users_by_template === null) {
+            $users_by_template = [];
+            // Serialized rows can be pre-filtered on the ref keys; encoded
+            // (base64) rows can't, so those are always decoded.
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT pm.post_id, pm.meta_value FROM {$wpdb->postmeta} pm
+                 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+                 WHERE pm.meta_key = 'mfn-page-items'
+                   AND p.post_status = 'publish'
+                   AND p.post_type NOT IN ('revision', 'template')
+                   AND (pm.meta_value LIKE %s OR pm.meta_value LIKE %s OR pm.meta_value NOT LIKE %s)",
+                '%' . $wpdb->esc_like('mfn_global_section_id') . '%',
+                '%' . $wpdb->esc_like('global_wraps_select') . '%',
+                'a:%'
+            ));
+            foreach ((array) $rows as $row) {
+                $payload = is_serialized($row->meta_value) ? $row->meta_value : base64_decode($row->meta_value, true);
+                $items = ($payload !== false && is_serialized($payload)) ? @unserialize($payload, ['allowed_classes' => false]) : false;
+                foreach (array_keys($this->bebuilder_global_refs($items)) as $tid) {
+                    $users_by_template[$tid][] = (int) $row->post_id;
+                }
+            }
+            unset($rows);
+        }
+
+        $users = [];
+        foreach ($users_by_template[(int) $template_id] ?? [] as $post_id) {
+            $users[] = [
+                'id' => $post_id,
+                'url' => get_permalink($post_id),
+                'title' => get_the_title($post_id),
+            ];
+        }
+        return $users;
+    }
+
+    /**
+     * GET /pages/{id}/bebuilder — every link-bearing value the page renders.
+     *
+     * `sources[0]` is the page's own layout; each further source is a
+     * published Global Section/Wrap the page renders, with `used_by` (every
+     * page that shows it). `writable: false` means the layout doesn't
+     * re-serialize byte-for-byte and POST will refuse it.
+     */
+    public function bebuilder_links($request)
+    {
+        $page_id = (int) $request['id'];
+        $page = get_post($page_id);
+        if (!$page) {
+            return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+
+        $layout = $this->bebuilder_read_layout($page_id);
+        if (is_wp_error($layout)) {
+            if ($layout->get_error_code() === 'no_bebuilder') {
+                return rest_ensure_response(['page_id' => $page_id, 'builder' => null, 'sources' => []]);
+            }
+            return $layout;
+        }
+
+        $links = [];
+        $non_utf8 = 0;
+        $this->bebuilder_collect_links($layout['items'], [], $links, $page_id, $non_utf8);
+        $sources = [[
+            'post_id' => $page_id,
+            'kind' => 'page',
+            'title' => $page->post_title,
+            'storage' => $layout['storage'],
+            'writable' => $layout['round_trips'],
+            'links' => $links,
+            'skipped_non_utf8' => $non_utf8,
+        ]];
+
+        foreach ($this->bebuilder_global_refs($layout['items']) as $tid => $kind) {
+            // BeTheme skips a global section/wrap whose template isn't published.
+            if (get_post_status($tid) !== 'publish') {
+                continue;
+            }
+            $source = [
+                'post_id' => $tid,
+                'kind' => $kind,
+                'title' => get_the_title($tid),
+                'storage' => null,
+                'writable' => false,
+                'links' => [],
+                'used_by' => $this->bebuilder_template_users($tid),
+            ];
+            $template = $this->bebuilder_read_layout($tid);
+            if (is_wp_error($template)) {
+                $source['error'] = $template->get_error_message();
+            } else {
+                // What renders: the template's first section (global section)
+                // or that section's wraps (global wrap).
+                $root = $kind === 'global_section' ? [0] : [0, 'wraps'];
+                $node = $kind === 'global_section'
+                    ? ($template['items'][0] ?? null)
+                    : ($template['items'][0]['wraps'] ?? null);
+                $template_links = [];
+                $template_non_utf8 = 0;
+                $this->bebuilder_collect_links($node, $root, $template_links, $tid, $template_non_utf8);
+                $source['storage'] = $template['storage'];
+                $source['writable'] = $template['round_trips'];
+                $source['links'] = $template_links;
+                $source['skipped_non_utf8'] = $template_non_utf8;
+            }
+            $sources[] = $source;
+        }
+
+        return rest_ensure_response(['page_id' => $page_id, 'builder' => 'bebuilder', 'sources' => $sources]);
+    }
+
+    /**
+     * The kind of `target_id` as seen from page `page_id`: 'page' for the
+     * page itself, or 'global_section'/'global_wrap' when it is a published
+     * template the page renders. Anything else is refused — Patrick never
+     * gets a free write to an arbitrary post.
+     *
+     * @return string|WP_Error
+     */
+    private function bebuilder_target_kind($page_id, $target_id)
+    {
+        if ($target_id === $page_id) {
+            return 'page';
+        }
+        $page_layout = $this->bebuilder_read_layout($page_id);
+        if (is_wp_error($page_layout)) {
+            return $page_layout;
+        }
+        $refs = $this->bebuilder_global_refs($page_layout['items']);
+        if (!isset($refs[$target_id]) || get_post_status($target_id) !== 'publish') {
+            return new WP_Error('target_not_on_page', "Post {$target_id} is not a published global section or wrap on page {$page_id}", ['status' => 403]);
+        }
+        return $refs[$target_id];
+    }
+
+    /** Purge the page and, for a shared template, every page that shows it. */
+    private function bebuilder_purge($page_id, $target_id, $kind)
+    {
+        $used_by = $kind === 'page' ? [] : $this->bebuilder_template_users($target_id);
+        $this->purge_site_caches($page_id);
+        foreach ($used_by as $user) {
+            if ($user['id'] !== $page_id) {
+                $this->purge_site_caches($user['id']);
+            }
+        }
+        return $used_by;
+    }
+
+    /**
+     * POST /pages/{id}/bebuilder — rewrite ONE string in a BeBuilder layout.
+     *
+     * Body: target_id (the page, or a Global Section/Wrap it renders), path
+     * (keys from GET), expected (the value Patrick read), value (the new
+     * string). Undo is the same call with expected/value swapped.
+     *
+     * Safety, in order:
+     *  - the target is the page or a published template the page renders;
+     *  - the layout must re-serialize to its exact stored bytes (see
+     *    bebuilder_read_layout), so one string and its length prefix are all
+     *    that change;
+     *  - the value at `path` must still be `expected`, or nothing is written;
+     *  - the stored bytes are kept in `_mehrana_mfn_backup` before writing
+     *    (no copy, no write); if the write then doesn't happen, the previous
+     *    copy is put back so the last good rollback point survives;
+     *  - the UPDATE only applies if the row still holds what was read, so a
+     *    BeBuilder save that landed first is not overwritten;
+     *  - the row is read back and must be exactly what was meant; if not,
+     *    the previous bytes go back — but only if the row still holds what
+     *    the read-back saw, so a save landing in that instant is left alone.
+     *
+     * It never calls wp_update_post(): saving a BeBuilder page through the
+     * core editor path is exactly how page-builder content goes missing.
+     */
+    public function bebuilder_update_value($request)
+    {
+        global $wpdb;
+
+        $page_id = (int) $request['id'];
+        $body = $request->get_json_params();
+        $target_id = (int) ($body['target_id'] ?? 0);
+        $path = $body['path'] ?? null;
+        $expected = $body['expected'] ?? null;
+        $value = $body['value'] ?? null;
+
+        if (!get_post($page_id)) {
+            return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+        if ($target_id <= 0 || !is_array($path) || empty($path) || !is_string($expected) || !is_string($value)) {
+            return new WP_Error('invalid_request', 'target_id, path, expected and value are required', ['status' => 400]);
+        }
+        if ($expected === $value) {
+            return new WP_Error('no_change', 'expected and value are identical', ['status' => 400]);
+        }
+
+        $kind = $this->bebuilder_target_kind($page_id, $target_id);
+        if (is_wp_error($kind)) {
+            return $kind;
+        }
+
+        $layout = $this->bebuilder_read_layout($target_id);
+        if (is_wp_error($layout)) {
+            return $layout;
+        }
+        if (!$layout['round_trips']) {
+            return new WP_Error('layout_not_round_trippable', "Post {$target_id}'s BeBuilder layout would not re-save byte-for-byte, so Patrick won't rewrite it. Edit this link in BeBuilder.", ['status' => 409]);
+        }
+
+        $items = $layout['items'];
+        $node = &$items;
+        foreach ($path as $key) {
+            if (!is_array($node)) {
+                unset($node);
+                return new WP_Error('path_not_found', 'That value is no longer in the layout — reload and try again', ['status' => 409]);
+            }
+            if (!array_key_exists($key, $node)) {
+                if (is_string($key) && ctype_digit($key) && array_key_exists((int) $key, $node)) {
+                    $key = (int) $key;
+                } else {
+                    unset($node);
+                    return new WP_Error('path_not_found', 'That value is no longer in the layout — reload and try again', ['status' => 409]);
+                }
+            }
+            $node = &$node[$key];
+        }
+        if (!is_string($node) || $node !== $expected) {
+            unset($node);
+            return new WP_Error('stale', 'The layout changed since Patrick read it (someone saved it in BeBuilder?) — reload and try again', ['status' => 409]);
+        }
+        $node = $value;
+        unset($node);
+
+        $payload = serialize($items);
+        $new_raw = $layout['storage'] === 'encoded' ? base64_encode($payload) : $payload;
+
+        // Rollback copy first. Keep the previous one to put back if this
+        // attempt ends up writing nothing.
+        $previous_backup = get_post_meta($target_id, '_mehrana_mfn_backup', true);
+        $restore_previous_backup = function () use ($target_id, $previous_backup) {
+            if (is_array($previous_backup) && isset($previous_backup['raw'])) {
+                update_post_meta($target_id, '_mehrana_mfn_backup', wp_slash($previous_backup));
+            } else {
+                delete_post_meta($target_id, '_mehrana_mfn_backup');
+            }
+        };
+        update_post_meta($target_id, '_mehrana_mfn_backup', wp_slash([
+            'saved_at' => time(),
+            'storage' => $layout['storage'],
+            'raw' => $layout['raw'],
+            'after_md5' => md5($new_raw),
+        ]));
+        $saved = get_post_meta($target_id, '_mehrana_mfn_backup', true);
+        if (!is_array($saved) || !isset($saved['raw']) || $saved['raw'] !== $layout['raw']) {
+            $restore_previous_backup();
+            return new WP_Error('backup_failed', 'Could not save a backup of the layout, so nothing was changed.', ['status' => 500]);
+        }
+
+        $updated = $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
+            $new_raw,
+            $layout['meta_id'],
+            md5($layout['raw'])
+        ));
+        wp_cache_delete($target_id, 'post_meta');
+
+        if ($updated === false) {
+            $restore_previous_backup();
+            return new WP_Error('db_error', 'Database update failed: ' . $wpdb->last_error, ['status' => 500]);
+        }
+        if ($updated === 0) {
+            $restore_previous_backup();
+            return new WP_Error('stale', 'The layout changed while Patrick was writing (someone saved it in BeBuilder?) — reload and try again', ['status' => 409]);
+        }
+
+        $check = $this->bebuilder_read_layout($target_id);
+        if (is_wp_error($check) || $check['raw'] !== $new_raw) {
+            $now = (string) $wpdb->get_var($wpdb->prepare(
+                "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_id = %d",
+                $layout['meta_id']
+            ));
+            $rolled_back = $wpdb->query($wpdb->prepare(
+                "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
+                $layout['raw'],
+                $layout['meta_id'],
+                md5($now)
+            ));
+            wp_cache_delete($target_id, 'post_meta');
+            $this->purge_site_caches($page_id);
+            if ($rolled_back) {
+                $restore_previous_backup();
+                $this->log("[BEBUILDER] Write to post {$target_id} did not read back as written — previous layout put back");
+                return new WP_Error('write_not_verified', 'The database did not keep the change exactly as written, so the previous layout was put back.', ['status' => 500]);
+            }
+            $this->log("[BEBUILDER] Write to post {$target_id} did not read back as written, and the row changed again before rollback — left as is");
+            return new WP_Error('write_not_verified', 'The database did not keep the change exactly as written, and the layout changed again before Patrick could put it back — check this page in BeBuilder. The previous layout is kept in the Patrick backup.', ['status' => 500]);
+        }
+
+        $used_by = $this->bebuilder_purge($page_id, $target_id, $kind);
+
+        $this->log("[BEBUILDER] Page {$page_id}: rewrote one value in {$kind} {$target_id} (" . strlen($layout['raw']) . ' → ' . strlen($new_raw) . ' bytes, ' . count($used_by) . ' page(s) share it)');
+
+        return rest_ensure_response([
+            'success' => true,
+            'page_id' => $page_id,
+            'target_id' => $target_id,
+            'kind' => $kind,
+            'storage' => $layout['storage'],
+            'bytes_before' => strlen($layout['raw']),
+            'bytes_after' => strlen($new_raw),
+            'used_by' => $used_by,
+        ]);
+    }
+
+    /**
+     * POST /pages/{id}/bebuilder/restore — put back the exact bytes kept by
+     * the last Patrick write to `target_id` (the page or a template it
+     * renders). Refuses when the layout changed after that write unless
+     * `force` is set, so a later BeBuilder save isn't silently undone.
+     * Emergency rollback; everyday Undo is the inverse POST.
+     */
+    public function bebuilder_restore($request)
+    {
+        global $wpdb;
+
+        $page_id = (int) $request['id'];
+        $body = $request->get_json_params();
+        $target_id = (int) ($body['target_id'] ?? $page_id);
+        $force = !empty($body['force']);
+
+        if (!get_post($page_id)) {
+            return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+        // A broken page layout can't list its refs; restoring the page itself
+        // is exactly the case that must still work.
+        $kind = $target_id === $page_id ? 'page' : $this->bebuilder_target_kind($page_id, $target_id);
+        if (is_wp_error($kind)) {
+            return $kind;
+        }
+
+        $backup = get_post_meta($target_id, '_mehrana_mfn_backup', true);
+        if (!is_array($backup) || !isset($backup['raw']) || !is_string($backup['raw'])) {
+            return new WP_Error('no_backup', "No Patrick backup for post {$target_id}", ['status' => 404]);
+        }
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT meta_id, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s",
+            $target_id,
+            'mfn-page-items'
+        ));
+        if (count((array) $rows) !== 1) {
+            return new WP_Error('ambiguous_layout', "Post {$target_id} has " . count((array) $rows) . ' BeBuilder layout rows; restore it by hand', ['status' => 409]);
+        }
+        $meta_id = (int) $rows[0]->meta_id;
+        $current_raw = (string) $rows[0]->meta_value;
+
+        if (!$force && md5($current_raw) !== ($backup['after_md5'] ?? '')) {
+            return new WP_Error('changed_since_write', 'The layout was saved again after Patrick\'s change; restoring would undo that too. Pass force to restore anyway.', ['status' => 409]);
+        }
+        if ($current_raw === $backup['raw']) {
+            return rest_ensure_response(['success' => true, 'target_id' => $target_id, 'restored_bytes' => 0, 'already' => true]);
+        }
+
+        $updated = $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
+            $backup['raw'],
+            $meta_id,
+            md5($current_raw)
+        ));
+        wp_cache_delete($target_id, 'post_meta');
+        if ($updated === false) {
+            return new WP_Error('db_error', 'Database update failed: ' . $wpdb->last_error, ['status' => 500]);
+        }
+        if ($updated === 0) {
+            return new WP_Error('stale', 'The layout changed while restoring — reload and try again', ['status' => 409]);
+        }
+        $now = (string) $wpdb->get_var($wpdb->prepare(
+            "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_id = %d",
+            $meta_id
+        ));
+        if ($now !== $backup['raw']) {
+            return new WP_Error('write_not_verified', 'The database did not keep the restored layout exactly — check this page in BeBuilder.', ['status' => 500]);
+        }
+
+        $this->bebuilder_purge($page_id, $target_id, $kind);
+        $this->log("[BEBUILDER] Restored post {$target_id} from the backup taken " . gmdate('c', (int) ($backup['saved_at'] ?? 0)));
+
+        return rest_ensure_response(['success' => true, 'target_id' => $target_id, 'restored_bytes' => strlen($backup['raw'])]);
     }
 
     /**
