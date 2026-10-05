@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.36.0
+ * Version: 5.36.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.36.0';
+    private $version = '5.36.1';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -216,7 +216,8 @@ class Mehrana_App_Plugin
         // admin, exempt from optimization, still sees it. SiteGround exposes
         // these exclusion filters; the script_loader_tag markers cover
         // Cloudflare Rocket Loader, Autoptimize, WP Rocket, WP Fastest Cache,
-        // Perfmatters and similar.
+        // Perfmatters and similar. The plugin itself loads the script with
+        // native async (src untouched), so it no longer blocks rendering.
         add_filter('sgo_javascript_combine_exclude', [$this, 'mehrana_cta_optimizer_exclude_handles']);
         add_filter('sgo_js_async_exclude', [$this, 'mehrana_cta_optimizer_exclude_handles']);
         add_filter('sgo_js_minify_exclude', [$this, 'mehrana_cta_optimizer_exclude_handles']);
@@ -12082,16 +12083,29 @@ class Mehrana_App_Plugin
      * init, connectedCallback fired twice, both async config fetches
      * resolved, and both appended a form to the shadow root. Added a
      * renderId guard so only the latest render commits.
+     *
+     * v5.36.1 — loaded with native `async`. As a plain footer script it was
+     * parser-blocking on every page of every client site (Lighthouse listed
+     * it under render-blocking resources, ~940 ms on quickfitparts mobile).
+     * Native async keeps the cross-origin src untouched, so the element's
+     * origin resolution (data-crm → this script's src → prod default) works
+     * exactly as before; the optimizer opt-out attributes stay so nothing
+     * combines or rewrites it. Async rather than defer: a deferred script
+     * holds DOMContentLoaded until it arrives, which would tie every client
+     * page's ready handlers to app.mehrana.agency's response time.
      */
     public function enqueue_lead_magnet_frontend()
     {
         $crm = $this->mehrana_crm_origin();
+        // WP 6.3+ reads this array as in-footer + async loading strategy.
+        // Older WP sees a truthy $in_footer (footer, no strategy) and
+        // mehrana_cta_script_loader_tag() adds the async attribute itself.
         wp_enqueue_script(
             'mehrana-cta-element',
             $crm . '/api/public/custom-elements/mehrana-cta.js',
             [],
             $this->version,
-            true // in footer; the element waits for connectedCallback so timing is fine.
+            ['in_footer' => true, 'strategy' => 'async']
         );
     }
 
@@ -12158,6 +12172,10 @@ class Mehrana_App_Plugin
      * Tag the custom-element <script> with the opt-out attributes honored by
      * the major non-SiteGround optimizers so it's never combined, minified,
      * deferred, or Rocket-Loader-wrapped — any of which strips its origin.
+     *
+     * The frontend tag also gets native `async` when WordPress didn't add it
+     * (pre-6.3 WP has no loading strategies). Native async is not an
+     * optimizer rewrite — the src stays our cross-origin URL.
      */
     public function mehrana_cta_script_loader_tag($tag, $handle)
     {
@@ -12169,6 +12187,11 @@ class Mehrana_App_Plugin
                     $tag
                 );
             }
+        }
+        // Match a real async/defer attribute only — not data-no-defer or
+        // data-wp-strategy="async", which don't change how the script loads.
+        if ($handle === 'mehrana-cta-element' && !preg_match('/<script\b[^>]*\s(?:async|defer)(?=[\s=>\/])/i', $tag)) {
+            $tag = preg_replace('/<script\b/i', '<script async', $tag, 1);
         }
         return $tag;
     }
