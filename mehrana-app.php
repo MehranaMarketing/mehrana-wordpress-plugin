@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.36.1
+ * Version: 5.36.2
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.36.1';
+    private $version = '5.36.2';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -135,6 +135,12 @@ class Mehrana_App_Plugin
         add_filter('wpseo_schema_graph', [$this, 'filter_yoast_schema_graph'], 10, 2);
         add_filter('wpseo_json_ld_output', [$this, 'filter_yoast_json_ld_output'], 10, 1);
         add_filter('rank_math/json_ld', [$this, 'filter_rank_math_json_ld'], 10, 2);
+
+        // Rank Math only renders a custom og:image from the attachment id
+        // meta. Pages whose OG image Patrick wrote as a URL (everything before
+        // v5.36.2, or an image outside the media library) get it served here.
+        add_action('rank_math/opengraph/facebook/add_images', [$this, 'rank_math_og_image_from_url']);
+        add_action('rank_math/opengraph/twitter/add_images', [$this, 'rank_math_og_image_from_url']);
         add_filter('woocommerce_structured_data_product', [$this, 'filter_woocommerce_structured_data'], 10, 2);
         add_filter('woocommerce_structured_data_product_offer', [$this, 'filter_woocommerce_structured_data'], 10, 2);
         add_filter('woocommerce_structured_data_review', [$this, 'filter_woocommerce_structured_data'], 10, 2);
@@ -11621,6 +11627,69 @@ class Mehrana_App_Plugin
     }
 
     /**
+     * Keep Rank Math's og:image attachment id in step with the URL just written.
+     *
+     * Rank Math renders a custom og:image only from `rank_math_facebook_image_id`;
+     * the URL meta is what its editor displays. Point the id at the matching
+     * media-library attachment, or clear it when the image isn't in the library
+     * so a stale pick from Rank Math's editor can't outrank the new URL (the
+     * add_images fallback below serves the URL instead).
+     *
+     * @param string $type 'post' or 'term'
+     */
+    private function sync_rank_math_og_image_id($type, $object_id, $url)
+    {
+        $attachment_id = $url !== '' ? attachment_url_to_postid($url) : 0;
+        if ($attachment_id > 0) {
+            update_metadata($type, $object_id, 'rank_math_facebook_image_id', $attachment_id);
+        } else {
+            delete_metadata($type, $object_id, 'rank_math_facebook_image_id');
+        }
+    }
+
+    /**
+     * Rank Math `opengraph/{network}/add_images` hook: serve the og:image URL
+     * meta when no attachment id is set. Runs before Rank Math's own per-page
+     * lookup, so an image found here stops it falling through to the featured
+     * or content image. Rank Math still validates the file type.
+     *
+     * @param object $image RankMath\OpenGraph\Image
+     */
+    public function rank_math_og_image_from_url($image)
+    {
+        if (!is_object($image) || !method_exists($image, 'add_image_by_url')) {
+            return;
+        }
+
+        if (is_singular() || is_front_page() || is_home()) {
+            $type = 'post';
+        } elseif (is_category() || is_tag() || is_tax()) {
+            $type = 'term';
+        } else {
+            return;
+        }
+        $object_id = get_queried_object_id();
+        if (!$object_id) {
+            return;
+        }
+
+        // An image picked in Rank Math's editor (stored as an id) wins.
+        if ((int) get_metadata($type, $object_id, 'rank_math_facebook_image_id', true) > 0) {
+            return;
+        }
+        // Twitter follows the Facebook image unless the page opted out.
+        if (strpos((string) current_action(), '/twitter/') !== false
+            && get_metadata($type, $object_id, 'rank_math_twitter_use_facebook', true) === 'off') {
+            return;
+        }
+
+        $url = get_metadata($type, $object_id, 'rank_math_facebook_image', true);
+        if (is_string($url) && $url !== '') {
+            $image->add_image_by_url($url);
+        }
+    }
+
+    /**
      * Update page SEO meta (Rank Math / Yoast)
      *
      * @param WP_REST_Request $request
@@ -11715,6 +11784,7 @@ class Mehrana_App_Plugin
             $og_image = esc_url_raw($body['og_image']);
             if ($has_rank_math) {
                 update_post_meta($page_id, 'rank_math_facebook_image', $og_image);
+                $this->sync_rank_math_og_image_id('post', $page_id, $og_image);
             } elseif ($has_yoast) {
                 update_post_meta($page_id, '_yoast_wpseo_opengraph-image', $og_image);
             }
@@ -11917,7 +11987,10 @@ class Mehrana_App_Plugin
 
         if (isset($body['og_image'])) {
             $og_image = esc_url_raw($body['og_image']);
-            if ($has_rank_math) update_term_meta($term_id, 'rank_math_facebook_image', $og_image);
+            if ($has_rank_math) {
+                update_term_meta($term_id, 'rank_math_facebook_image', $og_image);
+                $this->sync_rank_math_og_image_id('term', $term_id, $og_image);
+            }
             elseif ($has_yoast) $yoast_meta[$taxonomy][$term_id]['wpseo_opengraph-image'] = $og_image;
             $updated['og_image'] = $og_image;
         }
