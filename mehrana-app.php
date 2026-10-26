@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.36.2
+ * Version: 5.36.3
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.36.2';
+    private $version = '5.36.3';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -4414,10 +4414,18 @@ class Mehrana_App_Plugin
         // Without this pass, alts on Elementor sites looked deployed in our
         // dashboard but the next crawl re-discovered them as blank because
         // post_content was empty / wrapper-only.
+        //
+        // Revisions and autosaves are skipped, and each row is written by its
+        // meta_id (v5.36.3). Before, a revision's row was written with
+        // update_post_meta(), which WordPress redirects to the parent post:
+        // an old revision's whole layout replaced the live page (Rosmon,
+        // /projects/65-forest-park, 2026-10-11).
         $elementor_posts = $wpdb->get_results($wpdb->prepare(
-            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
-             WHERE meta_key = '_elementor_data'
-               AND (meta_value LIKE %s OR meta_value LIKE %s)",
+            "SELECT pm.meta_id, pm.post_id, pm.meta_value FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_elementor_data'
+               AND p.post_type <> 'revision'
+               AND (pm.meta_value LIKE %s OR pm.meta_value LIKE %s)",
             '%' . $wpdb->esc_like((string) $id) . '%',
             '%' . $wpdb->esc_like($filename_without_ext) . '%'
         ));
@@ -4427,7 +4435,19 @@ class Mehrana_App_Plugin
         foreach ($elementor_posts as $row) {
             $changed = $this->rewrite_elementor_alt($row->meta_value, $id, $image_urls, $sanitized_alt);
             if ($changed !== null) {
-                update_post_meta($row->post_id, '_elementor_data', wp_slash($changed));
+                // Only if the row still holds what we read, so an Elementor
+                // save that landed meanwhile is never overwritten.
+                $written = $wpdb->query($wpdb->prepare(
+                    "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE meta_id = %d AND MD5(meta_value) = %s",
+                    $changed,
+                    $row->meta_id,
+                    md5($row->meta_value)
+                ));
+                wp_cache_delete($row->post_id, 'post_meta');
+                if (!$written) {
+                    $this->log("[update_media_alt] Pass 2 skipped post {$row->post_id}: its layout changed while Patrick was writing");
+                    continue;
+                }
                 $elementor_updated++;
                 clean_post_cache($row->post_id);
                 $touched_post_ids[] = (int) $row->post_id;
@@ -7490,9 +7510,16 @@ class Mehrana_App_Plugin
         if (!$this->bebuilder_theme_active() || $needle === '') {
             return [];
         }
+        // Revisions are left out: the guarded writer keeps its rollback copy
+        // with update_post_meta(), which WordPress redirects from a revision
+        // to the parent — a revision's layout would replace (then delete)
+        // the live page's Patrick backup.
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
-             WHERE meta_key = 'mfn-page-items' AND (meta_value LIKE %s OR meta_value NOT LIKE 'a:%%')",
+            "SELECT pm.post_id, pm.meta_value FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = 'mfn-page-items'
+               AND p.post_type <> 'revision'
+               AND (pm.meta_value LIKE %s OR pm.meta_value NOT LIKE 'a:%%')",
             '%' . $wpdb->esc_like($needle) . '%'
         ));
         $ids = [];
