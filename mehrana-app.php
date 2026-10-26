@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 5.36.3
+ * Version: 6.0.0
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '5.36.3';
+    private $version = '6.0.0';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -655,7 +655,16 @@ class Mehrana_App_Plugin
             'args' => [
                 'from_url' => [
                     'required' => true,
-                    'sanitize_callback' => 'esc_url_raw'
+                    // A regex source is a pattern, not a URL: esc_url_raw
+                    // stripped ^ \ { } — `^/services/(.*)$` was stored
+                    // unanchored and redirected other live pages, `^old/(.*)$`
+                    // became `http://old/(.*)$` and never fired.
+                    'sanitize_callback' => function ($value, $request) {
+                        if ((string) $request->get_param('match_type') === 'regex') {
+                            return trim(wp_check_invalid_utf8((string) $value));
+                        }
+                        return esc_url_raw($value);
+                    }
                 ],
                 'to_url' => [
                     'required' => true,
@@ -1027,7 +1036,9 @@ class Mehrana_App_Plugin
         }
 
         // Store as JSON string so wp_head can emit it verbatim without re-encoding.
-        update_post_meta($page_id, '_mehrana_schema_markup', wp_json_encode($schema));
+        // wp_slash: update_post_meta unslashes, which would turn every JSON
+        // escape (é, \", \n) into broken text.
+        update_post_meta($page_id, '_mehrana_schema_markup', wp_slash(wp_json_encode($schema)));
         $this->log("[PAGE_SCHEMA] Stored " . count($schema) . " JSON-LD block(s) for page {$page_id}");
 
         return rest_ensure_response([
@@ -1077,12 +1088,14 @@ class Mehrana_App_Plugin
         $page_id = get_the_ID();
         if (!$page_id) return;
 
-        $blocks = $this->resolve_schema_for_post($page_id);
+        $blocks = $this->schema_blocks_for_post($page_id);
         if (empty($blocks)) return;
 
         foreach ($blocks as $entry) {
             if (!is_array($entry)) continue;
-            $encoded = wp_json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            // JSON_HEX_TAG: page text in a token (a title, a list item) can
+            // hold "</script>", which would otherwise close this tag early.
+            $encoded = wp_json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG);
             if (!$encoded) continue;
             echo "\n" . '<script type="application/ld+json">' . $encoded . '</script>';
         }
@@ -1104,6 +1117,22 @@ class Mehrana_App_Plugin
      *   3. compose: suppress by primary @type, override replaces/adds by identity
      *      (@id+@type, else @type+name), drop structurally-empty, de-dupe last-wins.
      */
+    /**
+     * The JSON-LD blocks Patrick prints on a post, resolved once per request.
+     * Empty for a password-protected post: its tokens read the protected
+     * content, which must not leak into the page source.
+     */
+    private function schema_blocks_for_post($post_id)
+    {
+        static $cache = [];
+        $post_id = intval($post_id);
+        if ($post_id <= 0) return [];
+        if (!array_key_exists($post_id, $cache)) {
+            $cache[$post_id] = post_password_required($post_id) ? [] : $this->resolve_schema_for_post($post_id);
+        }
+        return $cache[$post_id];
+    }
+
     private function resolve_schema_for_post($post_id)
     {
         // 0. Legacy per-page full replacement (highest precedence escape hatch).
@@ -1581,9 +1610,10 @@ class Mehrana_App_Plugin
         $body = $request->get_json_params();
         $match = isset($body['match']) && is_array($body['match']) ? $body['match'] : [];
 
+        // Same reach as rule_matches_post(): no post_types = every public type.
         $post_types = !empty($match['post_types']) && is_array($match['post_types'])
             ? array_values(array_filter($match['post_types'], 'is_string'))
-            : ['post', 'page'];
+            : array_values(get_post_types(['public' => true], 'names'));
 
         $args = [
             'post_type'      => $post_types,
@@ -1591,11 +1621,25 @@ class Mehrana_App_Plugin
             'posts_per_page' => 10,
             'fields'         => 'ids',
         ];
-        if (!empty($match['include_ids']) && is_array($match['include_ids'])) {
-            $args['post__in'] = array_map('intval', $match['include_ids']);
+        $exclude_ids = !empty($match['exclude_ids']) && is_array($match['exclude_ids'])
+            ? array_map('intval', $match['exclude_ids']) : [];
+        if ($exclude_ids) {
+            $args['post__not_in'] = $exclude_ids;
         }
-        if (!empty($match['exclude_ids']) && is_array($match['exclude_ids'])) {
-            $args['post__not_in'] = array_map('intval', $match['exclude_ids']);
+
+        // include_ids match on their own (rule_matches_post short-circuits on
+        // them), so the ones the other criteria would miss are added to the
+        // count rather than AND-ed into the query.
+        $extra = [];
+        if (!empty($match['include_ids']) && is_array($match['include_ids'])) {
+            $without_include = $match;
+            unset($without_include['include_ids']);
+            foreach (array_unique(array_map('intval', $match['include_ids'])) as $iid) {
+                if ($iid > 0 && !in_array($iid, $exclude_ids, true) && get_post_status($iid) === 'publish'
+                    && !$this->rule_matches_post($without_include, $iid)) {
+                    $extra[] = ['id' => $iid, 'title' => get_the_title($iid), 'url' => get_permalink($iid)];
+                }
+            }
         }
         if (!empty($match['taxonomies']) && is_array($match['taxonomies'])) {
             $tax_query = ['relation' => 'AND'];
@@ -1618,10 +1662,11 @@ class Mehrana_App_Plugin
 
         if (empty($slug_patterns)) {
             $q = new WP_Query($args);
-            $total = (int)$q->found_posts;
+            $total = (int)$q->found_posts + count($extra);
             $samples = array_map(function ($id) {
                 return ['id' => $id, 'title' => get_the_title($id), 'url' => get_permalink($id)];
             }, $q->posts);
+            $samples = array_slice(array_merge($extra, $samples), 0, 10);
             return rest_ensure_response(['total' => $total, 'samples' => $samples]);
         }
 
@@ -1629,8 +1674,8 @@ class Mehrana_App_Plugin
         $wide_args = $args;
         $wide_args['posts_per_page'] = 500;
         $q = new WP_Query($wide_args);
-        $matched = [];
-        $total = 0;
+        $matched = array_slice($extra, 0, 10);
+        $total = count($extra);
         foreach ($q->posts as $id) {
             $url = get_permalink($id);
             if ($this->url_matches_any_pattern($url, $slug_patterns)) {
@@ -2198,27 +2243,11 @@ class Mehrana_App_Plugin
         if ($post_id <= 0) return false;
         if (isset($cache[$post_id])) return $cache[$post_id];
 
-        // Per-page override wins immediately.
-        $override = get_post_meta($post_id, '_mehrana_schema_markup', true);
-        if (!empty($override)) return $cache[$post_id] = true;
-
-        // Schema 2 path-keyed override delta (blocks and/or suppressedTypes) also
-        // means Patrick owns this page — suppress Yoast/RankMath/Woo here too.
-        $delta = $this->load_page_override_for_post($post_id);
-        if (!empty($delta['override']) || !empty($delta['suppressedTypes'])) {
-            return $cache[$post_id] = true;
-        }
-
-        // Otherwise check rules.
-        $rules = $this->load_schema_rules();
-        foreach ($rules as $rule) {
-            if (!isset($rule['match'])) continue;
-            if ($this->rule_matches_post($rule['match'], $post_id)) {
-                return $cache[$post_id] = true;
-            }
-        }
-
-        return $cache[$post_id] = false;
+        // Patrick owns the page's schema only when it actually prints some.
+        // A rule that matches but resolves to nothing (FAQPage with no FAQs,
+        // a recipe block on a page that isn't one) used to silence Yoast /
+        // Rank Math / Woo anyway and leave the page with no schema at all.
+        return $cache[$post_id] = !empty($this->schema_blocks_for_post($post_id));
     }
 
     /**
@@ -2569,12 +2598,27 @@ class Mehrana_App_Plugin
             );
         }
 
-        // Check allowed origins (optional - configurable in settings)
-        $allowed_origins = get_option('plb_allowed_origins', '');
-        if (!empty($allowed_origins)) {
-            $origin = $request->get_header('origin');
-            $allowed_list = array_map('trim', explode(',', $allowed_origins));
-            if (!in_array($origin, $allowed_list)) {
+        // Check allowed origins (optional - Settings → Allowed Origins). The
+        // settings page saves `map_allowed_origins`; this used to read an old
+        // option name, so the setting never did anything. It only applies to
+        // browser requests from another site: a server call (no Origin
+        // header) and the site's own pages are never blocked.
+        $allowed_origins = get_option('map_allowed_origins', '');
+        if ($allowed_origins === '' || $allowed_origins === false) {
+            $allowed_origins = get_option('plb_allowed_origins', '');
+        }
+        $origin = (string) $request->get_header('origin');
+        if (!empty($allowed_origins) && $origin !== '') {
+            $allowed_list = array_filter(array_map(function ($o) {
+                return untrailingslashit(trim($o));
+            }, explode(',', $allowed_origins)));
+            foreach ([home_url(), site_url(), admin_url()] as $own) {
+                $p = wp_parse_url($own);
+                if (!empty($p['host'])) {
+                    $allowed_list[] = ($p['scheme'] ?? 'https') . '://' . $p['host'] . (isset($p['port']) ? ':' . $p['port'] : '');
+                }
+            }
+            if (!in_array(untrailingslashit($origin), $allowed_list, true)) {
                 $this->log('Blocked request from unauthorized origin: ' . $origin);
                 return new WP_Error(
                     'rest_forbidden',
@@ -2589,23 +2633,37 @@ class Mehrana_App_Plugin
     }
 
     /**
-     * Rate limiting check - DISABLED FOR TESTING
+     * Rate limit: 200 requests per minute per IP, in a fixed 60-second window.
+     *
+     * Counted once per HTTP request. Core calls the permission callback again
+     * for every handler on the route (rest_send_allow_header), and the old
+     * counter also restarted its 60 s expiry on every hit, so a steady bulk
+     * job from Patrick hit 429 after about 50–100 calls however slowly it ran.
      */
     private function check_rate_limit()
     {
-        $limit = 200; // Requests per minute
-        $ip = $_SERVER['REMOTE_ADDR'];
-        $transient_key = 'map_rate_limit_' . md5($ip);
-
-        $current = get_transient($transient_key);
-        if ($current !== false && $current >= $limit) {
-            return false;
+        static $decided = null;
+        if ($decided !== null) {
+            return $decided;
         }
 
-        $new_count = ($current === false) ? 1 : $current + 1;
-        set_transient($transient_key, $new_count, 60);
+        $limit = 200;
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : '';
+        $transient_key = 'map_rate_limit_' . md5($ip);
+        $now = time();
 
-        return true;
+        $window = get_transient($transient_key);
+        if (!is_array($window) || !isset($window['start'], $window['count']) || $now - (int) $window['start'] >= 60) {
+            $window = ['start' => $now, 'count' => 0];
+        }
+        if ((int) $window['count'] >= $limit) {
+            return $decided = false;
+        }
+
+        $window['count'] = (int) $window['count'] + 1;
+        set_transient($transient_key, $window, max(1, 60 - ($now - (int) $window['start'])));
+
+        return $decided = true;
     }
 
     /**
@@ -3305,10 +3363,28 @@ class Mehrana_App_Plugin
             }
         }
         $total['post_ids'] = array_values(array_unique($total['post_ids']));
+        $this->invalidate_elementor_caches($total['post_ids']);
         foreach (array_slice($total['post_ids'], 0, 50) as $pid) {
             $this->purge_site_caches($pid);
         }
         return $total;
+    }
+
+    /**
+     * Elementor serves section/column backgrounds from a generated
+     * uploads/elementor/css/post-{id}.css and widget HTML from a per-widget
+     * cache. After an image URL moves, both still name the old (deleted) file
+     * until the page is re-saved; dropping the meta makes Elementor rebuild
+     * them on the next view.
+     */
+    private function invalidate_elementor_caches(array $post_ids)
+    {
+        foreach (array_unique(array_map('intval', $post_ids)) as $pid) {
+            if ($pid > 0 && metadata_exists('post', $pid, '_elementor_data')) {
+                delete_post_meta($pid, '_elementor_css');
+                delete_post_meta($pid, '_elementor_element_cache');
+            }
+        }
     }
 
     /**
@@ -3338,6 +3414,12 @@ class Mehrana_App_Plugin
             return $data;
         }
 
+        // An object of a class that isn't loaded can't be written to (PHP 8
+        // throws mid-swap, after files were already moved). Leave it as is.
+        if ($data instanceof \__PHP_Incomplete_Class) {
+            return $data;
+        }
+
         if (is_object($data)) {
             foreach (get_object_vars($data) as $key => $value) {
                 $data->$key = $this->deep_str_replace($value, $old, $new);
@@ -3356,8 +3438,10 @@ class Mehrana_App_Plugin
     public function replace_media($request)
     {
         // HARDENING: Increase memory limit for image processing
-        @ini_set('memory_limit', '512M');
-        @ini_set('max_execution_time', '300');
+        if (function_exists('ini_set')) {
+            @ini_set('memory_limit', '512M');
+            @ini_set('max_execution_time', '300');
+        }
 
         try {
             $id = intval($request['id']);
@@ -3459,6 +3543,13 @@ class Mehrana_App_Plugin
                 $same_format = $current_ext === $new_extension || ($new_extension === 'jpg' && $current_ext === 'jpeg');
                 if ($new_extension && !$same_format) {
                     $new_file = $path_info['dirname'] . '/' . $path_info['filename'] . '.' . $new_extension;
+                    // `banner.jpg` and `banner.png` can share a folder; both
+                    // convert to `banner.webp`. The second conversion used to
+                    // overwrite the first one's file. Take a free name instead.
+                    if (file_exists($new_file)) {
+                        $new_file = $path_info['dirname'] . '/' . wp_unique_filename($path_info['dirname'], basename($new_file));
+                        $this->log("[REPLACE_MEDIA] {$path_info['filename']}.{$new_extension} is taken — writing " . basename($new_file));
+                    }
                 } else {
                     $new_file = $current_file;
                 }
@@ -3552,22 +3643,16 @@ class Mehrana_App_Plugin
                 update_attached_file($id, $new_file);
 
                 // Update mime type
-                wp_update_post([
+                $this->update_post_unfiltered([
                     'ID' => $id,
                     'post_mime_type' => $mime_type
                 ]);
-            } else {
-                // Same extension but still need to delete old thumbnails for regeneration
-                if (!empty($old_metadata['sizes'])) {
-                    $old_dir = dirname($current_file);
-                    foreach ($old_metadata['sizes'] as $size => $size_data) {
-                        $thumb_path = $old_dir . '/' . $size_data['file'];
-                        if (file_exists($thumb_path)) {
-                            unlink($thumb_path);
-                        }
-                    }
-                }
             }
+            // Same format: the old sizes are NOT deleted first any more.
+            // Regeneration writes each size under the same name (overwriting
+            // it), and a size the smaller new image can't produce (1536px,
+            // 2048px, wide theme crops) keeps its old file — deleting it left
+            // every page that embedded it with a broken image.
 
             // Regenerate thumbnails
             require_once(ABSPATH . 'wp-admin/includes/image.php');
@@ -3601,12 +3686,15 @@ class Mehrana_App_Plugin
                 if (!empty($old_metadata['sizes'])) {
                     foreach ($old_metadata['sizes'] as $size => $size_data) {
                         $stem = pathinfo($size_data['file'], PATHINFO_FILENAME);
-                        $new_size_file = !empty($new_metadata['sizes'][$size]['file'])
-                            ? $new_metadata['sizes'][$size]['file']
-                            : $stem . $new_ext;
+                        // A size the new image didn't produce (smaller than
+                        // it, or no WebP support) points at the new full file,
+                        // which exists — not at a guessed name that doesn't.
+                        $new_size_url = !empty($new_metadata['sizes'][$size]['file'])
+                            ? $new_path_info['dirname'] . '/' . $new_metadata['sizes'][$size]['file']
+                            : $new_url;
                         $pairs[] = [
                             $old_path_info['dirname'] . '/' . $stem . $old_ext,
-                            $new_path_info['dirname'] . '/' . $new_size_file,
+                            $new_size_url,
                         ];
                     }
                 }
@@ -3616,8 +3704,12 @@ class Mehrana_App_Plugin
 
             return rest_ensure_response([
                 'success' => true,
-                'backup_url' => $backup_url,
-                'backup_path' => $backup_path,
+                // Only when a backup file was actually written (none for an
+                // offloaded file that isn't on disk) — Patrick records these
+                // as the Undo source.
+                'backup_created' => $backup_created,
+                'backup_url' => $backup_created ? $backup_url : null,
+                'backup_path' => $backup_created ? $backup_path : null,
                 // Where the old file was still referenced and now points at
                 // the new one (null when the file name didn't change).
                 'references' => $references,
@@ -3714,7 +3806,10 @@ class Mehrana_App_Plugin
 
         // Never clobber a neighbour. Suffix until the whole family is free.
         $metadata  = wp_get_attachment_metadata($id);
-        $orig_name = get_post_meta($id, '_wp_original_image', true);
+        // Core keeps the pre-`-scaled` original in the metadata's
+        // `original_image`; `_wp_original_image` is only a fallback for sites
+        // where something else wrote it.
+        $orig_name = !empty($metadata['original_image']) ? $metadata['original_image'] : get_post_meta($id, '_wp_original_image', true);
         $suffix    = 0;
         $base_slug = $slug;
         $stem      = $target_stem;
@@ -3763,6 +3858,16 @@ class Mehrana_App_Plugin
         }
 
         // Generated sizes: `old-stem-300x200.jpg` -> `new-stem-300x200.jpg`.
+        // A `-scaled` upload's sizes are named after the original
+        // (`photo-300x200.jpg`, not `photo-scaled-300x200.jpg`), so they map
+        // onto the plain new slug; they used to be skipped, keeping the old
+        // name on every size while the rename reported success.
+        $old_stem = pathinfo($old_base, PATHINFO_FILENAME);
+        $stem_maps = [[$old_stem, $stem, false]];
+        if ($is_scaled) {
+            // Only real size tails (`-300x200…`) under the shorter stem.
+            $stem_maps[] = [preg_replace('/-scaled$/i', '', $old_stem), $base_slug, true];
+        }
         $size_renames = [];
         if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
             foreach ($metadata['sizes'] as $size_key => $size_data) {
@@ -3770,11 +3875,16 @@ class Mehrana_App_Plugin
                 $size_file = $size_data['file'];
                 $size_ext  = pathinfo($size_file, PATHINFO_EXTENSION);
                 $size_stem = pathinfo($size_file, PATHINFO_FILENAME);
-                $old_stem  = pathinfo($old_base, PATHINFO_FILENAME);
                 // Only the leading stem is ours; the `-WxH` tail stays put.
-                if (strpos($size_stem, $old_stem) !== 0) continue;
-                $tail          = substr($size_stem, strlen($old_stem));
-                $new_size_file = $stem . $tail . '.' . $size_ext;
+                $new_size_file = null;
+                foreach ($stem_maps as $map) {
+                    if (strpos($size_stem, $map[0]) === 0
+                        && (!$map[2] || preg_match('/^-\d+x\d+/', substr($size_stem, strlen($map[0]))))) {
+                        $new_size_file = $map[1] . substr($size_stem, strlen($map[0])) . '.' . $size_ext;
+                        break;
+                    }
+                }
+                if ($new_size_file === null) continue;
                 if ($move($size_file, $new_size_file) === null) {
                     $rollback();
                     return new WP_Error('rename_failed', "Could not move the {$size_key} size — nothing was changed.", ['status' => 500]);
@@ -3788,7 +3898,9 @@ class Mehrana_App_Plugin
         $new_orig_name = null;
         // `$orig_name === $old_base` would mean the master *is* the original;
         // it has already been moved above and must not be recorded twice.
-        if ($orig_name && $orig_name !== $old_base) {
+        // Only behind a `-scaled` master: a rotated upload's original would
+        // land on the master's own new name.
+        if ($orig_name && $orig_name !== $old_base && $is_scaled) {
             $orig_ext      = pathinfo($orig_name, PATHINFO_EXTENSION);
             $new_orig_name = $base_slug . '.' . $orig_ext;
             $moved_original = $move($orig_name, $new_orig_name);
@@ -3809,9 +3921,12 @@ class Mehrana_App_Plugin
             if (!empty($metadata['file'])) {
                 $metadata['file'] = ltrim(($sub_dir === '' ? '' : $sub_dir . '/') . $new_base, '/');
             }
+            if ($new_orig_name && !empty($metadata['original_image'])) {
+                $metadata['original_image'] = $new_orig_name;
+            }
             wp_update_attachment_metadata($id, $metadata);
         }
-        if ($new_orig_name) {
+        if ($new_orig_name && get_post_meta($id, '_wp_original_image', true)) {
             update_post_meta($id, '_wp_original_image', $new_orig_name);
         }
 
@@ -3825,6 +3940,9 @@ class Mehrana_App_Plugin
         $rewrites = [[$path_prefix . $old_base, $path_prefix . $new_base]];
         foreach ($size_renames as $pair) {
             $rewrites[] = [$path_prefix . $pair[0], $path_prefix . $pair[1]];
+        }
+        if ($new_orig_name) {
+            $rewrites[] = [$path_prefix . $orig_name, $path_prefix . $new_orig_name];
         }
 
         // Same reference swap as WebP conversion and restore: post_content,
@@ -3843,6 +3961,7 @@ class Mehrana_App_Plugin
             $css_files    += $r['css_files'];
             $touched       = array_merge($touched, $r['post_ids']);
         }
+        $this->invalidate_elementor_caches($touched);
         foreach (array_slice(array_values(array_unique($touched)), 0, 50) as $pid) {
             $this->purge_site_caches($pid);
         }
@@ -3931,13 +4050,15 @@ class Mehrana_App_Plugin
         if ($is_scaled && file_exists($dir . '/' . $base_slug . '.' . $ext)) {
             return true;
         }
+        // A `-scaled` upload's sizes go under the plain slug (see rename_media).
+        $size_stem = $is_scaled ? $base_slug : $stem;
         if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
             foreach ($metadata['sizes'] as $size_data) {
                 if (empty($size_data['file'])) continue;
                 $size_ext = pathinfo($size_data['file'], PATHINFO_EXTENSION);
                 $tail = preg_replace('/^.*?(-\d+x\d+)$/', '$1', pathinfo($size_data['file'], PATHINFO_FILENAME));
                 if ($tail && $tail !== pathinfo($size_data['file'], PATHINFO_FILENAME)
-                    && file_exists($dir . '/' . $stem . $tail . '.' . $size_ext)) {
+                    && file_exists($dir . '/' . $size_stem . $tail . '.' . $size_ext)) {
                     return true;
                 }
             }
@@ -4312,6 +4433,21 @@ class Mehrana_App_Plugin
     /**
      * Update media alt text
      */
+    /**
+     * The filename stem every file of an attachment starts with — the stem a
+     * LIKE search for "posts that embed this image" has to use. For a
+     * `-scaled` upload that is the original's stem (`photo`), because WordPress
+     * names the generated sizes after the original, not the scaled copy.
+     */
+    private function media_search_stem($attachment_id, $url)
+    {
+        $metadata = wp_get_attachment_metadata($attachment_id);
+        if (!empty($metadata['original_image'])) {
+            return pathinfo($metadata['original_image'], PATHINFO_FILENAME);
+        }
+        return pathinfo(basename((string) $url), PATHINFO_FILENAME);
+    }
+
     public function update_media_alt($request)
     {
         $id = intval($request['id']);
@@ -4360,10 +4496,18 @@ class Mehrana_App_Plugin
                 }
             }
         }
+        // A big upload is served as `photo-scaled.jpg`; the untouched original
+        // `photo.jpg` sits beside it and can be embedded too.
+        if (!empty($metadata['original_image'])) {
+            $image_urls[] = $base_url . '/' . $metadata['original_image'];
+        }
 
-        // Filename for both LIKE search and Elementor JSON matching.
+        // Filename for both LIKE search and Elementor JSON matching. For a
+        // `-scaled` upload this is the original's stem: its sizes are named
+        // `photo-1024x683.jpg`, so searching for `photo-scaled` missed every
+        // post that embeds a size (Gutenberg uses "large" by default).
         $filename = basename($image_url);
-        $filename_without_ext = pathinfo($filename, PATHINFO_FILENAME);
+        $filename_without_ext = $this->media_search_stem($id, $image_url);
 
         global $wpdb;
         $inline_updated = 0;
@@ -4451,8 +4595,10 @@ class Mehrana_App_Plugin
                 $elementor_updated++;
                 clean_post_cache($row->post_id);
                 $touched_post_ids[] = (int) $row->post_id;
-                // Bump Elementor's CSS cache so the frontend re-renders
+                // Bump Elementor's CSS cache so the frontend re-renders, and its
+                // per-widget HTML cache, which would keep printing the old alt
                 delete_post_meta($row->post_id, '_elementor_css');
+                delete_post_meta($row->post_id, '_elementor_element_cache');
                 $this->log("[update_media_alt] Pass 2 updated Elementor alt on post {$row->post_id}");
             }
         }
@@ -4849,6 +4995,12 @@ class Mehrana_App_Plugin
             },
             $html
         );
+        // NULL = PCRE gave up (a single script/style block over ~1 MB hits the
+        // backtrack limit). Passing NULL on returned an EMPTY page; serve the
+        // page untouched instead.
+        if ($masked === null) {
+            return $html;
+        }
 
         $masked = preg_replace_callback(
             '/<a\b[^>]*?>/i',
@@ -4857,6 +5009,9 @@ class Mehrana_App_Plugin
             },
             $masked
         );
+        if ($masked === null) {
+            return $html;
+        }
 
         if (!empty($masked_blocks)) {
             $masked = strtr($masked, $masked_blocks);
@@ -4945,6 +5100,11 @@ class Mehrana_App_Plugin
             },
             $html
         );
+        // NULL = PCRE gave up (see follow_internal_links_on_html): serve the
+        // page untouched rather than empty.
+        if ($masked === null) {
+            return $html;
+        }
 
         // Per-request URL→ID cache so attachment_url_to_postid() isn't
         // called repeatedly for the same image (DB hit each time).
@@ -4957,6 +5117,9 @@ class Mehrana_App_Plugin
             },
             $masked
         );
+        if ($masked === null) {
+            return $html;
+        }
 
         if (!empty($masked_blocks)) {
             $masked = strtr($masked, $masked_blocks);
@@ -5125,62 +5288,81 @@ class Mehrana_App_Plugin
     }
 
     /**
-     * Apply every inline-<img> alt-rewrite pattern to a content string.
-     * Returns true if any pattern matched. Pulled out of update_media_alt
-     * so the same logic can be reused by future bulk endpoints.
+     * Set this attachment's alt on every <img> in a content string that shows
+     * it: matched by its exact src (master or a generated size, including
+     * lazy-load data-src) or by its `wp-image-{id}` class. Returns true if any
+     * tag changed. An existing alt is replaced on either match; a missing one
+     * is added on the class match.
+     *
+     * One tag at a time, so nothing outside the tag can change. The regex
+     * version this replaces also matched wp-image-123 when updating 12, read
+     * "$1" in an alt as a backreference (garbling the tag), and cut an alt at
+     * its first apostrophe, leaving the rest of the old text in the tag.
      */
     private function rewrite_inline_alt_in_content(&$content, $attachment_id, $image_urls, $sanitized_alt)
     {
-        $updated = false;
-        $wp_image_class = 'wp-image-' . intval($attachment_id);
+        $urls = array_flip(array_map('strval', (array) $image_urls));
+        $class = 'wp-image-' . intval($attachment_id);
+        $changed = false;
 
-        foreach ($image_urls as $url) {
-            $escaped_url = preg_quote($url, '/');
-
-            // src=…alt=…
-            $pattern = '/(<img[^>]*src=["\']' . $escaped_url . '["\'][^>]*alt=["\'])([^"\']*)(["\'])/i';
-            if (preg_match($pattern, $content)) {
-                $content = preg_replace($pattern, '$1' . esc_attr($sanitized_alt) . '$3', $content);
-                $updated = true;
+        $new = preg_replace_callback('/<img\b[^>]*>/i', function ($m) use ($urls, $class, $sanitized_alt, &$changed) {
+            $tag = $m[0];
+            $by_src = false;
+            if (preg_match_all('/\s(?:src|data-src|data-lazy-src|data-original)\s*=\s*(["\'])(.*?)\1/is', $tag, $srcs)) {
+                foreach ($srcs[2] as $src) {
+                    if (isset($urls[$src])) {
+                        $by_src = true;
+                        break;
+                    }
+                }
             }
-            // alt=…src=…
-            $pattern2 = '/(<img[^>]*alt=["\'])([^"\']*)(["\']+[^>]*src=["\']' . $escaped_url . '["\'])/i';
-            if (preg_match($pattern2, $content)) {
-                $content = preg_replace($pattern2, '$1' . esc_attr($sanitized_alt) . '$3', $content);
-                $updated = true;
+            $by_class = preg_match('/\sclass\s*=\s*(["\'])(.*?)\1/is', $tag, $cls) === 1
+                && preg_match('/(?:^|\s)' . preg_quote($class, '/') . '(?:\s|$)/', $cls[2]) === 1;
+            if (!$by_src && !$by_class) {
+                return $tag;
             }
-            // src=…alt="anything"…  (greedy alt replacement)
-            $pattern7 = '/(<img[^>]*src=["\']' . $escaped_url . '["\'][^>]*)alt=["\'][^"\']*["\']([^>]*>)/i';
-            if (preg_match($pattern7, $content)) {
-                $content = preg_replace($pattern7, '$1alt="' . esc_attr($sanitized_alt) . '"$2', $content);
-                $updated = true;
+            $out = $this->set_img_alt($tag, $sanitized_alt, $by_class);
+            if ($out !== $tag) {
+                $changed = true;
             }
-        }
+            return $out;
+        }, $content);
 
-        // Gutenberg / theme: match by wp-image-ID class
-        $pattern3 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*alt=["\'])([^"\']*)(["\'])/i';
-        if (preg_match($pattern3, $content)) {
-            $content = preg_replace($pattern3, '$1' . esc_attr($sanitized_alt) . '$3', $content);
-            $updated = true;
+        if ($new === null || !$changed) {
+            return false;
         }
-        $pattern4 = '/(<img[^>]*alt=["\'])([^"\']*)(["\']+[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'])/i';
-        if (preg_match($pattern4, $content)) {
-            $content = preg_replace($pattern4, '$1' . esc_attr($sanitized_alt) . '$3', $content);
-            $updated = true;
-        }
-        $pattern5 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*)alt=["\'][^"\']*["\']([^>]*>)/i';
-        if (preg_match($pattern5, $content)) {
-            $content = preg_replace($pattern5, '$1alt="' . esc_attr($sanitized_alt) . '"$2', $content);
-            $updated = true;
-        }
-        // Add missing alt attribute on classic-editor markup that lacks one
-        $pattern6 = '/(<img[^>]*class=["\'][^"\']*' . preg_quote($wp_image_class, '/') . '[^"\']*["\'][^>]*)(\/?>)/i';
-        if (preg_match($pattern6, $content) && !preg_match('/alt=["\']/', $content)) {
-            $content = preg_replace($pattern6, '$1 alt="' . esc_attr($sanitized_alt) . '" $2', $content);
-            $updated = true;
-        }
+        $content = $new;
+        return true;
+    }
 
-        return $updated;
+    /**
+     * Put $alt on one <img> tag: replace its alt value (either quote style,
+     * apostrophes included), or add one when $add_missing. The value is never
+     * read as a regex replacement, so "from $1,999" stays literal.
+     */
+    private function set_img_alt($tag, $alt, $add_missing)
+    {
+        $escaped = esc_attr($alt);
+        $replaced = 0;
+        $out = preg_replace_callback('/(\salt\s*=\s*)(?:"[^"]*"|\'[^\']*\'|[^\s>"\']+)/i', function ($m) use ($escaped, &$replaced) {
+            if ($replaced++) {
+                return $m[0];
+            }
+            return $m[1] . '"' . $escaped . '"';
+        }, $tag);
+        if ($out === null) {
+            return $tag;
+        }
+        if ($replaced) {
+            return $out;
+        }
+        if (!$add_missing) {
+            return $tag;
+        }
+        $out = preg_replace_callback('/\s*(\/?>)$/', function ($m) use ($escaped) {
+            return ' alt="' . $escaped . '"' . $m[1];
+        }, $tag, 1);
+        return $out === null ? $tag : $out;
     }
 
     /**
@@ -5243,6 +5425,21 @@ class Mehrana_App_Plugin
     /**
      * Restore media from backup
      */
+    /** Another attachment whose file is $file, or 0. */
+    private function other_attachment_using_file($file, $attachment_id)
+    {
+        global $wpdb;
+        $relative = _wp_relative_upload_path($file);
+        if (!$relative) {
+            return 0;
+        }
+        return (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attached_file' AND meta_value = %s AND post_id <> %d LIMIT 1",
+            $relative,
+            $attachment_id
+        ));
+    }
+
     public function restore_media($request)
     {
         $id = intval($request['id']);
@@ -5295,12 +5492,24 @@ class Mehrana_App_Plugin
         $path_info = pathinfo($current_file);
         $restore_path = $path_info['dirname'] . '/' . $original_name;
 
+        // The old name may belong to another image by now (uploaded after the
+        // conversion freed it). Never copy over someone else's file.
+        if ($restore_path !== $current_file && file_exists($restore_path) && $this->other_attachment_using_file($restore_path, $id)) {
+            $restore_path = $path_info['dirname'] . '/' . wp_unique_filename($path_info['dirname'], $original_name);
+            $this->log("[RESTORE_MEDIA] {$original_name} belongs to another attachment — restoring as " . basename($restore_path));
+        }
+
+        // Before 6.0 two images could end up sharing one converted file (see
+        // replace_media). If another attachment still uses the current file,
+        // it stays on disk and its references stay as they are.
+        $current_shared = $current_file && $this->other_attachment_using_file($current_file, $id);
+
         if (!copy($backup_path, $restore_path)) {
             return new WP_Error('restore_failed', 'Failed to restore from backup', ['status' => 500]);
         }
 
         // If current file is different (format changed), delete it
-        if ($current_file !== $restore_path && file_exists($current_file)) {
+        if ($current_file !== $restore_path && file_exists($current_file) && !$current_shared) {
             unlink($current_file);
         }
 
@@ -5318,7 +5527,7 @@ class Mehrana_App_Plugin
         $mime_type = $mime_map[$original_extension] ?? 'image/jpeg';
 
         // Update post mime type
-        wp_update_post([
+        $this->update_post_unfiltered([
             'ID' => $id,
             'post_mime_type' => $mime_type
         ]);
@@ -5340,7 +5549,7 @@ class Mehrana_App_Plugin
         // Before 5.36 this step was missing, so Undo deleted the .webp that
         // every page still pointed at and the image broke.
         $references = null;
-        if ($current_url && $new_url && $current_url !== $new_url) {
+        if ($current_url && $new_url && $current_url !== $new_url && !$current_shared) {
             $pairs = [[$current_url, $new_url]];
             $cur_dir_url = dirname($current_url);
             $new_dir_url = dirname($new_url);
@@ -5414,8 +5623,12 @@ class Mehrana_App_Plugin
      */
     public function scan_content_images($request)
     {
-        // Increase timeout for large sites
-        set_time_limit(300);
+        // Increase timeout for large sites. On PHP 8 a function listed in
+        // disable_functions is undefined: calling it is a fatal Error (not a
+        // warning @ can hide), so check first.
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(300);
+        }
 
         $min_size_kb = intval($request->get_param('min_size_kb')) ?: 0;
         $limit = intval($request->get_param('limit')) ?: 500;
@@ -5722,10 +5935,16 @@ class Mehrana_App_Plugin
         // Be generous with the time budget when callers ask for full data —
         // big sites with hundreds of products take real wall-clock time even
         // when memory isn't the bottleneck. @-prefixed so a hardened host
-        // (set_time_limit disabled in php.ini) doesn't throw a warning.
+        // (set_time_limit disabled in php.ini) doesn't throw a warning — and
+        // function_exists, because on PHP 8 a disabled function is a fatal
+        // "undefined function" Error that @ doesn't suppress.
         if (!$lite_mode) {
-            @set_time_limit(180);
-            @ignore_user_abort(true);
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(180);
+            }
+            if (function_exists('ignore_user_abort')) {
+                @ignore_user_abort(true);
+            }
         }
 
         // Get all public post types
@@ -5898,7 +6117,7 @@ class Mehrana_App_Plugin
             $featured_id = get_post_thumbnail_id($page->ID) ?: null;
             $featured_url = $featured_id ? wp_get_attachment_image_url($featured_id, 'full') : null;
             $featured_alt = $featured_id
-                ? (string) get_post_meta($featured_id, '_wp_attachment_image_alt_text', true)
+                ? (string) get_post_meta($featured_id, '_wp_attachment_image_alt', true)
                 : '';
             $featured_filename = null;
             if ($featured_id) {
@@ -6025,7 +6244,7 @@ class Mehrana_App_Plugin
         $featured_id = get_post_thumbnail_id($page->ID) ?: null;
         $featured_url = $featured_id ? wp_get_attachment_image_url($featured_id, 'full') : null;
         $featured_alt = $featured_id
-            ? (string) get_post_meta($featured_id, '_wp_attachment_image_alt_text', true)
+            ? (string) get_post_meta($featured_id, '_wp_attachment_image_alt', true)
             : '';
         $featured_filename = null;
         if ($featured_id) {
@@ -6567,6 +6786,9 @@ class Mehrana_App_Plugin
 
         if (!get_post($page_id)) {
             return new WP_Error('not_found', 'Page not found', ['status' => 404]);
+        }
+        if (wp_is_post_revision($target_id)) {
+            return new WP_Error('revision_target', "Post {$target_id} is a revision; Patrick only restores live pages and templates.", ['status' => 409]);
         }
         // A broken page layout can't list its refs; restoring the page itself
         // is exactly the case that must still work.
@@ -7180,6 +7402,13 @@ class Mehrana_App_Plugin
     {
         global $wpdb;
 
+        // A revision is history, never a write target. Its backup write below
+        // would also land on the parent (core redirects update_post_meta from
+        // a revision to its parent) and wipe the live page's rollback copy.
+        if (wp_is_post_revision($target_id)) {
+            return new WP_Error('revision_target', "Post {$target_id} is a revision; Patrick only edits live pages and templates.", ['status' => 409]);
+        }
+
         $layout = $this->bebuilder_read_layout($target_id);
         if (is_wp_error($layout)) {
             return $layout;
@@ -7326,6 +7555,9 @@ class Mehrana_App_Plugin
             'storage' => $layout['storage'],
             'raw_before' => $layout['raw'],
             'raw_after' => $new_raw,
+            // So a revert (bebuilder_revert_write) can put the rollback copy
+            // from the write before this one back too.
+            'previous_backup' => $previous_backup,
             'bytes_before' => strlen($layout['raw']),
             'bytes_after' => strlen($new_raw),
             'edits' => count($edits),
@@ -7348,6 +7580,18 @@ class Mehrana_App_Plugin
             md5($write['raw_after'])
         ));
         wp_cache_delete($write['target_id'], 'post_meta');
+        // The layout is back to before this request, so its rollback copy goes
+        // back to the one from the previous Patrick change. Leaving this
+        // request's copy (after_md5 = the reverted write) made Restore refuse
+        // with changed_since_write and lost the earlier rollback point.
+        if ($reverted && array_key_exists('previous_backup', $write)) {
+            $previous = $write['previous_backup'];
+            if (is_array($previous) && isset($previous['raw'])) {
+                update_post_meta($write['target_id'], '_mehrana_mfn_backup', wp_slash($previous));
+            } else {
+                delete_post_meta($write['target_id'], '_mehrana_mfn_backup');
+            }
+        }
         return (bool) $reverted;
     }
 
@@ -7407,7 +7651,7 @@ class Mehrana_App_Plugin
 
         foreach ($written as &$done) {
             $done['used_by'] = $this->bebuilder_purge($page_id, $done['target_id'], $done['kind']);
-            unset($done['raw_before'], $done['raw_after'], $done['meta_id']);
+            unset($done['raw_before'], $done['raw_after'], $done['meta_id'], $done['previous_backup']);
         }
         unset($done);
 
@@ -7556,7 +7800,7 @@ class Mehrana_App_Plugin
         if (!$main) {
             return $result;
         }
-        $stem = pathinfo(basename($main), PATHINFO_FILENAME);
+        $stem = $this->media_search_stem($attachment_id, $main);
 
         foreach ($this->bebuilder_posts_mentioning($stem) as $post_id) {
             $layout = $this->bebuilder_read_layout($post_id);
@@ -7597,10 +7841,10 @@ class Mehrana_App_Plugin
                     if (!preg_match('/\ssrc=["\']([^"\']+)["\']/i', $m[0], $src) || !isset($paths[$this->url_path($src[1])])) {
                         return $m[0];
                     }
-                    if (preg_match('/\salt=(["\'])[^"\']*\1/i', $m[0])) {
-                        return preg_replace('/\salt=(["\'])[^"\']*\1/i', ' alt="' . esc_attr($alt) . '"', $m[0], 1);
-                    }
-                    return preg_replace('/\s*(\/?>)$/', ' alt="' . esc_attr($alt) . '"$1', $m[0], 1);
+                    // set_img_alt handles an alt holding the other quote
+                    // (alt="Mike's") — the old regex missed it and appended a
+                    // second alt, which browsers ignore.
+                    return $this->set_img_alt($m[0], $alt, true);
                 }, $value);
                 if ($new !== $value) {
                     $edits[] = ['path' => $path, 'expected' => $value, 'value' => $new];
@@ -8112,10 +8356,13 @@ class Mehrana_App_Plugin
                 // Also clear this specific page's cache
                 delete_post_meta($page_id, '_elementor_css');
                 delete_post_meta($page_id, '_elementor_page_assets');
+                // Per-widget HTML cache (Elementor 3.22+): without this the new
+                // link only showed once the cache expired.
+                delete_post_meta($page_id, '_elementor_element_cache');
             }
 
             // Method 3: Touch the post to update modification time
-            wp_update_post([
+            $this->update_post_unfiltered([
                 'ID' => $page_id,
                 'post_modified' => current_time('mysql'),
                 'post_modified_gmt' => current_time('mysql', 1)
@@ -8142,10 +8389,17 @@ class Mehrana_App_Plugin
                 if (empty($keyword) || empty($target_url))
                     continue;
 
+                // Links made for THIS keyword. only_first means one link for
+                // the keyword on the page: once it is in, the meta fields are
+                // left alone. (It used to compare against the running total of
+                // every keyword, and once anything was linked it passed
+                // only_first=false — linking every later occurrence.)
+                $keyword_linked = 0;
+
                 // 1. Process main post_content
-                $result = $this->replace_keyword($content, $keyword, $target_url, $anchor_id, $only_first && $total_linked === 0);
+                $result = $this->replace_keyword($content, $keyword, $target_url, $anchor_id, $only_first);
                 $content = $result['text'];
-                $total_linked += $result['count'];
+                $keyword_linked += $result['count'];
 
                 // Collect skipped info
                 if (!empty($result['skipped'])) {
@@ -8161,15 +8415,18 @@ class Mehrana_App_Plugin
                 $content_meta_keys = $this->get_content_meta_keys($all_meta);
 
                 foreach ($content_meta_keys as $meta_key) {
+                    if ($only_first && $keyword_linked > 0) {
+                        break;
+                    }
                     $meta_value = get_post_meta($page_id, $meta_key, true);
                     if (empty($meta_value) || !is_string($meta_value))
                         continue;
 
-                    $result = $this->replace_keyword($meta_value, $keyword, $target_url, $anchor_id, $only_first && $total_linked === 0);
+                    $result = $this->replace_keyword($meta_value, $keyword, $target_url, $anchor_id, $only_first);
 
                     if ($result['count'] > 0) {
-                        update_post_meta($page_id, $meta_key, $result['text']);
-                        $total_linked += $result['count'];
+                        $this->update_text_meta($page_id, $meta_key, $result['text'], $meta_value);
+                        $keyword_linked += $result['count'];
                     }
 
                     if (!empty($result['skipped'])) {
@@ -8181,19 +8438,17 @@ class Mehrana_App_Plugin
                     }
                 }
 
+                $total_linked += $keyword_linked;
                 $results[] = [
                     'keyword' => $keyword,
-                    'count' => $total_linked,
-                    // Note: apply_links primarily cares about applied links, but we could return linked_count if needed
-                    // For now, we just stick to applied structure unless we want to track pre-existing during apply?
-                    // Let's assume apply returns what it DID.
+                    'count' => $keyword_linked,
                 ];
             }
 
             // Save Standard Content — only when a link actually went in. A
             // no-op wp_update_post still fires every save_post handler and
             // bumps post_modified for nothing.
-            $update_result = $content === $page->post_content ? 0 : wp_update_post([
+            $update_result = $content === $page->post_content ? 0 : $this->update_post_unfiltered([
                 'ID' => $page_id,
                 'post_content' => $content
             ]);
@@ -8205,13 +8460,11 @@ class Mehrana_App_Plugin
             } else {
                 $this->log("Post {$page_id} updated successfully. Result ID: " . $update_result);
 
-                // Clear WPBakery/Visual Composer caches if detected
-                if ($is_wpbakery) {
-                    // Clear WPBakery page cache
-                    delete_post_meta($page_id, '_wpb_post_custom_css');
-                    delete_post_meta($page_id, '_wpb_shortcodes_custom_css');
-                    $this->log("Cleared WPBakery caches for post {$page_id}");
-                }
+                // WPBakery's _wpb_post_custom_css (the page's Custom CSS box) and
+                // _wpb_shortcodes_custom_css (Design Options styles) are content,
+                // not caches — they used to be deleted here, and WPBakery only
+                // rebuilds them when the page is saved in its editor. A link
+                // changes neither, so both are left as they are.
 
                 // Clear all page caches (WP Super Cache, W3TC, WP Fastest Cache, etc.)
                 if (function_exists('wp_cache_clear_cache')) {
@@ -8225,7 +8478,7 @@ class Mehrana_App_Plugin
                 }
 
                 // Touch post modification time
-                wp_update_post([
+                $this->update_post_unfiltered([
                     'ID' => $page_id,
                     'post_modified' => current_time('mysql'),
                     'post_modified_gmt' => current_time('mysql', 1)
@@ -8256,10 +8509,16 @@ class Mehrana_App_Plugin
             if (isset($element['settings']) && is_array($element['settings'])) {
                 // Determine if we should stop based on combined count if only_first is true
                 $limit_reached = $only_first && ($total_count + $total_linked_count) > 0;
+                if ($limit_reached) {
+                    break;
+                }
 
-                $result = $this->process_settings_recursive($element['settings'], $keyword, $target_url, $anchor_id, $only_first && !$limit_reached);
-                $total_count += $result['count'];
-                $total_linked_count += $result['linked_count'] ?? 0;
+                // process_settings_recursive returns a plain count. Reading it
+                // as an array made every Elementor link report 0 (Patrick said
+                // "keyword not found" and kept no anchor to undo) and let
+                // only_first link once per widget instead of once per page.
+                $widget_type = isset($element['widgetType']) ? (string) $element['widgetType'] : '';
+                $total_count += (int) $this->process_settings_recursive($element['settings'], $keyword, $target_url, $anchor_id, $only_first, 0, $this->elementor_unlinkable_keys($widget_type));
             }
 
             // Process nested elements
@@ -8282,14 +8541,34 @@ class Mehrana_App_Plugin
     /**
      * Process settings - recursive with BLACKLIST
      */
-    private function process_settings_recursive(&$data, $keyword, $target_url, $anchor_id, $only_first, $depth = 0)
+    /**
+     * Elementor settings that never get a link: they render as a heading, a
+     * button label (a link inside the button's own <a>), a toggle title, a
+     * form control (placeholders show raw HTML) or an attribute value.
+     */
+    private function elementor_unlinkable_keys($widget_type)
+    {
+        $always = [
+            'placeholder', 'field_label', 'field_options', 'field_value', 'button_text',
+            'anchor', 'css_classes', '_css_classes', '_element_id', 'shortcode', 'tab_title',
+        ];
+        $by_widget = [
+            'heading'   => ['title'],
+            'button'    => ['text'],
+            'icon-box'  => ['title_text'],
+            'image-box' => ['title_text'],
+        ];
+        return array_merge($always, $by_widget[$widget_type] ?? []);
+    }
+
+    private function process_settings_recursive(&$data, $keyword, $target_url, $anchor_id, $only_first, $depth = 0, $extra_blocked = [])
     {
         $total_count = 0;
         $total_linked_count = 0;
 
         // Prevent infinite recursion
         if ($depth > 10) {
-            return ['count' => 0, 'linked_count' => 0];
+            return 0;
         }
 
         // BLACKLIST: Skip fields that are definitely not content or should not contain HTML links
@@ -8338,7 +8617,7 @@ class Mehrana_App_Plugin
                 $is_blocked = false;
 
                 if (is_string($key)) {
-                    if (in_array($key, $blocked_exact)) {
+                    if (in_array($key, $blocked_exact) || in_array($key, $extra_blocked, true)) {
                         $is_blocked = true;
                     } else {
                         foreach ($blocked_endings as $ending) {
@@ -8376,8 +8655,8 @@ class Mehrana_App_Plugin
                     if ($only_first && $total_count > 0) {
                         continue;
                     }
-                    $count = $this->process_settings_recursive($value, $keyword, $target_url, $anchor_id, $only_first, $depth + 1);
-                    $total_count += $count;
+                    $count = $this->process_settings_recursive($value, $keyword, $target_url, $anchor_id, $only_first, $depth + 1, $extra_blocked);
+                    $total_count += (int) $count;
                 }
             }
         }
@@ -8489,6 +8768,18 @@ class Mehrana_App_Plugin
                 continue; // Skip JSON-like
             if (preg_match('/^a:\d+:{/', $value))
                 continue; // Skip serialized arrays
+
+            // When adding links (not cleaning them up): only prose. A value
+            // with no whitespace is a URL, slug, email, field key or number —
+            // linking "roofing" inside https://site.com/roofing/ breaks the
+            // button or product link that reads it. Other SEO plugins' fields
+            // and URL/link fields are never content either.
+            if (!$include_seo) {
+                if (!preg_match('/\s/u', trim($value)))
+                    continue;
+                if (preg_match('/^_?(seopress|aioseo|genesis|_aioseop)_|_(url|link|links_to|href|email|phone)$|^_button_text$/i', $key))
+                    continue;
+            }
 
             // Include if it looks like content
             $content_keys[] = $key;
@@ -8639,14 +8930,16 @@ class Mehrana_App_Plugin
             // Pattern to match specific ID <a ... id="lb-..." ...>...</a>
             $pattern_id = '/<a\s+[^>]*\bid=["\']' . preg_quote($link_id, '/') . '["\'][^>]*>(.*?)<\/a>/is';
 
-            // 1. Post Content
+            // 1. Post Content. Unlinking keeps whatever was inside the link —
+            // strip_tags() here used to delete an <img> (or <strong>) the link
+            // wrapped.
             $new_content_id = preg_replace_callback($pattern_id, function ($match) use (&$modified) {
                 $modified = true;
-                return strip_tags($match[1]); // Return anchor text
+                return $match[1];
             }, $post->post_content);
 
             if ($modified) {
-                wp_update_post([
+                $this->update_post_unfiltered([
                     'ID' => $page_id,
                     'post_content' => $new_content_id
                 ]);
@@ -8660,21 +8953,34 @@ class Mehrana_App_Plugin
             if (!empty($elementor_data)) {
                 $data = is_string($elementor_data) ? json_decode($elementor_data, true) : $elementor_data;
                 if ($data) {
-                    $json_str = json_encode($data);
+                    // Walk the decoded settings. The old version ran the regex
+                    // over json_encode() output, where every </a> is <\/a>, so
+                    // it never matched: the link stayed on the page while the
+                    // post_content mirror lost it and Undo reported success.
                     $modified_el = false;
-                    // Fix: Elementor JSON has escaped quotes (id=\"...\"), so we need regex to match escaped quotes too
-                    // Match id="lb-..." OR id=\"lb-...\"
-                    // We use [\\\\]? before quotes to allow optional backslash
-                    $pattern_id_el = '/<a\s+[^>]*\bid=[\\\\]?["\']' . preg_quote($link_id, '/') . '[\\\\]?["\'][^>]*>(.*?)<\/a>/is';
-
-                    $new_json_str = preg_replace_callback($pattern_id_el, function ($match) use (&$modified_el) {
-                        $modified_el = true;
-                        return strip_tags($match[1]);
-                    }, $json_str);
+                    $unlink = function (&$node) use (&$unlink, $pattern_id, &$modified_el) {
+                        if (is_array($node)) {
+                            foreach ($node as &$child) {
+                                $unlink($child);
+                            }
+                            unset($child);
+                        } elseif (is_string($node) && stripos($node, '<a') !== false) {
+                            $new = preg_replace_callback($pattern_id, function ($match) use (&$modified_el) {
+                                $modified_el = true;
+                                return $match[1];
+                            }, $node);
+                            if ($new !== null) {
+                                $node = $new;
+                            }
+                        }
+                    };
+                    $unlink($data);
 
                     if ($modified_el) {
-                        $data = json_decode($new_json_str, true);
-                        update_post_meta($page_id, '_elementor_data', wp_slash(json_encode($data)));
+                        update_post_meta($page_id, '_elementor_data', wp_slash(wp_json_encode($data)));
+                        // Elementor's per-widget HTML cache would keep showing the link.
+                        delete_post_meta($page_id, '_elementor_element_cache');
+                        delete_post_meta($page_id, '_elementor_css');
                         $this->log("Removed link by ID '$link_id' from Elementor data");
                         $modified = true;
                     }
@@ -8692,11 +8998,11 @@ class Mehrana_App_Plugin
                 $meta_modified = false;
                 $new_meta_val = preg_replace_callback($pattern_id, function ($match) use (&$meta_modified) {
                     $meta_modified = true;
-                    return strip_tags($match[1]);
+                    return $match[1];
                 }, $meta_value);
 
                 if ($meta_modified) {
-                    update_post_meta($page_id, $meta_key, $new_meta_val);
+                    $this->update_text_meta($page_id, $meta_key, $new_meta_val, $meta_value);
                     $modified = true;
                     $this->log("Removed link by ID '$link_id' from meta field '$meta_key'");
                 }
@@ -8798,7 +9104,7 @@ class Mehrana_App_Plugin
 
             if ($url_matches && $anchor === $target_anchor && !$modified) {
                 $modified = true;
-                return strip_tags($match[2]); // Return just the anchor text without the <a> tag
+                return $match[2]; // What the link wrapped, without the <a> (an image stays)
             }
             return $match[0];
         }, $post->post_content);
@@ -8807,7 +9113,7 @@ class Mehrana_App_Plugin
 
         if ($modified) {
             // Update regular content
-            wp_update_post([
+            $this->update_post_unfiltered([
                 'ID' => $page_id,
                 'post_content' => $new_content
             ]);
@@ -8823,7 +9129,9 @@ class Mehrana_App_Plugin
                     $this->remove_link_by_target($data, $target_url, $target_anchor, $modified);
                     $this->log("After Elementor search, modified: " . ($modified ? 'YES' : 'NO'));
                     if ($modified) {
-                        update_post_meta($page_id, '_elementor_data', wp_slash(json_encode($data)));
+                        update_post_meta($page_id, '_elementor_data', wp_slash(wp_json_encode($data)));
+                        delete_post_meta($page_id, '_elementor_element_cache');
+                        delete_post_meta($page_id, '_elementor_css');
                         $this->log("Removed link from Elementor data in page $page_id");
                     }
                 } else {
@@ -8869,13 +9177,13 @@ class Mehrana_App_Plugin
 
                     if ($url_matches && $anchor === $target_anchor) {
                         $meta_modified = true;
-                        return strip_tags($match[2]);
+                        return $match[2];
                     }
                     return $match[0];
                 }, $meta_value);
 
                 if ($meta_modified) {
-                    update_post_meta($page_id, $meta_key, $new_meta_val);
+                    $this->update_text_meta($page_id, $meta_key, $new_meta_val, $meta_value);
                     $modified = true;
                     $this->log("Removed link from meta field '$meta_key' in page $page_id");
                 }
@@ -8922,7 +9230,7 @@ class Mehrana_App_Plugin
                         // Match with normalized URLs
                         if (($url === $target_url || $url_path === $target_url_path || $url === $target_url_path) && $anchor === $target_anchor && !$modified) {
                             $modified = true;
-                            return strip_tags($match[2]);
+                            return $match[2];
                         }
                         return $match[0];
                     }, $value);
@@ -8952,7 +9260,7 @@ class Mehrana_App_Plugin
 
                         if ($match_id === $link_id) {
                             $modified = true;
-                            return strip_tags($anchor);
+                            return $anchor;
                         }
                         return $match[0];
                     }, $value);
@@ -8961,6 +9269,113 @@ class Mehrana_App_Plugin
                 }
             }
         }
+    }
+
+    /**
+     * Run a core post write with kses switched off. API-key requests have no
+     * WordPress user, so core treats them as unprivileged and runs post_content
+     * (and title/excerpt) through kses on every wp_update_post — even one that
+     * only changes the status — stripping iframes, scripts, forms and SVG. The
+     * request already passed our API-key auth, so the write is trusted.
+     */
+    private function without_kses(callable $write)
+    {
+        $had_kses = has_filter('content_save_pre', 'wp_filter_post_kses') !== false;
+        if ($had_kses) {
+            kses_remove_filters();
+        }
+        try {
+            return $write();
+        } finally {
+            if ($had_kses) {
+                kses_init_filters();
+            }
+        }
+    }
+
+    /**
+     * wp_update_post() for content Patrick changed itself. It expects slashed
+     * input (it wp_unslash()es internally): without wp_slash every backslash
+     * in the page is lost — Gutenberg's `<` escapes turn into `u003c`.
+     */
+    private function update_post_unfiltered(array $postarr, $wp_error = false)
+    {
+        foreach (['post_content', 'post_title', 'post_excerpt'] as $field) {
+            if (isset($postarr[$field]) && is_string($postarr[$field])) {
+                $postarr[$field] = wp_slash($postarr[$field]);
+            }
+        }
+        return $this->without_kses(function () use ($postarr, $wp_error) {
+            return wp_update_post($postarr, $wp_error);
+        });
+    }
+
+    /**
+     * Write one text meta value Patrick edited (a link added or removed).
+     * Slashed, because update_post_meta unslashes; and only the row that held
+     * $old is changed — without prev_value every row of a repeated key would
+     * be overwritten with this one's value.
+     */
+    private function update_text_meta($post_id, $meta_key, $new, $old)
+    {
+        return update_post_meta($post_id, $meta_key, wp_slash($new), $old);
+    }
+
+    /**
+     * Hide shortcode tags (`[name attr="…"]`, `[/name]`) from keyword linking.
+     * A link written inside an attribute breaks the shortcode — a CF7 form
+     * whose `id` is overridden by the link's id stops rendering. Text between
+     * an opening and closing tag (WPBakery's content) stays linkable.
+     *
+     * Masked: registered shortcodes, tags with attributes, and code-like names
+     * (`vc_row`, `et_pb_text`). "[Roof Repair]" in plain prose is left alone.
+     * The placeholder is letters wrapped in braces, so no keyword can match
+     * inside it and word boundaries around it are unchanged. Only text outside
+     * HTML tags is masked: links only ever go into text, and a placeholder
+     * inside an attribute (href="[site_url]") could come back URL-encoded.
+     */
+    private function mask_shortcodes($text, array &$map)
+    {
+        if (strpos($text, '[') === false) {
+            return $text;
+        }
+        $parts = preg_split('/(<[^>]*>)/', $text, -1, PREG_SPLIT_DELIM_CAPTURE);
+        if ($parts === false) {
+            return $text;
+        }
+        foreach ($parts as $i => $part) {
+            if ($i % 2 === 0 && strpos($part, '[') !== false) {
+                $parts[$i] = $this->mask_shortcodes_in_text($part, $map);
+            }
+        }
+        return implode('', $parts);
+    }
+
+    private function mask_shortcodes_in_text($text, array &$map)
+    {
+        $masked = preg_replace_callback('/\[\/?([A-Za-z][\w\-]*)(?:[^\[\]]*)\]/', function ($m) use (&$map) {
+            $name = $m[1];
+            $is_code = shortcode_exists($name) || strpos($m[0], '=') !== false
+                || strpos($name, '_') !== false || strpos($name, '-') !== false;
+            if (!$is_code) {
+                return $m[0];
+            }
+            $n = count($map);
+            $token = '{MEHSC';
+            do {
+                $token .= chr(97 + ($n % 26));
+                $n = intdiv($n, 26);
+            } while ($n > 0);
+            $token .= '}';
+            $map[$token] = $m[0];
+            return $token;
+        }, $text);
+        return $masked === null ? $text : $masked;
+    }
+
+    private function unmask_shortcodes($text, array $map)
+    {
+        return empty($map) ? $text : strtr($text, $map);
     }
 
     /**
@@ -8980,6 +9395,35 @@ class Mehrana_App_Plugin
         if (empty($text) || !is_string($text)) {
             return $result;
         }
+
+        // Shortcode tags are never linked into (see mask_shortcodes).
+        $shortcodes = [];
+        $original_text = $text;
+        $text = $this->mask_shortcodes($text, $shortcodes);
+        $result = $this->replace_keyword_masked($text, $keyword, $target_url, $anchor_id, $only_first, $dry_run);
+        foreach ($result['skipped'] as &$skip) {
+            if (isset($skip['sample']) && is_string($skip['sample'])) {
+                $skip['sample'] = $this->unmask_shortcodes($skip['sample'], $shortcodes);
+            }
+        }
+        unset($skip);
+        if ($result['count'] === 0) {
+            // Nothing linked: hand back the exact input, not a DOM re-serialization.
+            $result['text'] = $original_text;
+        } else {
+            $result['text'] = $this->unmask_shortcodes($result['text'], $shortcodes);
+        }
+        return $result;
+    }
+
+    private function replace_keyword_masked($text, $keyword, $target_url, $anchor_id, $only_first, $dry_run)
+    {
+        $result = [
+            'text' => $text,
+            'count' => 0,
+            'linked_count' => 0,
+            'skipped' => []
+        ];
 
         // Check if text has any HTML tags
         $has_html = $text !== strip_tags($text);
@@ -9019,6 +9463,9 @@ class Mehrana_App_Plugin
         libxml_clear_errors();
 
         $xpath = new DOMXPath($dom);
+        // Our wrapper. The ancestry check below stops here, not at the first
+        // <div> it meets: <a href><div>keyword</div></a> is inside a link.
+        $wrapper = $dom->getElementsByTagName('div')->item(0);
 
         // Find all text nodes
         $text_nodes = $xpath->query('//text()');
@@ -9052,7 +9499,7 @@ class Mehrana_App_Plugin
             // Check ancestry for forbidden tags
             $parent = $node->parentNode;
             $is_forbidden = false;
-            while ($parent && $parent->nodeName !== 'div') { // 'div' is our wrapper
+            while ($parent && !($wrapper && $parent->isSameNode($wrapper))) {
                 if (in_array(strtolower($parent->nodeName), $forbidden_tags)) {
                     $is_forbidden = true;
                     // If it's an existing link, count it as linked!
@@ -10215,6 +10662,12 @@ class Mehrana_App_Plugin
     {
         global $wp_filesystem;
 
+        // This filter runs for every plugin, theme and translation install.
+        // Only our own package may be moved into mehrana-app/.
+        if (empty($hook_extra['plugin']) || $hook_extra['plugin'] !== plugin_basename(__FILE__)) {
+            return $response;
+        }
+
         // Get plugin directory
         $plugin_folder = WP_PLUGIN_DIR . '/mehrana-app/';
 
@@ -10244,6 +10697,11 @@ class Mehrana_App_Plugin
         if ($cached !== false && !$debug) {
             return $cached;
         }
+        // A failed check (rate limit, network) is remembered for 15 minutes so
+        // every admin page load doesn't wait on another 10 s GitHub call.
+        if (!$debug && get_transient($transient_key . '_failed')) {
+            return false;
+        }
 
         $url = "https://api.github.com/repos/{$this->github_username}/{$this->github_repo}/releases/latest";
 
@@ -10256,11 +10714,13 @@ class Mehrana_App_Plugin
         ]);
 
         if (is_wp_error($response)) {
+            set_transient($transient_key . '_failed', 1, 15 * MINUTE_IN_SECONDS);
             return $debug ? ['error' => $response->get_error_message()] : false;
         }
 
         $code = wp_remote_retrieve_response_code($response);
         if ($code !== 200) {
+            set_transient($transient_key . '_failed', 1, 15 * MINUTE_IN_SECONDS);
             return $debug ? [
                 'error' => "HTTP $code",
                 'response_code' => $code,
@@ -10304,6 +10764,37 @@ class Mehrana_App_Plugin
      * @param WP_REST_Request $request
      * @return WP_REST_Response|WP_Error
      */
+    /**
+     * str_replace inside Elementor's stored JSON. Elementor writes "/" as "\/"
+     * and non-ASCII as "\uXXXX", so a plain replace missed every URL path and
+     * accented word; and a replacement holding a quote or backslash produced
+     * invalid JSON (an empty page). Both search and replace are JSON-escaped
+     * the way the data is stored. If the result would not decode, the data is
+     * returned unchanged.
+     */
+    private function replace_in_elementor_json($json, $search, $replace)
+    {
+        if ($search === '' || !is_string($json)) {
+            return $json;
+        }
+        $original = $json;
+        $done = [];
+        foreach ([0, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE] as $flags) {
+            $s = substr((string) wp_json_encode($search, $flags), 1, -1);
+            $r = substr((string) wp_json_encode($replace, $flags), 1, -1);
+            if ($s === '' || isset($done[$s])) {
+                continue;
+            }
+            $done[$s] = true;
+            $json = str_replace($s, $r, $json);
+        }
+        if ($json !== $original && !is_array(json_decode($json, true))) {
+            $this->log("[CLONE_PAGE] Replacement '{$search}' would break the Elementor data; left it out");
+            return $original;
+        }
+        return $json;
+    }
+
     public function clone_page($request)
     {
         $template_id = intval($request['template_id']);
@@ -10389,24 +10880,28 @@ class Mehrana_App_Plugin
 
                 // Replace in Elementor data
                 if (!empty($elementor_data)) {
-                    $elementor_data = str_replace($search, $replace, $elementor_data);
+                    $elementor_data = $this->replace_in_elementor_json($elementor_data, $search, $replace);
                 }
             }
             $this->log("[CLONE_PAGE] Applied " . count($replacements) . " replacements");
         }
 
-        // Create new post
+        // Create new post. wp_insert_post expects slashed input and, for an
+        // API-key request, runs kses: without wp_slash + kses off, the clone
+        // lost every backslash (broken Gutenberg blocks) and its embeds.
         $new_post_data = [
-            'post_title' => $new_title,
+            'post_title' => wp_slash($new_title),
             'post_name' => $new_slug,
-            'post_content' => $post_content,
+            'post_content' => wp_slash($post_content),
             'post_status' => $status,
             'post_type' => $template->post_type,
             'post_parent' => $parent_id,
             'post_author' => get_current_user_id() > 0 ? get_current_user_id() : 1
         ];
 
-        $new_post_id = wp_insert_post($new_post_data, true);
+        $new_post_id = $this->without_kses(function () use ($new_post_data) {
+            return wp_insert_post($new_post_data, true);
+        });
 
         if (is_wp_error($new_post_id)) {
             $this->log("[CLONE_PAGE] Error creating post: " . $new_post_id->get_error_message());
@@ -10505,7 +11000,7 @@ class Mehrana_App_Plugin
                         $value = str_replace((string) $search, (string) $replace, $value);
                     }
                 }
-                update_post_meta($new_post_id, $key, $value);
+                update_post_meta($new_post_id, $key, wp_slash($value));
             }
         }
 
@@ -10561,6 +11056,10 @@ class Mehrana_App_Plugin
             // Also handle patterns that lead with `/` but have no `^` anchor.
             if (strpos($from_path, '^') !== 0) {
                 $from_path = ltrim($from_path, '/');
+            }
+            // A pattern that doesn't compile would error on every page view.
+            if ($from_path === '' || @preg_match('#' . str_replace('#', '\#', $from_path) . '#', '') === false) {
+                return new WP_Error('invalid_regex', 'That redirect pattern is not a valid regular expression, so it was not saved.', ['status' => 400]);
             }
         } else {
             $from_path = str_replace($site_url, '', $from_url);
@@ -10644,20 +11143,46 @@ class Mehrana_App_Plugin
         // Method 2: Try Redirection plugin
         if (!$method_used && class_exists('Red_Item')) {
             try {
-                // Redirection plugin's match_type is different from Rank Math's:
-                // it uses 'url' / 'regex' for the source-matching strategy.
-                $rp_match = $match_type === 'regex' ? 'regex' : 'url';
-                Red_Item::create([
-                    'url' => $from_path,
+                // Redirection's source matching is "url" (exact) or regex. Our
+                // contains/start/end become the equivalent regex — mapping
+                // them to "url" turned a "starts with" rule into one path.
+                $rp_source = $from_path;
+                $rp_regex = $match_type === 'regex';
+                if ($rp_regex) {
+                    // Redirection matches a regex against the path WITH its
+                    // leading slash, so it gets the pattern as written, not the
+                    // slash-stripped Rank Math form built above.
+                    $rp_source = trim((string) $from_url);
+                }
+                if (in_array($match_type, ['contains', 'start', 'end'], true)) {
+                    // No delimiter argument: Redirection wraps the pattern in
+                    // @…@ and escapes @ itself. The pattern spans the whole
+                    // URL because Redirection replaces only the matched part:
+                    // `^/blog` would send /blog/post to /news/post, while Rank
+                    // Math and our own handler send it to /news.
+                    $rp_source = $match_type === 'start'
+                        ? '^' . preg_quote(untrailingslashit($from_path)) . '.*$'
+                        : '^.*' . preg_quote(trim($from_path, '/')) . ($match_type === 'end' ? '/?$' : '.*$');
+                    $rp_regex = true;
+                }
+                $created = Red_Item::create([
+                    'url' => $rp_source,
                     'action_data' => ['url' => $to_url],
                     'action_type' => 'url',
-                    'match_type' => $rp_match,
-                    'regex' => $match_type === 'regex' ? 1 : 0,
+                    'match_type' => 'url',
+                    'regex' => $rp_regex ? 1 : 0,
                     'action_code' => $type,
-                    'group_id' => 1 // Default group
+                    'group_id' => $this->redirection_group_id(),
                 ]);
+                // create() reports a bad rule (no such group, invalid source)
+                // by returning a WP_Error, not by throwing; it was ignored and
+                // Patrick was told the redirect existed.
+                if (is_wp_error($created)) {
+                    $this->log("[CREATE_REDIRECT] Redirection plugin refused the rule: " . $created->get_error_message());
+                    return new WP_Error('redirect_failed', 'The Redirection plugin did not accept this redirect: ' . $created->get_error_message(), ['status' => 400]);
+                }
                 $method_used = 'redirection_plugin';
-                $this->log("[CREATE_REDIRECT] Created via Redirection plugin ({$rp_match})");
+                $this->log("[CREATE_REDIRECT] Created via Redirection plugin (" . ($rp_regex ? 'regex' : 'url') . ")");
             } catch (\Exception $e) {
                 $this->log("[CREATE_REDIRECT] Redirection plugin error: " . $e->getMessage());
             }
@@ -10675,7 +11200,7 @@ class Mehrana_App_Plugin
                 'match_type' => $match_type,
                 'created' => current_time('mysql')
             ];
-            update_option('mehrana_redirects', array_values($redirects));
+            update_option('mehrana_redirects', $redirects);
             $method_used = 'mehrana_custom';
             if ($match_type !== 'regex') {
                 $this->purge_site_caches(null, home_url($from_path));
@@ -10694,6 +11219,25 @@ class Mehrana_App_Plugin
             'method' => $method_used,
             'message' => "Redirect created via {$method_used}"
         ]);
+    }
+
+    /**
+     * A Redirection group to put our rules in. Group 1 is the plugin's default
+     * "Redirections" group, but it can be deleted; then the first enabled
+     * group is used.
+     */
+    private function redirection_group_id()
+    {
+        global $wpdb;
+        $table = $wpdb->prefix . 'redirection_groups';
+        if ($wpdb->get_var("SHOW TABLES LIKE '$table'") !== $table) {
+            return 1;
+        }
+        if ($wpdb->get_var("SELECT id FROM $table WHERE id = 1")) {
+            return 1;
+        }
+        $first = (int) $wpdb->get_var("SELECT id FROM $table WHERE status = 'enabled' ORDER BY id ASC LIMIT 1");
+        return $first > 0 ? $first : 1;
     }
 
     /**
@@ -10727,12 +11271,17 @@ class Mehrana_App_Plugin
      * to new format (numeric-indexed with from_url field).
      */
     private function normalize_custom_redirects($custom) {
-        if (empty($custom)) return [];
+        if (empty($custom) || !is_array($custom)) return [];
+        // Numeric keys are kept as they are: they are the rule ids Patrick
+        // holds (`custom_{key}`). Re-indexing after a delete shifted every
+        // later rule, so the next delete in the same flow removed the wrong
+        // one. Old path-keyed entries get fresh numeric keys after the rest.
         $normalized = [];
+        $legacy = [];
         foreach ($custom as $key => $val) {
             if (is_string($key) && !is_numeric($key)) {
                 // Old format: path is the key, value has 'to'
-                $normalized[] = [
+                $legacy[] = [
                     'from_url' => $key,
                     'to_url' => is_array($val) ? ($val['to'] ?? ($val['to_url'] ?? '')) : $val,
                     'type' => is_array($val) ? (int)($val['type'] ?? 301) : 301,
@@ -10740,10 +11289,13 @@ class Mehrana_App_Plugin
                 ];
             } else {
                 // New format: numeric key, from_url in value
-                $normalized[] = $val;
+                $normalized[(int) $key] = $val;
             }
         }
-        return array_values($normalized);
+        foreach ($legacy as $val) {
+            $normalized[] = $val;
+        }
+        return $normalized;
     }
 
     /**
@@ -11063,49 +11615,31 @@ class Mehrana_App_Plugin
                     // Found with correct parent
                     $current_parent_id = $existing_pages[0]->ID;
                 } else {
-                    // Second: Try to find page by slug only (any parent)
-                    $args_any_parent = [
-                        'name' => $segment_slug,
+                    // Not under this parent. A page with the same slug elsewhere
+                    // is a different page — /vancouver/commercial/ is not
+                    // /burnaby/commercial/. It used to be moved here ("wrong
+                    // parent - fix it"), taking its children with it and
+                    // breaking their live URLs. Now the missing segment is
+                    // created under the right parent, like any missing segment.
+                    // Create new parent page if it doesn't exist
+                    $new_parent_data = [
+                        'post_title' => ucwords(str_replace('-', ' ', $segment)),
+                        'post_name' => $segment_slug,
+                        'post_status' => 'publish', // Parents are usually published
                         'post_type' => 'page',
-                        'post_status' => ['publish', 'draft'],
-                        'numberposts' => 1
+                        'post_parent' => $current_parent_id,
+                        'post_author' => get_current_user_id() > 0 ? get_current_user_id() : 1
                     ];
-                    $pages_any_parent = get_posts($args_any_parent);
 
-                    if (!empty($pages_any_parent)) {
-                        // Page exists but has WRONG parent - FIX IT!
-                        $existing_page_id = $pages_any_parent[0]->ID;
-                        $old_parent = $pages_any_parent[0]->post_parent;
+                    $new_parent_id = wp_insert_post($new_parent_data);
 
-                        if ($old_parent != $current_parent_id) {
-                            wp_update_post([
-                                'ID' => $existing_page_id,
-                                'post_parent' => $current_parent_id
-                            ]);
-                            $this->log("[UPDATE_PAGE] Fixed parent for '{$segment}' (ID: {$existing_page_id}): {$old_parent} -> {$current_parent_id}");
-                        }
-                        $current_parent_id = $existing_page_id;
+                    if (!is_wp_error($new_parent_id)) {
+                        $this->log("[UPDATE_PAGE] Created missing parent: {$segment} (ID: {$new_parent_id})");
+                        $current_parent_id = $new_parent_id;
                     } else {
-                        // Create new parent page if it doesn't exist
-                        $new_parent_data = [
-                            'post_title' => ucwords(str_replace('-', ' ', $segment)),
-                            'post_name' => $segment_slug,
-                            'post_status' => 'publish', // Parents are usually published
-                            'post_type' => 'page',
-                            'post_parent' => $current_parent_id,
-                            'post_author' => get_current_user_id() > 0 ? get_current_user_id() : 1
-                        ];
-
-                        $new_parent_id = wp_insert_post($new_parent_data);
-
-                        if (!is_wp_error($new_parent_id)) {
-                            $this->log("[UPDATE_PAGE] Created missing parent: {$segment} (ID: {$new_parent_id})");
-                            $current_parent_id = $new_parent_id;
-                        } else {
-                            $this->log("[UPDATE_PAGE] Error creating parent {$segment}: " . $new_parent_id->get_error_message());
-                            // Stop recursion on error, but keep last valid parent
-                            break;
-                        }
+                        $this->log("[UPDATE_PAGE] Error creating parent {$segment}: " . $new_parent_id->get_error_message());
+                        // Stop recursion on error, but keep last valid parent
+                        break;
                     }
                 }
             }
@@ -11232,11 +11766,25 @@ class Mehrana_App_Plugin
 
         $previous_status = $post->post_status;
 
+        // With EMPTY_TRASH_DAYS = 0 the site has no Trash: wp_trash_post()
+        // deletes the page permanently, and Patrick's Restore can't bring it
+        // back. Refuse instead of deleting.
+        if (!EMPTY_TRASH_DAYS && $previous_status !== 'trash') {
+            return new WP_Error(
+                'trash_disabled',
+                'This site has the WordPress Trash turned off (EMPTY_TRASH_DAYS is 0), so moving the page to Trash would delete it permanently. Nothing was changed.',
+                ['status' => 409]
+            );
+        }
+
         // wp_trash_post returns the trashed post object on success, false on
         // failure. It's a no-op when the post is already trashed — in that
         // case the post itself is returned unchanged but post_status='trash'
-        // so we treat it as success.
-        $result = wp_trash_post($page_id);
+        // so we treat it as success. kses off: the status change re-saves the
+        // content, which would strip its embeds (see without_kses).
+        $result = $this->without_kses(function () use ($page_id) {
+            return wp_trash_post($page_id);
+        });
         if ($result === false) {
             return new WP_Error('trash_failed', "Failed to trash post {$page_id}", ['status' => 500]);
         }
@@ -11314,7 +11862,9 @@ class Mehrana_App_Plugin
             return $new_status;
         };
         add_filter('wp_untrash_post_status', $filter, 999, 3);
-        $untrash_result = wp_untrash_post($page_id);
+        $untrash_result = $this->without_kses(function () use ($page_id) {
+            return wp_untrash_post($page_id);
+        });
         remove_filter('wp_untrash_post_status', $filter, 999);
 
         if ($untrash_result === false) {
@@ -11331,7 +11881,7 @@ class Mehrana_App_Plugin
         // Strategy 2: wp_update_post if the filter was overridden.
         if ($refreshed && $refreshed->post_status !== $previous_status) {
             $this->log("[RESTORE_PAGE] Strategy 1 (filter) landed on '{$refreshed->post_status}', trying Strategy 2 (wp_update_post)");
-            $update_result = wp_update_post([
+            $update_result = $this->update_post_unfiltered([
                 'ID' => $page_id,
                 'post_status' => $previous_status,
             ], true);
@@ -11740,6 +12290,17 @@ class Mehrana_App_Plugin
         $has_rank_math = defined('RANK_MATH_VERSION');
         $has_yoast = defined('WPSEO_VERSION');
 
+        // Every field below is written to Rank Math's or Yoast's own meta. With
+        // neither active nothing would be saved, yet this used to answer
+        // success — Patrick showed the deploy as done.
+        if (!$has_rank_math && !$has_yoast) {
+            return new WP_Error(
+                'no_seo_plugin',
+                'This site has neither Yoast SEO nor Rank Math active, so the SEO title and description could not be saved. Nothing was changed.',
+                ['status' => 409]
+            );
+        }
+
         // Title
         if (isset($body['title'])) {
             $title = sanitize_text_field($body['title']);
@@ -11958,6 +12519,15 @@ class Mehrana_App_Plugin
 
         $has_rank_math = defined('RANK_MATH_VERSION');
         $has_yoast = defined('WPSEO_VERSION');
+
+        // Same as update_page_seo: no supported SEO plugin = nothing saved.
+        if (!$has_rank_math && !$has_yoast) {
+            return new WP_Error(
+                'no_seo_plugin',
+                'This site has neither Yoast SEO nor Rank Math active, so the category SEO could not be saved. Nothing was changed.',
+                ['status' => 409]
+            );
+        }
 
         // Load Yoast taxonomy meta option once if needed
         $yoast_meta = null;
@@ -12565,9 +13135,17 @@ class Mehrana_App_Plugin
                     $final_pattern = trim($final_pattern, '/');
                 }
 
-                $update['sources'] = serialize([
-                    ['pattern' => $final_pattern, 'comparison' => $final_match]
-                ]);
+                // Only the first source is edited (it's the one Patrick shows).
+                // The rest of the rule's sources, and the first one's other
+                // fields (Rank Math's `ignore` = case-insensitive), stay — a
+                // rebuild from scratch silently dropped every other source URL.
+                if (!is_array($sources) || empty($sources) || !is_array(reset($sources))) {
+                    $sources = [[]];
+                }
+                $first_key = array_key_first($sources);
+                $sources[$first_key]['pattern'] = $final_pattern;
+                $sources[$first_key]['comparison'] = $final_match;
+                $update['sources'] = serialize($sources);
             }
 
             if (!empty($update)) {
@@ -12589,8 +13167,10 @@ class Mehrana_App_Plugin
                     if (isset($body['type'])) $update_data['action_code'] = intval($body['type']);
                     if (isset($body['fromUrl'])) $update_data['url'] = trim($body['fromUrl']);
                     if (isset($body['matchType']) && in_array($body['matchType'], $valid_match_types, true)) {
+                        // In Redirection, regex is a flag on a "url" match;
+                        // "regex" is not one of its match types.
                         $update_data['regex'] = $body['matchType'] === 'regex' ? 1 : 0;
-                        $update_data['match_type'] = $body['matchType'] === 'regex' ? 'regex' : 'url';
+                        $update_data['match_type'] = 'url';
                     }
                     if (!empty($update_data)) {
                         $item->update($update_data);
@@ -12666,8 +13246,9 @@ class Mehrana_App_Plugin
             $custom = get_option('mehrana_redirects', []);
             $custom = $this->normalize_custom_redirects($custom);
             if (isset($custom[$idx])) {
+                // No re-index: the other rules keep their ids.
                 unset($custom[$idx]);
-                update_option('mehrana_redirects', array_values($custom));
+                update_option('mehrana_redirects', $custom);
                 $this->log("Deleted custom redirect #{$idx}");
             }
             return rest_ensure_response(['success' => true]);
@@ -12825,6 +13406,9 @@ class Mehrana_App_Plugin
         }
 
         $overrides = get_option('mehrana_breadcrumb_overrides', []);
+        if (!is_array($overrides)) {
+            $overrides = [];
+        }
         $overrides[] = [
             'from_url' => $from_url,
             'to_url' => $to_url,
@@ -12832,7 +13416,8 @@ class Mehrana_App_Plugin
         ];
         update_option('mehrana_breadcrumb_overrides', $overrides);
 
-        return rest_ensure_response(['success' => true, 'id' => count($overrides) - 1]);
+        // Ids are array keys and stay stable across deletes (see below).
+        return rest_ensure_response(['success' => true, 'id' => array_key_last($overrides)]);
     }
 
     /**
@@ -12858,8 +13443,10 @@ class Mehrana_App_Plugin
     public function linklab_delete_breadcrumb_override($request) {
         $idx = intval($request['id']);
         $overrides = get_option('mehrana_breadcrumb_overrides', []);
-        if (isset($overrides[$idx])) {
-            array_splice($overrides, $idx, 1);
+        if (is_array($overrides) && isset($overrides[$idx])) {
+            // unset, not array_splice: splicing re-indexed every later
+            // override, so a second delete removed the wrong one.
+            unset($overrides[$idx]);
             update_option('mehrana_breadcrumb_overrides', $overrides);
         }
         return rest_ensure_response(['success' => true]);
@@ -13359,12 +13946,24 @@ class Mehrana_App_Plugin
         $final_slug = end($parts);
         if (!$final_slug) return 0;
 
+        // Slug fallback for URLs url_to_postid() can't parse (custom permalink
+        // plugins, flattened category URLs). A post only counts when its own
+        // permalink IS this URL: the slug alone used to pick any post with
+        // that name — /product-category/kitchen-cabinets/ resolved to the page
+        // /kitchen-cabinets/, and a dead /vancouver/roofing/ to /burnaby/roofing/.
         global $wpdb;
-        $found = $wpdb->get_var($wpdb->prepare(
-            "SELECT ID FROM $wpdb->posts WHERE post_name = %s AND post_status = 'publish' LIMIT 1",
+        $candidates = $wpdb->get_col($wpdb->prepare(
+            "SELECT ID FROM $wpdb->posts WHERE post_name = %s AND post_status = 'publish' LIMIT 20",
             $final_slug
         ));
-        return $found ? (int) $found : 0;
+        $want = strtolower(untrailingslashit(rawurldecode($path)));
+        foreach ((array) $candidates as $cid) {
+            $permalink_path = wp_parse_url(get_permalink((int) $cid), PHP_URL_PATH);
+            if (is_string($permalink_path) && strtolower(untrailingslashit(rawurldecode($permalink_path))) === $want) {
+                return (int) $cid;
+            }
+        }
+        return 0;
     }
 
     public function linklab_sitemap_exclude($request) {
@@ -13605,6 +14204,14 @@ class Mehrana_App_Plugin
                     'A physical robots.txt exists on the host but is not writable by WordPress',
                     ['status' => 500]
                 );
+            }
+            // The host's own file, before Patrick ever changed it, is kept once
+            // and never overwritten — the rolling backup below only holds the
+            // previous publish, so from the second publish on the original
+            // was gone.
+            $original = $physical_path . '.mehrana-original';
+            if (!file_exists($original)) {
+                @copy($physical_path, $original);
             }
             // Single fixed backup name so publishes don't pile files up in
             // the web root; each publish overwrites the previous backup.
