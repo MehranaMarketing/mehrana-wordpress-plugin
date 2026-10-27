@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Mehrana App Plugin
  * Description: Headless SEO & Optimization Plugin for Mehrana App - Link Building, Image Optimization, GTM, Clarity & More
- * Version: 6.0.0
+ * Version: 6.0.1
  * Author: Mehrana Agency
  * Author URI: https://mehrana.agency
  * Text Domain: mehrana-app
@@ -18,7 +18,7 @@ if (!defined('ABSPATH')) {
 class Mehrana_App_Plugin
 {
 
-    private $version = '6.0.0';
+    private $version = '6.0.1';
     private $namespace = 'mehrana/v1';
 
     /**
@@ -13695,6 +13695,14 @@ class Mehrana_App_Plugin
             if (function_exists('w3tc_flush_url')) w3tc_flush_url($url);
             // WP Super Cache
             if (function_exists('wpsc_delete_url_cache')) wpsc_delete_url_cache($url);
+            // WP Fastest Cache (Alpha Child Therapy) — desktop and mobile copies
+            if (function_exists('wpfc_clear_cache_by_url')) wpfc_clear_cache_by_url($url);
+        }
+
+        // WP Fastest Cache before its URL helper existed: clear by post
+        if (!function_exists('wpfc_clear_cache_by_url') && function_exists('wpfc_clear_post_cache_by_id')) {
+            $post_id = url_to_postid(home_url($path));
+            if ($post_id) wpfc_clear_post_cache_by_id($post_id);
         }
 
         // WP Rocket purges by file list
